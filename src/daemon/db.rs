@@ -164,4 +164,17 @@ impl Database {
         }
         // return String::from(""); // unreachable statement, however I want to make it clear this is our default
     }
+
+    pub fn delete(&mut self, namespace: &str) -> bool {
+        let res = self.hashtable.remove(&namespace.to_string());
+        match res {
+            Some(res) => {
+                return true;
+            },
+            None => {
+                return false;
+            },
+        }
+    }
+
 }

@@ -9,6 +9,7 @@ mod sighting_reader;
 mod sighting_configure;
 mod attribute;
 mod db;
+mod acl;
 
 use clap::Arg;
 use std::sync::Arc;
@@ -58,10 +59,15 @@ pub struct InfoData {
 fn help(_req: HttpRequest) -> impl Responder {
     "Sighting Daemon, written by Sebastien Tricaud, (C) Devo Inc. 2019
 REST Endpoints:
-\t/w: write
-\t/r: read
-\t/c: configure
-\t/i: info
+\t/w: write (GET)
+\t/wb: write in bulk mode (POST)
+\t/r: read (GET)
+\t/rs: read with statistics (GET)
+\t/rb: read in bulk mode (POST)
+\t/rbs: read with statistics in bulk mode (POST)
+\t/d: delete (GET)
+\t/c: configure (GET)
+\t/i: info (GET)
 "
 }
 
@@ -69,6 +75,16 @@ fn read_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) 
     let sharedstate = &mut *data.lock().unwrap();
     
     let (_, path) = _req.path().split_at(4);
+    let http_header_auth = _req.head().headers.get("Authorization");
+    match http_header_auth {
+        Some(apikey) => {
+            let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), path);
+            if ! can_read {
+                return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
+            }
+        },
+        None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+    }
     let query_string = QString::from(_req.query_string());
     let val = query_string.get("val");
     match val {
@@ -81,8 +97,19 @@ fn read_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) 
 }
 fn read(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> impl Responder {
     let sharedstate = &mut *data.lock().unwrap();
-    
+
     let (_, path) = _req.path().split_at(3);
+    let http_header_auth = _req.head().headers.get("Authorization");
+    match http_header_auth {
+        Some(apikey) => {
+            let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), path);
+            if ! can_read {
+                return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
+            }
+        },
+        None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+    }
+    
     let query_string = QString::from(_req.query_string());
     let val = query_string.get("val");
     match val {
@@ -100,6 +127,18 @@ fn write(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> HttpRes
 
     // println!("{:?}", _req.path());
     let (_, path) = _req.path().split_at(3); // We remove '/w/'
+    let http_header_auth = _req.head().headers.get("Authorization");
+    match http_header_auth {
+        Some(apikey) => {
+            let can_write = acl::can_write(&mut sharedstate.db, apikey.to_str().unwrap(), path);
+            if ! can_write {
+                let mut error_msg = String::from("Cannot write to namespace: /");
+                error_msg.push_str(path);
+                return HttpResponse::Ok().json(Message{message: error_msg});
+            }
+        },
+        None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+    }
     let query_string = QString::from(_req.query_string());
 
     let val = query_string.get("val");
@@ -123,7 +162,6 @@ fn configure(_req: HttpRequest) -> impl Responder {
     "configure"
 }
 
-
 #[derive(Serialize,Deserialize)]
 pub struct PostData {
     items: Vec<BulkSighting>
@@ -142,6 +180,17 @@ fn read_bulk(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web::Json<PostD
     let mut json_response = String::from("{\n\t\"items\": [\n");
 
     for v in &postdata.items {
+        let http_header_auth = _req.head().headers.get("Authorization");
+        match http_header_auth {
+            Some(apikey) => {
+                let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), v.namespace.as_str());
+                if ! can_read {
+                    return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
+                }
+            },
+            None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+        }
+
         let ans = sighting_reader::read(&mut sharedstate.db, v.namespace.as_str(), v.value.as_str(), false);
 
         json_response.push_str("\t\t");
@@ -161,6 +210,17 @@ fn read_bulk_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web:
     let mut json_response = String::from("{\n\t\"items\": [\n");
 
     for v in &postdata.items {
+        let http_header_auth = _req.head().headers.get("Authorization");
+        match http_header_auth {
+            Some(apikey) => {
+                let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), v.namespace.as_str());
+                if ! can_read {
+                    return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
+                }
+            },
+            None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+        }
+        
         let ans = sighting_reader::read(&mut sharedstate.db, v.namespace.as_str(), v.value.as_str(), true);
 
         json_response.push_str("\t\t");
@@ -179,10 +239,21 @@ fn write_bulk(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web::Json<Post
     let sharedstate = &mut *data.lock().unwrap();
     let mut could_write = false;
     
-    for i in &postdata.items {
-        if i.value.len() > 0 { // There is no need to write a value that does not exists
-            let timestamp = i.timestamp.unwrap_or(0);
-            could_write = sighting_writer::write(&mut sharedstate.db, i.namespace.as_str(), i.value.as_str(), timestamp);
+    for v in &postdata.items {
+        if v.value.len() > 0 { // There is no need to write a value that does not exists
+            let http_header_auth = _req.head().headers.get("Authorization");
+            match http_header_auth {
+                Some(apikey) => {
+                    let can_write = acl::can_write(&mut sharedstate.db, apikey.to_str().unwrap(), v.namespace.as_str());
+                    if ! can_write {
+                        return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
+                    }
+                },
+                None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+            }
+            
+            let timestamp = v.timestamp.unwrap_or(0);
+            could_write = sighting_writer::write(&mut sharedstate.db, v.namespace.as_str(), v.value.as_str(), timestamp);
         }
     }
 
@@ -190,6 +261,31 @@ fn write_bulk(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web::Json<Post
         return HttpResponse::Ok().json(Message{message: String::from("ok")});
     }
     return HttpResponse::Ok().json(Message{message: String::from("Invalid base64 encoding (base64 url with non padding) value")});
+}
+
+fn delete(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> HttpResponse {
+    let sharedstate = &mut *data.lock().unwrap();
+
+    let (_, path) = _req.path().split_at(3); // We remove '/w/'
+    let http_header_auth = _req.head().headers.get("Authorization");
+    match http_header_auth {
+        Some(apikey) => {
+            let can_write = acl::can_write(&mut sharedstate.db, apikey.to_str().unwrap(), path);
+            if ! can_write {
+                let mut error_msg = String::from("Cannot write to namespace: /");
+                error_msg.push_str(path);
+                return HttpResponse::Ok().json(Message{message: error_msg});
+            }
+        },
+        None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+    }
+
+    let deleted = sharedstate.db.delete(path);
+    if ! deleted {
+        return HttpResponse::Ok().json(Message{message: String::from("Namespace not found, nothing was deleted.")});
+    }
+    
+    return HttpResponse::Ok().json(Message{message: String::from("ok")});
 }
 
 
@@ -364,6 +460,7 @@ fn main() {
                         .route("/wb", web::post().to(write_bulk))
                         .route("/c/*", web::get().to(configure))
                         .route("/i", web::get().to(info))
+                        .route("/d/*", web::get().to(delete))                                  
                         .default_service(web::to(help))
                         .data(web::JsonConfig::default().limit(post_limit))
         })
