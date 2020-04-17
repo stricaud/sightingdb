@@ -5,16 +5,8 @@ authors = ["Sebastien Tricaud <sebastien.tricaud@devo.com>"]
 edition = "2018"
 
 [[bin]]
-name = "b64"
-path = "src/b64/main.rs"
-
-[[bin]]
-name = "sighting-daemon"
-path = "src/daemon/main.rs"
-
-[[bin]]
-name = "sighting"
-path = "src/client/main.rs"
+name = "sightingdb"
+path = "src/main.rs"
 
 [dependencies]
 dirs = "2.0.2"
@@ -22,7 +14,6 @@ rustyline = "5.0.0"
 regex = "1"
 
 reqwest = "0.9.18"
-#shio = "0.3.0"
 daemonize = "0.4.1"
 
 serde = "1.0.94"

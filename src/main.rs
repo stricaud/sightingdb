@@ -313,7 +313,7 @@ fn create_home_config() {
 }
 
 fn sightingdb_get_config() -> Result<String, &'static str> {
-    let ini_file = PathBuf::from("/etc/sightingdb/sighting-daemon.ini");
+    let ini_file = PathBuf::from("/etc/sightingdb/sightingdb.conf");
     let mut home_ini_file = PathBuf::from(dirs::home_dir().unwrap());
     
     let can_open = Path::new(&ini_file).exists();
@@ -322,14 +322,14 @@ fn sightingdb_get_config() -> Result<String, &'static str> {
     }
     
     home_ini_file.push(".sightingdb");
-    home_ini_file.push("sighting-daemon.ini");
+    home_ini_file.push("sightingdb.conf");
 
     let can_open = Path::new(&home_ini_file).exists();
     if can_open {
         return Ok(String::from(home_ini_file.to_str().unwrap()));
     }
     
-    return Err("Cannot locate sighting-daemon.ini in neither from the -c flag, /etc/sightingdb or ~/.sightingdb/");
+    return Err("Cannot locate sightingdb.conf in neither from the -c flag, /etc/sightingdb or ~/.sightingdb/");
 }
 
 fn sightingdb_get_pid() -> String {
