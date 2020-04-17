@@ -30,16 +30,19 @@ use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+
 pub struct SharedState {
     pub db: db::Database,
+    pub authenticate: bool,
 }
 
 impl SharedState {
     pub fn new() -> Self {
         Self {
             db: db::Database::new(),
+            authenticate: true,
         }
-    }
+    }    
 }
 
 #[derive(Serialize)]
@@ -54,7 +57,6 @@ pub struct InfoData {
     vendor: String,
     author: String
 }
-
 
 fn help(_req: HttpRequest) -> impl Responder {
     "Sighting Daemon, written by Sebastien Tricaud, (C) Devo Inc. 2019
@@ -75,15 +77,17 @@ fn read_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) 
     let sharedstate = &mut *data.lock().unwrap();
     
     let (_, path) = _req.path().split_at(4);
-    let http_header_auth = _req.head().headers.get("Authorization");
-    match http_header_auth {
-        Some(apikey) => {
-            let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), path);
-            if ! can_read {
-                return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
-            }
-        },
-        None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+    if sharedstate.authenticate {
+        let http_header_auth = _req.head().headers.get("Authorization");
+        match http_header_auth {
+            Some(apikey) => {
+                let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), path);
+                if ! can_read {
+                    return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
+                }
+            },
+            None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+        }
     }
     let query_string = QString::from(_req.query_string());
     let val = query_string.get("val");
@@ -99,15 +103,17 @@ fn read(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> impl Res
     let sharedstate = &mut *data.lock().unwrap();
 
     let (_, path) = _req.path().split_at(3);
-    let http_header_auth = _req.head().headers.get("Authorization");
-    match http_header_auth {
-        Some(apikey) => {
-            let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), path);
-            if ! can_read {
-                return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
-            }
-        },
-        None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+    if sharedstate.authenticate {
+        let http_header_auth = _req.head().headers.get("Authorization");
+        match http_header_auth {
+            Some(apikey) => {
+                let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), path);
+                if ! can_read {
+                    return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
+                }
+            },
+            None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+        }
     }
     
     let query_string = QString::from(_req.query_string());
@@ -127,18 +133,22 @@ fn write(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> HttpRes
 
     // println!("{:?}", _req.path());
     let (_, path) = _req.path().split_at(3); // We remove '/w/'
-    let http_header_auth = _req.head().headers.get("Authorization");
-    match http_header_auth {
-        Some(apikey) => {
-            let can_write = acl::can_write(&mut sharedstate.db, apikey.to_str().unwrap(), path);
-            if ! can_write {
-                let mut error_msg = String::from("Cannot write to namespace: /");
-                error_msg.push_str(path);
-                return HttpResponse::Ok().json(Message{message: error_msg});
-            }
-        },
-        None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+
+    if sharedstate.authenticate {
+        let http_header_auth = _req.head().headers.get("Authorization");
+        match http_header_auth {
+            Some(apikey) => {
+                let can_write = acl::can_write(&mut sharedstate.db, apikey.to_str().unwrap(), path);
+                if ! can_write {
+                    let mut error_msg = String::from("Cannot write to namespace: /");
+                    error_msg.push_str(path);
+                    return HttpResponse::Ok().json(Message{message: error_msg});
+                }
+            },
+            None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+        }
     }
+    
     let query_string = QString::from(_req.query_string());
 
     let val = query_string.get("val");
@@ -180,15 +190,17 @@ fn read_bulk(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web::Json<PostD
     let mut json_response = String::from("{\n\t\"items\": [\n");
 
     for v in &postdata.items {
-        let http_header_auth = _req.head().headers.get("Authorization");
-        match http_header_auth {
-            Some(apikey) => {
-                let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), v.namespace.as_str());
-                if ! can_read {
-                    return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
-                }
-            },
-            None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+        if sharedstate.authenticate {
+            let http_header_auth = _req.head().headers.get("Authorization");
+            match http_header_auth {
+                Some(apikey) => {
+                    let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), v.namespace.as_str());
+                    if ! can_read {
+                        return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
+                    }
+                },
+                None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+            }
         }
 
         let ans = sighting_reader::read(&mut sharedstate.db, v.namespace.as_str(), v.value.as_str(), false);
@@ -210,15 +222,17 @@ fn read_bulk_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web:
     let mut json_response = String::from("{\n\t\"items\": [\n");
 
     for v in &postdata.items {
-        let http_header_auth = _req.head().headers.get("Authorization");
-        match http_header_auth {
-            Some(apikey) => {
-                let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), v.namespace.as_str());
-                if ! can_read {
-                    return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
-                }
-            },
-            None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+        if sharedstate.authenticate {
+            let http_header_auth = _req.head().headers.get("Authorization");
+            match http_header_auth {
+                Some(apikey) => {
+                    let can_read = acl::can_read(&mut sharedstate.db, apikey.to_str().unwrap(), v.namespace.as_str());
+                    if ! can_read {
+                        return HttpResponse::Ok().json(Message{message: String::from("API key not found.")});
+                    }
+                },
+                None => { return HttpResponse::Ok().json(Message{message: String::from("Please add the API key in the Authorization headers.")});},
+            }
         }
         
         let ans = sighting_reader::read(&mut sharedstate.db, v.namespace.as_str(), v.value.as_str(), true);
@@ -401,6 +415,17 @@ fn main() {
         "false" => use_ssl = false,
         _ => use_ssl = true, // no mistake, only false can start the unsecure server.
     }
+    match daemon_config.get("authenticate").unwrap().as_ref() {
+        "false" => {
+            sharedstate.lock().unwrap().authenticate = false;
+        },
+        _ => sharedstate.lock().unwrap().authenticate = true, // no mistake, only false can start the unsecure server.
+    }
+    if ! sharedstate.lock().unwrap().authenticate {
+        let auth_string = Red.paint("No authentication used for the database.").to_string();
+        println!("{}", auth_string);
+    }
+    
 
     let mut ssl_cert: PathBuf;
     let ssl_cert_config = daemon_config.get("ssl_cert").unwrap();
