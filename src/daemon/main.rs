@@ -346,9 +346,9 @@ fn main() {
     create_home_config();
     
     let sharedstate = Arc::new(Mutex::new(SharedState::new()));
-
+    
     let matches = clap::App::new("SightingDB")
-                          .version("0.2")
+                          .version("0.4")
                           .author("Sebastien Tricaud <sebastien.tricaud@devo.com>")
                           .about("Sightings Database")
                           .arg(Arg::with_name("config")
@@ -380,6 +380,7 @@ fn main() {
         }
     }
 
+    
     println!("Using configuration file: {}", configstr);
     let configpath = Path::new(&configstr);
     let config = Ini::load_from_file(&configstr).unwrap();

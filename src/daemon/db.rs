@@ -19,12 +19,18 @@ pub struct DbError {
 
 impl Database {
     pub fn new() -> Database {
-        Database {
+        let mut db = Database {
             db_path: String::from(""),
             hashtable: HashMap::new(),
             // "stats":{"1586548800":1},
             re_stats: Regex::new(r"\x22stats\x22:\{.+\},").unwrap(),
-        }
+        };
+        // We initialize the default apikey: 'changeme'
+        let attr = Attribute::new("");
+        let mut tmphash = HashMap::new();
+        tmphash.insert("".to_string(), attr);
+        db.hashtable.insert("_config/acl/apikeys/changeme".to_string(), tmphash);
+        return db;
     }
     pub fn set_db_path(&mut self, path: String) {
         self.db_path = path;
@@ -124,6 +130,19 @@ impl Database {
             },
         };
     }
+    pub fn namespace_exists(&mut self, namespace: &str) -> bool {
+        let valuestable = self.hashtable.get_mut(&namespace.to_string());
+
+        match valuestable {
+            Some(_) => {
+                return true;
+            },
+            None => {
+                return false;
+            },
+        }
+    }
+    
     pub fn get_attr(&mut self, path: &str, value: &str, with_stats: bool, consensus_count: u128) -> String {        
         let valuestable = self.hashtable.get_mut(&path.to_string());
 
@@ -168,7 +187,7 @@ impl Database {
     pub fn delete(&mut self, namespace: &str) -> bool {
         let res = self.hashtable.remove(&namespace.to_string());
         match res {
-            Some(res) => {
+            Some(_) => {
                 return true;
             },
             None => {
