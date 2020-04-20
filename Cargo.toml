@@ -1,6 +1,6 @@
 [package]
 name = "sightingdb"
-version = "0.0.1"
+version = "0.4.0"
 authors = ["Sebastien Tricaud <sebastien.tricaud@devo.com>"]
 edition = "2018"
 
@@ -32,6 +32,7 @@ qstring = "0.7.0"
 
 bincode = "*"
 flate2 = "*"
+glob = "*"
 
 [dependencies.chrono]
 version = "0.4.7"

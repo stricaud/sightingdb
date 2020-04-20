@@ -1,6 +1,14 @@
+extern crate glob;
+
+use std::io::prelude::*;
+use std::io::BufReader;
+use std::fs;
+use std::fs::File;
 use std::collections::HashMap;
 use serde::{Serialize};
 use regex::Regex;
+
+use glob::glob;
 
 use crate::attribute::Attribute;
 
@@ -196,4 +204,60 @@ impl Database {
         }
     }
 
+    pub fn dump_to_disk(&mut self) -> bool {
+        println!("Dumping data to {}", self.db_path);
+        for (namespace, attr) in &self.hashtable {
+            // println!("Namespace: {}", namespace);
+            let mut dir_to_make = String::from(&self.db_path);
+            dir_to_make.push_str(namespace);
+            dir_to_make.push_str("/");
+            let res = fs::create_dir_all(dir_to_make.clone());
+            match res {
+                Ok(_res) => {},
+                Err(e) => { println!("Error making directory for namespace: {}", e); return false; },
+            }
+
+            let mut file_to_make = String::from(&dir_to_make);
+            file_to_make.push_str("attributes.json");
+            let mut buffer = File::create(file_to_make).unwrap();
+            for (attrval, iattr) in attr {
+                // println!("Attribute content: {}", serde_json::to_string(&attr).unwrap());
+                buffer.write_all(&serde_json::to_vec(&attr).unwrap());
+            }
+        }
+        true
+    }
+
+    fn restore_from_disk_each_dir(&mut self, path: &String) -> bool {        
+        let namespace = path.split_at(self.db_path.len()).1;
+        let mut attribute_file = String::from(path);
+        attribute_file.push_str("/attributes.json");
+        let fpres = File::open(attribute_file);
+        match fpres {
+            Ok(mut fp) => {
+                let reader = BufReader::new(fp);
+                
+                // let mut buffer = Vec::new();
+                // fp.read_to_end(&mut buffer);
+                let attr: Attribute = serde_json::from_reader(reader).unwrap(); 
+            },
+            Err(e) => { println!("Error opening attribute file: {}", e); return false; },
+        }
+        // println!("Parent dir: {}", namespace);
+        // println!("Attribute file: {}", attribute_file);
+        
+        true
+    }
+    
+    pub fn restore_from_disk(&mut self) -> bool {
+        let mut dir_to_read = String::from(&self.db_path);
+        dir_to_read.push_str("/**/attributes.json");
+        for entry in glob(&dir_to_read).unwrap() {
+            self.restore_from_disk_each_dir(&entry.unwrap().parent().unwrap().to_str().unwrap().to_string());
+        }
+        
+        
+        true
+    }
+    
 }

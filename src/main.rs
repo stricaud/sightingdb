@@ -425,7 +425,11 @@ fn main() {
         let auth_string = Red.paint("No authentication used for the database.").to_string();
         println!("{}", auth_string);
     }
-    
+
+    let dbdir = daemon_config.get("dbdir").unwrap();
+    sharedstate.lock().unwrap().db.set_db_path(dbdir.to_string());
+    // sharedstate.lock().unwrap().db.dump_to_disk();
+    sharedstate.lock().unwrap().db.restore_from_disk();
 
     let mut ssl_cert: PathBuf;
     let ssl_cert_config = daemon_config.get("ssl_cert").unwrap();
