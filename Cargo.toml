@@ -1,6 +1,6 @@
 [package]
 name = "sightingdb"
-version = "0.0.1"
+version = "0.0.4"
 authors = ["Sebastien Tricaud <sebastien.tricaud@devo.com>"]
 edition = "2018"
 
