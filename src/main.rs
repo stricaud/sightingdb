@@ -485,6 +485,14 @@ fn main() {
                 .multiple(true)
                 .help("Sets the level of verbosity"),
         )
+        .arg(
+            Arg::with_name("apikey")
+                .short("k")
+                .long("apikey")
+                .value_name("APIKEY")
+                .help("Set the default API KEY")
+                .takes_value(true)                
+        )
         .get_matches();
 
     // match matches.occurrences_of("v") {
@@ -506,6 +514,18 @@ fn main() {
         }
     }
 
+    let apikeyarg = matches.value_of("apikey");
+    match apikeyarg {
+        Some(apikey)  => {            
+            sharedstate.lock().unwrap().db.delete("_config/acl/apikeys/changeme");
+            let mut namespace_withkey = String::from("_config/acl/apikeys/");
+            namespace_withkey.push_str(apikey);
+            sharedstate.lock().unwrap().db.write(&namespace_withkey, "", 0, false);
+        },
+        None => {},
+    }
+    
+    
     println!("Using configuration file: {}", configstr);
     let configpath = Path::new(&configstr);
     let config = Ini::load_from_file(&configstr).unwrap();
@@ -619,7 +639,7 @@ fn main() {
 fn info(_req: HttpRequest) -> impl Responder {
     let info_data = InfoData {
         implementation: String::from("SightingDB"),
-        version: String::from("0.0.1"),
+        version: String::from("0.0.4"),
         vendor: String::from("Devo"),
         author: String::from("Sebastien Tricaud"),
     };
