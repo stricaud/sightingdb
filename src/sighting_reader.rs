@@ -29,7 +29,7 @@ pub fn read(db: &mut Database, path: &str, value: &str, with_stats: bool) -> Str
     // _shadow does not write the consensus
     db.write(&shadow_path, value, 0, false);
     
-    return attr;
+    attr
 }
 
 // Our internal reading does not trigger shadow sightings.

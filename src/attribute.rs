@@ -37,28 +37,14 @@ impl Attribute {
     }
     pub fn make_stats(&mut self, time: DateTime<Utc>) {
         let rounded_time = time.timestamp() - time.timestamp()%3600;
-        if self.stats.contains_key(&rounded_time) {
-            let mut cnt: u128;
-            cnt = *self.stats.get(&rounded_time).unwrap();
-            cnt += 1;
-            self.stats.insert(rounded_time, cnt);
-        } else {
-            self.stats.insert(rounded_time, 1);            
-        }
+        self.stats.entry(rounded_time).and_modify(|e| { *e += 1 }).or_insert(1);
     }
     pub fn make_stats_from_timestamp(&mut self, timestamp: i64) {
         let rounded_time = timestamp - timestamp%3600;
-        if self.stats.contains_key(&rounded_time) {
-            let mut cnt: u128;
-            cnt = *self.stats.get(&rounded_time).unwrap();
-            cnt += 1;
-            self.stats.insert(rounded_time, cnt);
-        } else {
-            self.stats.insert(rounded_time, 1);            
-        }
+        self.stats.entry(rounded_time).and_modify(|e| { *e += 1 }).or_insert(1);
     }
     pub fn count(&mut self) -> u128 {
-        return self.count;
+        self.count
     }
     pub fn incr(&mut self) {
         if self.first_seen.timestamp() == 0 {

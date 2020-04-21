@@ -45,6 +45,12 @@ impl SharedState {
     }    
 }
 
+impl Default for SharedState {
+     fn default() -> Self {
+         Self::new()
+     }
+}
+
 #[derive(Serialize)]
 pub struct Message {
     message: String
@@ -94,9 +100,9 @@ fn read_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) 
     match val {
         Some(v) => {
             let ans = sighting_reader::read(&mut sharedstate.db, path, v, true);
-            return HttpResponse::Ok().body(ans);
+            HttpResponse::Ok().body(ans)
         },
-        None => { return HttpResponse::Ok().json(Message{message: String::from("Error: val= not found!")}); }
+        None => { HttpResponse::Ok().json(Message{message: String::from("Error: val= not found!")}) }
     }    
 }
 fn read(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> impl Responder {
@@ -121,9 +127,9 @@ fn read(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> impl Res
     match val {
         Some(v) => {
             let ans = sighting_reader::read(&mut sharedstate.db, path, v, false);
-            return HttpResponse::Ok().body(ans);
+            HttpResponse::Ok().body(ans)
         },
-        None => { return HttpResponse::Ok().json(Message{message: String::from("Error: val= not found!")}); }
+        None => { HttpResponse::Ok().json(Message{message: String::from("Error: val= not found!")}) }
     }    
 }
 
@@ -158,12 +164,12 @@ fn write(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> HttpRes
             let timestamp_i = timestamp.parse::<i64>().unwrap_or(0);
             let could_write = sighting_writer::write(&mut sharedstate.db, path, v, timestamp_i);
             if could_write {
-                return HttpResponse::Ok().json(Message{message: String::from("ok")});
+                HttpResponse::Ok().json(Message{message: String::from("ok")})
             } else {
-                return HttpResponse::Ok().json(Message{message: String::from("Could not write request!")});                
+                HttpResponse::Ok().json(Message{message: String::from("Could not write request!")})                
             }
         },
-        None => { return HttpResponse::BadRequest().json(Message{message: String::from("Did not received a val= argument in the query string.")}); }
+        None => { HttpResponse::BadRequest().json(Message{message: String::from("Did not received a val= argument in the query string.")}) }
     }    
 }
 
@@ -214,8 +220,9 @@ fn read_bulk(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web::Json<PostD
     json_response.push_str("\n"); // however we need the line return :)
     
     json_response.push_str("\t]\n}\n");
-    return HttpResponse::Ok().body(json_response);        
+    HttpResponse::Ok().body(json_response)
 }
+
 fn read_bulk_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web::Json<PostData>, _req: HttpRequest) -> impl Responder {
     let sharedstate = &mut *data.lock().unwrap();
 
@@ -246,7 +253,7 @@ fn read_bulk_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web:
     json_response.push_str("\n"); // however we need the line return :)
     
     json_response.push_str("\t]\n}\n");
-    return HttpResponse::Ok().body(json_response);        
+    HttpResponse::Ok().body(json_response)
 }
 
 fn write_bulk(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web::Json<PostData>, _req: HttpRequest) -> impl Responder {
@@ -254,7 +261,7 @@ fn write_bulk(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web::Json<Post
     let mut could_write = false;
     
     for v in &postdata.items {
-        if v.value.len() > 0 { // There is no need to write a value that does not exists
+        if !v.value.is_empty()  { // There is no need to write a value that does not exists
             let http_header_auth = _req.head().headers.get("Authorization");
             match http_header_auth {
                 Some(apikey) => {
@@ -274,7 +281,7 @@ fn write_bulk(data: web::Data<Arc<Mutex<SharedState>>>, postdata: web::Json<Post
     if could_write {
         return HttpResponse::Ok().json(Message{message: String::from("ok")});
     }
-    return HttpResponse::Ok().json(Message{message: String::from("Invalid base64 encoding (base64 url with non padding) value")});
+    HttpResponse::Ok().json(Message{message: String::from("Invalid base64 encoding (base64 url with non padding) value")})
 }
 
 fn delete(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> HttpResponse {
@@ -299,12 +306,12 @@ fn delete(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> HttpRe
         return HttpResponse::Ok().json(Message{message: String::from("Namespace not found, nothing was deleted.")});
     }
     
-    return HttpResponse::Ok().json(Message{message: String::from("ok")});
+    HttpResponse::Ok().json(Message{message: String::from("ok")})
 }
 
 
 fn create_home_config() {
-    let mut home_config = PathBuf::from(dirs::home_dir().unwrap());
+    let mut home_config = dirs::home_dir().unwrap();
     home_config.push(".sightingdb");
     match fs::create_dir_all(home_config) {
         Ok(_) => {},
@@ -314,7 +321,7 @@ fn create_home_config() {
 
 fn sightingdb_get_config() -> Result<String, &'static str> {
     let ini_file = PathBuf::from("/etc/sightingdb/sightingdb.conf");
-    let mut home_ini_file = PathBuf::from(dirs::home_dir().unwrap());
+    let mut home_ini_file = dirs::home_dir().unwrap();
     
     let can_open = Path::new(&ini_file).exists();
     if can_open {
@@ -329,26 +336,26 @@ fn sightingdb_get_config() -> Result<String, &'static str> {
         return Ok(String::from(home_ini_file.to_str().unwrap()));
     }
     
-    return Err("Cannot locate sightingdb.conf in neither from the -c flag, /etc/sightingdb or ~/.sightingdb/");
+    Err("Cannot locate sightingdb.conf in neither from the -c flag, /etc/sightingdb or ~/.sightingdb/")
 }
 
 fn sightingdb_get_pid() -> String {
     let can_create_file = File::create("/var/run/sightingdb.pid");
     match can_create_file {
         Ok(_) => {
-            return String::from("/var/run/sightingdb.pid");
+            String::from("/var/run/sightingdb.pid")
         },
         Err(..) => {
-            let mut home_pid = PathBuf::from(dirs::home_dir().unwrap());
+            let mut home_pid = dirs::home_dir().unwrap();
             home_pid.push(".sightingdb");
             home_pid.push("sighting-daemon.pid");
             let pid_file = home_pid.to_str().unwrap();
             let can_create_home_pid_file = File::create(pid_file);
             match can_create_home_pid_file {
-                Ok(_) => { return String::from(pid_file); },
+                Ok(_) => { String::from(pid_file) },
                 Err(..) => {
                     println!("Cannot write pid to /var/run not ~/.sightingdb/, using current dir: sightingdb.pid");
-                    return String::from("./sightingdb.pid");
+                    String::from("./sightingdb.pid")
                 }
             }
         }
@@ -429,7 +436,7 @@ fn main() {
 
     let mut ssl_cert: PathBuf;
     let ssl_cert_config = daemon_config.get("ssl_cert").unwrap();
-    if ssl_cert_config.starts_with("/") {
+    if ssl_cert_config.starts_with('/') {
         ssl_cert = PathBuf::from(ssl_cert_config);
     } else {
         ssl_cert = PathBuf::from(configpath.parent().unwrap());
@@ -438,7 +445,7 @@ fn main() {
 
     let mut ssl_key: PathBuf;
     let ssl_key_config = daemon_config.get("ssl_key").unwrap();
-    if ssl_key_config.starts_with("/") {
+    if ssl_key_config.starts_with('/') {
         ssl_key = PathBuf::from(ssl_key_config);
     } else {
         ssl_key = PathBuf::from(configpath.parent().unwrap());
@@ -475,7 +482,7 @@ fn main() {
         // i -> info
         // untyped -> things that have an incorrect type match
 
-        let post_limit: usize = daemon_config.get("post_limit").unwrap().parse().unwrap_or(2500000000);
+        let post_limit: usize = daemon_config.get("post_limit").unwrap().parse().unwrap_or(2_500_000_000);
         
         HttpServer::new(move || { App::new().data(sharedstate.clone())
                         .route("/r/*", web::get().to(read))
@@ -505,5 +512,5 @@ fn info(_req: HttpRequest) -> impl Responder {
         vendor: String::from("Devo"),
         author: String::from("Sebastien Tricaud")
     };
-    return HttpResponse::Ok().json(&info_data);
+    HttpResponse::Ok().json(&info_data)
 }

@@ -30,7 +30,7 @@ impl Database {
         let mut tmphash = HashMap::new();
         tmphash.insert("".to_string(), attr);
         db.hashtable.insert("_config/acl/apikeys/changeme".to_string(), tmphash);
-        return db;
+        db
     }
     pub fn set_db_path(&mut self, path: String) {
         self.db_path = path;
@@ -89,7 +89,7 @@ impl Database {
             },
         }
 
-        if new_value_to_path == true && write_consensus == true {
+        if new_value_to_path && write_consensus {
             // Check for consensus
             // Do we have the value in _all? If not then
             // we add it and consensus is the count of the
@@ -97,7 +97,7 @@ impl Database {
             self.write(&"_all".to_string(), value, 0, false);
         }
         
-        return retval;
+        retval
     }
     pub fn new_consensus(&mut self, path: &str, value: &str, consensus_count: u128) -> u128 {
         let valuestable = self.hashtable.get_mut(&path.to_string()).unwrap();
@@ -106,12 +106,12 @@ impl Database {
             Some(_attr) => {
                 let iattr = valuestable.get_mut(&value.to_string()).unwrap();
                 iattr.set_consensus(consensus_count);
-                return iattr.consensus;
+                iattr.consensus
             },
             None => {
-                return 0;
+                0
             },            
-        };
+        }
     }
     pub fn get_count(&mut self, path: &str, value: &str) -> u128 {
         let valuestable = self.hashtable.get_mut(&path.to_string());
@@ -119,26 +119,26 @@ impl Database {
             Some(valuestable) => {
                 let attr = valuestable.get_mut(&value.to_string());
                 match attr {
-                    Some(attr) => { return attr.count(); },
+                    Some(attr) => { attr.count() },
                     None => {
-                        return 0;
+                        0
                     },            
-                };
+                }
             },
             None => {
-                return 0;
+                0
             },
-        };
+        }
     }
     pub fn namespace_exists(&mut self, namespace: &str) -> bool {
         let valuestable = self.hashtable.get_mut(&namespace.to_string());
 
         match valuestable {
             Some(_) => {
-                return true;
+                true
             },
             None => {
-                return false;
+                false
             },
         }
     }
@@ -168,17 +168,17 @@ impl Database {
                             return jattr;
                         }
                         let nostats = self.re_stats.replace(&jattr, "");
-                        return nostats.to_string();                        
+                        nostats.to_string()                        
                     },
                     None => {
                         let err = serde_json::to_string(&DbError{error: String::from("Value not found"), path: path.to_string(), value: value.to_string()});
-                        return err.unwrap();
+                        err.unwrap()
                     }
                 }
             },
             None => {
                 let err = serde_json::to_string(&DbError{error: String::from("Path not found"), path: path.to_string(), value: value.to_string()});
-                return err.unwrap();
+                err.unwrap()
             },
         }
         // return String::from(""); // unreachable statement, however I want to make it clear this is our default
@@ -188,12 +188,20 @@ impl Database {
         let res = self.hashtable.remove(&namespace.to_string());
         match res {
             Some(_) => {
-                return true;
+                true
             },
             None => {
-                return false;
+                false
             },
         }
     }
 
 }
+
+impl Default for Database {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
