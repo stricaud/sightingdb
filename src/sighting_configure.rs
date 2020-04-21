@@ -3,7 +3,7 @@
 // #[derive(PartialEq, Eq)]
 // pub enum ConfigStorage {
 //     IN_MEMORY,
-//     ON_DISK,    
+//     ON_DISK,
 // }
 
 // pub struct Configuration {
@@ -33,7 +33,7 @@
 //             }
 //         }
 //     }
-    
+
 // }
 
 // pub fn set(path: &str, value: &str) {
