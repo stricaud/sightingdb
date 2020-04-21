@@ -133,7 +133,7 @@ impl Database {
     }
     pub fn namespace_exists(&mut self, namespace: &str) -> bool {
         let valuestable = self.hashtable.get_mut(&namespace.to_string());
-	valuestable.is_some()
+        valuestable.is_some()
     }
 
     pub fn get_attr(
@@ -193,8 +193,8 @@ impl Database {
 
     pub fn delete(&mut self, namespace: &str) -> bool {
         let res = self.hashtable.remove(&namespace.to_string());
-	res.is_some()
- }
+        res.is_some()
+    }
 }
 
 impl Default for Database {
