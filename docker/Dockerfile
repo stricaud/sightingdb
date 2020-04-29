@@ -15,7 +15,7 @@ RUN openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 -keyout key.pem -ou
 WORKDIR /opt/sightingdb/
 RUN mkdir /var/log/sightingdb/
 
-COPY sightingdb-entrypoint.sh /usr/local/bin/
 EXPOSE 9999
-ENTRYPOINT ["/usr/local/bin/sightingdb-entrypoint.sh"] 
+COPY sightingdb-entrypoint.sh /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/sightingdb-entrypoint.sh"]
 
