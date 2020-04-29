@@ -13,7 +13,7 @@ pub struct Database {
 #[derive(Serialize)]
 pub struct DbError {
     error: String,
-    path: String,
+    namespace: String,
     value: String,
 }
 
@@ -136,6 +136,41 @@ impl Database {
         valuestable.is_some()
     }
 
+    pub fn get_namespace_attrs(&mut self, namespace: &str) -> String {
+        let valuestable = self.hashtable.get_mut(&namespace.to_string());
+
+        match valuestable {
+            Some(valuestable) => {
+                let mut all_attrs = String::from("{\n    \"items\": [\n");
+                let tablelen = valuestable.len();
+                let mut counter = 0;
+                for (_value, attr) in valuestable.iter() {
+                    let jattr = serde_json::to_string(&attr).unwrap();
+                    let nostats = self.re_stats.replace(&jattr, "");
+                    nostats.to_string();
+                    all_attrs.push_str("        ");
+                    all_attrs.push_str(&nostats);
+                    counter += 1;
+                    if counter == tablelen {
+                        all_attrs.push_str("\n    ]\n}\n");
+                    } else {
+                        all_attrs.push_str(",\n");
+                    }
+                }
+                return all_attrs;
+            },
+            None => {
+                let err = serde_json::to_string(&DbError {
+                    error: String::from("Namespace not found"),
+                    namespace: namespace.to_string(),
+                    value: "".to_string(),
+                });
+                err.unwrap()
+
+            }
+        }
+    }
+    
     pub fn get_attr(
         &mut self,
         path: &str,
@@ -172,7 +207,7 @@ impl Database {
                     None => {
                         let err = serde_json::to_string(&DbError {
                             error: String::from("Value not found"),
-                            path: path.to_string(),
+                            namespace: path.to_string(),
                             value: value.to_string(),
                         });
                         err.unwrap()
@@ -182,7 +217,7 @@ impl Database {
             None => {
                 let err = serde_json::to_string(&DbError {
                     error: String::from("Path not found"),
-                    path: path.to_string(),
+                    namespace: path.to_string(),
                     value: value.to_string(),
                 });
                 err.unwrap()

@@ -141,10 +141,14 @@ fn read(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> impl Res
         Some(v) => {
             let ans = sighting_reader::read(&mut sharedstate.db, path, v, false);
             HttpResponse::Ok().body(ans)
-        }
-        None => HttpResponse::Ok().json(Message {
-            message: String::from("Error: val= not found!"),
-        }),
+        },
+        // None => HttpResponse::Ok().json(Message {
+        //     message: String::from("Error: val= not found!"),
+        // }),
+        None => {
+            let ans = sighting_reader::read_namespace(&mut sharedstate.db, path);
+            HttpResponse::Ok().body(ans)            
+        },
     }
 }
 
