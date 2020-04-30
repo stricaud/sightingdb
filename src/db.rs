@@ -141,7 +141,7 @@ impl Database {
 
         match valuestable {
             Some(valuestable) => {
-                let mut all_attrs = String::from("{\n    \"items\": [\n");
+                let mut all_attrs = String::from("{\n    \"attributes\": [\n");
                 let tablelen = valuestable.len();
                 let mut counter = 0;
                 for (_value, attr) in valuestable.iter() {
