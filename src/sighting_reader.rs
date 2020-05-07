@@ -13,7 +13,7 @@ pub struct Message {
 //     value: String
 // }
 
-pub fn read(db: &mut Database, path: &str, value: &str, with_stats: bool) -> String {
+pub fn read(db: &mut Database, path: &str, value: &str, with_stats: bool, with_shadow: bool) -> String {
     if path.starts_with("_config/") {
         let err = serde_json::to_string(&Message {
             message: String::from("No access to _config namespace from outside!"),
@@ -24,13 +24,15 @@ pub fn read(db: &mut Database, path: &str, value: &str, with_stats: bool) -> Str
 
     let consensus = db.get_count(&"_all".to_string(), value);
     let attr = db.get_attr(path, value, with_stats, consensus);
-
+    
     // Shadow Sightings
-    let mut shadow_path: String = "_shadow/".to_owned();
-    shadow_path.push_str(path);
-    // _shadow does not write the consensus
-    db.write(&shadow_path, value, 0, false);
-
+    if with_shadow {
+        let mut shadow_path: String = "_shadow/".to_owned();
+        shadow_path.push_str(path);
+        // _shadow does not write the consensus
+        db.write(&shadow_path, value, 0, false);
+    }
+    
     attr
 }
 

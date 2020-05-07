@@ -101,10 +101,20 @@ fn read_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) 
         }
     }
     let query_string = QString::from(_req.query_string());
+
+    let val = query_string.get("noshadow");
+    let mut with_shadow = true;
+    match val {
+        Some(_v) => {
+            with_shadow = false;
+        },
+        None => {}
+    }
+
     let val = query_string.get("val");
     match val {
         Some(v) => {
-            let ans = sighting_reader::read(&mut sharedstate.db, path, v, true);
+            let ans = sighting_reader::read(&mut sharedstate.db, path, v, true, with_shadow);
             HttpResponse::Ok().body(ans)
         }
         None => HttpResponse::Ok().json(Message {
@@ -136,10 +146,21 @@ fn read(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> impl Res
     }
 
     let query_string = QString::from(_req.query_string());
+
+    let val = query_string.get("noshadow");
+    let mut with_shadow = true;
+    match val {
+        Some(_v) => {
+            with_shadow = false;
+        },
+        None => {}
+    }
+
+    
     let val = query_string.get("val");
     match val {
         Some(v) => {
-            let ans = sighting_reader::read(&mut sharedstate.db, path, v, false);
+            let ans = sighting_reader::read(&mut sharedstate.db, path, v, false, with_shadow);
             HttpResponse::Ok().body(ans)
         },
         // None => HttpResponse::Ok().json(Message {
@@ -216,6 +237,7 @@ pub struct BulkSighting {
     namespace: String,
     value: String,
     timestamp: Option<i64>,
+    noshadow: bool,
 }
 
 fn read_bulk(
@@ -257,7 +279,8 @@ fn read_bulk(
             &mut sharedstate.db,
             v.namespace.as_str(),
             v.value.as_str(),
-            false,
+            false, // no stats
+            !v.noshadow, 
         );
 
         json_response.push_str("\t\t");
@@ -312,6 +335,7 @@ fn read_bulk_with_stats(
             v.namespace.as_str(),
             v.value.as_str(),
             true,
+            !v.noshadow, 
         );
 
         json_response.push_str("\t\t");
