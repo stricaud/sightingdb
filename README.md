@@ -45,7 +45,25 @@ Reading
 	$ curl -k https://localhost:9999/r/my/namespace/?val=$(b64 127.0.0.1)
 	{"value":"127.0.0.1","first_seen":1566624658,"last_seen":1566624658,"count":1,"tag":"","ttl":0,"consensus":2}
 	
-	$ curl -k https://localhost:9999/w/another/namespace/?val=127.0.0.1
+	$ curl -k https://localhost:9999/r/another/namespace/?val=127.0.0.1
 	{"value":"127.0.0.1","first_seen":1566624686,"last_seen":1566624689,"count":2,"tag":"","ttl":0,"consensus":2}
-	
 
+	$ curl -k https://localhost:9999/rs/my/namespace/?val=127.0.0.1
+	{"value":"127.0.0.1","first_seen":1593719022,"last_seen":1593721509,"count":10,"tags":"","ttl":0,"stats":{"1593716400":2,"1593720000":8},"consensus":1}
+	
+Authentication
+--------------
+	$ curl -H 'Authorization: changeme' -k https://localhost:9999/w/my/namespace/?val=127.0.0.1
+	{"message":"ok"}	
+
+REST Endpoints
+==============
+	/w: write (GET)
+	/wb: write in bulk mode (POST)
+	/r: read (GET)
+	/rs: read with statistics (GET)
+	/rb: read in bulk mode (POST)
+	/rbs: read with statistics in bulk mode (POST)
+	/d: delete (GET)
+	/c: configure (GET)
+	/i: info (GET)
