@@ -239,6 +239,13 @@ impl Database {
         let res = self.hashtable.remove(&namespace.to_string());
         res.is_some()
     }
+
+    pub fn reset(&mut self) -> bool {
+	self.hashtable.clear();
+	
+	true
+    }
+    
 }
 
 // impl Default for Database {
