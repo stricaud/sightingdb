@@ -20,9 +20,9 @@ pub struct DbError {
 }
 
 impl Database {
-    pub fn new() -> Database {
+    pub fn new(dbdir: &String) -> Database {
         let mut db = Database {
-            db_path: String::from(""),
+            db_path: String::from(dbdir),
             hashtable: HashMap::new(),
             // "stats":{"1586548800":1},
             re_stats: Regex::new(r"\x22stats\x22:\{.+\},").unwrap(),
@@ -241,8 +241,8 @@ impl Database {
     }
 }
 
-impl Default for Database {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// impl Default for Database {
+//     fn default(dbdir: &String) -> Self {
+//         Self::new(dbdir)
+//     }
+// }

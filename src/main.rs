@@ -36,19 +36,19 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    pub fn new() -> Self {
+    pub fn new(dbdir: &String) -> Self {
         Self {
-            db: db::Database::new(),
+            db: db::Database::new(dbdir),
             authenticate: true,
         }
     }
 }
 
-impl Default for SharedState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// impl Default for SharedState {
+//     fn default(dbdir: &String) -> Self {
+//         Self::new(dbdir)
+//     }
+// }
 
 #[derive(Serialize)]
 pub struct Message {
@@ -561,8 +561,21 @@ fn main() {
         _ => use_ssl = true, // no mistake, only false can start the unsecure server.
     }
 
+    let sighting_dbdir;
     match daemon_config.get("dbdir") {
-	Some(dbdir) => { println!("Let's write to {}", dbdir); },
+	Some(dbdir) => {
+	    println!("Persistency for SightingDB directory: {}", dbdir);
+	    match fs::create_dir_all(dbdir) {
+		Ok(_) => { sighting_dbdir = dbdir; },
+		Err(e) => {
+		    let error = Red
+			.paint("CRITICAL: Cannot create database directory")
+			.to_string();
+		    println!("{}: {}", error, e);
+		    std::process::exit(1);
+		}
+	    }
+	},
 	None => {
 	    let error = Red
 		.paint("CRITICAL: Unable to get dbdir from configuration file!")
@@ -572,7 +585,7 @@ fn main() {
 	}
     }
     
-    let sharedstate = Arc::new(Mutex::new(SharedState::new()));
+    let sharedstate = Arc::new(Mutex::new(SharedState::new(sighting_dbdir)));
     match daemon_config.get("authenticate").unwrap().as_ref() {
         "false" => {
             sharedstate.lock().unwrap().authenticate = false;
