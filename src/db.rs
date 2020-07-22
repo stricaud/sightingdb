@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 use crate::attribute::Attribute;
+#[path="./disk.rs"]
+mod disk;
 
 pub struct Database {
     db_path: String, // Where are DB is stored on disk
@@ -27,6 +29,9 @@ impl Database {
         };
         // We initialize the default apikey: 'changeme'
         let attr = Attribute::new("");
+
+	disk::store_attribute(&db.db_path, &"_config/acl/apikeys/changeme".to_string(), &attr);
+
         let mut tmphash = HashMap::new();
         tmphash.insert("".to_string(), attr);
         db.hashtable
@@ -60,6 +65,8 @@ impl Database {
                         } else {
                             iattr.incr();
                         }
+			disk::store_attribute(&self.db_path, &path.to_string(), &iattr);
+
                         retval = iattr.count;
                     }
                     None => {
@@ -72,6 +79,7 @@ impl Database {
                         }
 
                         retval = iattr.count;
+			disk::store_attribute(&self.db_path, &path.to_string(), &iattr);
 
                         valuestable.insert(value.to_string(), iattr);
                         new_value_to_path = true;
@@ -90,6 +98,7 @@ impl Database {
 
                 retval = iattr.count;
 
+		disk::store_attribute(&self.db_path, &path.to_string(), &iattr);
                 newvaluestable.insert(value.to_string(), iattr);
                 self.hashtable.insert(path.to_string(), newvaluestable);
                 new_value_to_path = true;

@@ -493,8 +493,6 @@ fn sightingdb_get_pid() -> String {
 fn main() {
     create_home_config();
 
-    let sharedstate = Arc::new(Mutex::new(SharedState::new()));
-
     let matches = clap::App::new("SightingDB")
         .version("0.4")
         .author("Sebastien Tricaud <sebastien.tricaud@devo.com>")
@@ -542,18 +540,6 @@ fn main() {
         }
     }
 
-    let apikeyarg = matches.value_of("apikey");
-    match apikeyarg {
-        Some(apikey)  => {            
-            sharedstate.lock().unwrap().db.delete("_config/acl/apikeys/changeme");
-            let mut namespace_withkey = String::from("_config/acl/apikeys/");
-            namespace_withkey.push_str(apikey);
-            sharedstate.lock().unwrap().db.write(&namespace_withkey, "", 0, false);
-        },
-        None => {},
-    }
-    
-    
     println!("Using configuration file: {}", configstr);
     let configpath = Path::new(&configstr);
     let config = Ini::load_from_file(&configstr).unwrap();
@@ -574,6 +560,19 @@ fn main() {
         "false" => use_ssl = false,
         _ => use_ssl = true, // no mistake, only false can start the unsecure server.
     }
+
+    match daemon_config.get("dbdir") {
+	Some(dbdir) => { println!("Let's write to {}", dbdir); },
+	None => {
+	    let error = Red
+		.paint("CRITICAL: Unable to get dbdir from configuration file!")
+		.to_string();
+            println!("{}", error);
+	    std::process::exit(1);
+	}
+    }
+    
+    let sharedstate = Arc::new(Mutex::new(SharedState::new()));
     match daemon_config.get("authenticate").unwrap().as_ref() {
         "false" => {
             sharedstate.lock().unwrap().authenticate = false;
@@ -585,8 +584,8 @@ fn main() {
             .paint("No authentication used for the database.")
             .to_string();
         println!("{}", auth_string);
-    }
-
+    }    
+    
     let mut ssl_cert: PathBuf;
     let ssl_cert_config = daemon_config.get("ssl_cert").unwrap();
     if ssl_cert_config.starts_with('/') {
@@ -620,6 +619,17 @@ fn main() {
         _ => println!("Unknown daemon setting. Starting in foreground."),
     }
 
+    let apikeyarg = matches.value_of("apikey");
+    match apikeyarg {
+        Some(apikey)  => {            
+            sharedstate.lock().unwrap().db.delete("_config/acl/apikeys/changeme");
+            let mut namespace_withkey = String::from("_config/acl/apikeys/");
+            namespace_withkey.push_str(apikey);
+            sharedstate.lock().unwrap().db.write(&namespace_withkey, "", 0, false);
+        },
+        None => {},
+    }
+    
     if use_ssl {
         let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
         builder

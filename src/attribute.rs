@@ -5,7 +5,7 @@ use std::fmt;
 use chrono::serde::ts_seconds;
 use std::collections::BTreeMap;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Attribute {
     pub value: String,
     #[serde(with = "ts_seconds")]
