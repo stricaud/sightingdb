@@ -1,11 +1,15 @@
 use hex;
 use sha2::{Sha512, Digest};
+
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::{PathBuf};
 //use serde::Serialize;
 
+use walkdir::WalkDir;
+
+use crate::db::Database;
 use crate::attribute::Attribute;
 
 // pub fn store_attribute(attr: Attribute)
@@ -32,4 +36,28 @@ pub fn store_attribute(dbdir: &String, namespace: &String, attr: &Attribute)
 	Ok(_) => {},
 	Err(e) => { println!("Error writing to database: {}", e); }
     }
+}
+
+pub fn retrieve_attributes(db: &mut Database)
+{
+    &db.reset();
+    let dbpath = &db.get_db_path().clone();
+    // println!("-->db dir:{}", dbpath.len());
+
+    for entry in WalkDir::new(dbpath)
+	.into_iter()
+	.filter_map(|e| e.ok()) {
+	    if entry.metadata().unwrap().is_file() {
+		let mut attrfile = File::open(entry.path()).unwrap();
+		let mut attrbuf = String::new();
+		attrfile.read_to_string(&mut attrbuf);		
+		let attr: Attribute = serde_json::from_str(&attrbuf).unwrap();
+		
+		let mut parent_dir = String::from(entry.path().parent().unwrap().to_str().unwrap());
+		let namespace = parent_dir.split_off(dbpath.len());
+
+		&db.write(&namespace, &attr.value, attr.last_seen.timestamp(), attr.count, false, false);
+	    }
+    }
+    
 }

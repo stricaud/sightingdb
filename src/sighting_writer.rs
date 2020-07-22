@@ -4,6 +4,6 @@
 use crate::db::Database;
 
 pub fn write(db: &mut Database, path: &str, value: &str, timestamp: i64) -> bool {
-    db.write(path, value, timestamp, true);
+    db.write(path, value, timestamp, 0, true, true);
     true
 }

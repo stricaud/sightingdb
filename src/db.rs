@@ -41,76 +41,100 @@ impl Database {
     pub fn set_db_path(&mut self, path: String) {
         self.db_path = path;
     }
+    pub fn get_db_path(&mut self) -> &String {
+	return &self.db_path;
+    }
     // Return the count of the written value
     pub fn write(
         &mut self,
-        path: &str,
+        namespace: &str,
         value: &str,
         timestamp: i64,
+	count: u128,
         write_consensus: bool,
+	write_to_disk: bool,
     ) -> u128 {
-        let valuestable = self.hashtable.get_mut(&path.to_string());
-        let mut new_value_to_path = false;
+        let valuestable = self.hashtable.get_mut(&namespace.to_string());
+        let mut new_value_to_namespace = false;
         let retval;
 
         match valuestable {
             Some(valuestable) => {
-                //let mut valuestable = self.hashtable.get_mut(&path.to_string()).unwrap();
+                //let mut valuestable = self.hashtable.get_mut(&namespace.to_string()).unwrap();
                 let attr = valuestable.get(&value.to_string());
                 match attr {
                     Some(_attr) => {
                         let iattr = valuestable.get_mut(&value.to_string()).unwrap();
-                        if timestamp > 0 {
-                            iattr.incr_from_timestamp(timestamp);
-                        } else {
-                            iattr.incr();
-                        }
-			disk::store_attribute(&self.db_path, &path.to_string(), &iattr);
+			if count > 0 {
+			    iattr.count = count;
+			} else {
+                            if timestamp > 0 {
+				iattr.incr_from_timestamp(timestamp);
+                            } else {
+				iattr.incr();
+                            }
+			}
+			if write_to_disk {
+			    disk::store_attribute(&self.db_path, &namespace.to_string(), &iattr);
+			}
 
                         retval = iattr.count;
                     }
                     None => {
-                        // New Value to existing path
+                        // New Value to existing namespace
                         let mut iattr = Attribute::new(&value);
-                        if timestamp > 0 {
-                            iattr.incr_from_timestamp(timestamp);
-                        } else {
-                            iattr.incr();
-                        }
+			if count > 0 {
+			    iattr.count = count;
+			} else {
+                            if timestamp > 0 {
+				iattr.incr_from_timestamp(timestamp);
+                            } else {
+				iattr.incr();
+                            }
+			}
 
                         retval = iattr.count;
-			disk::store_attribute(&self.db_path, &path.to_string(), &iattr);
-
+			if write_to_disk {
+			    disk::store_attribute(&self.db_path, &namespace.to_string(), &iattr);
+			}
+			
                         valuestable.insert(value.to_string(), iattr);
-                        new_value_to_path = true;
+                        new_value_to_namespace = true;
                     }
                 }
             }
             None => {
-                // New Value to a path that does not exist
+                // New Value to a namespace that does not exist
                 let mut newvaluestable = HashMap::new();
                 let mut iattr = Attribute::new(&value);
-                if timestamp > 0 {
-                    iattr.incr_from_timestamp(timestamp);
-                } else {
-                    iattr.incr();
-                }
+
+		if count > 0 {
+		    iattr.count = count;
+		} else {
+                    if timestamp > 0 {
+			iattr.incr_from_timestamp(timestamp);
+                    } else {
+			iattr.incr();
+                    }
+		}
 
                 retval = iattr.count;
 
-		disk::store_attribute(&self.db_path, &path.to_string(), &iattr);
+		if write_to_disk {
+		    disk::store_attribute(&self.db_path, &namespace.to_string(), &iattr);
+		}
                 newvaluestable.insert(value.to_string(), iattr);
-                self.hashtable.insert(path.to_string(), newvaluestable);
-                new_value_to_path = true;
+                self.hashtable.insert(namespace.to_string(), newvaluestable);
+                new_value_to_namespace = true;
             }
         }
 
-        if new_value_to_path && write_consensus {
+        if new_value_to_namespace && write_consensus {
             // Check for consensus
             // Do we have the value in _all? If not then
             // we add it and consensus is the count of the
             // value from _all.
-            self.write(&"_all".to_string(), value, 0, false);
+            self.write(&"_all".to_string(), value, 0, 0, false, write_to_disk);
         }
 
         retval

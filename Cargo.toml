@@ -37,6 +37,8 @@ hex = "*"
 sha2 = "*"
 futures = "0.3"
 
+walkdir = "*"
+
 [dependencies.chrono]
 version = "0.4.7"
 features = ["serde"]

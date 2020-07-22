@@ -10,6 +10,7 @@ mod db;
 mod sighting_configure;
 mod sighting_reader;
 mod sighting_writer;
+mod disk;
 
 use clap::Arg;
 use std::sync::Arc;
@@ -638,10 +639,12 @@ fn main() {
             sharedstate.lock().unwrap().db.delete("_config/acl/apikeys/changeme");
             let mut namespace_withkey = String::from("_config/acl/apikeys/");
             namespace_withkey.push_str(apikey);
-            sharedstate.lock().unwrap().db.write(&namespace_withkey, "", 0, false);
+            sharedstate.lock().unwrap().db.write(&namespace_withkey, "", 0, 0, false, true);
         },
         None => {},
     }
+
+    disk::retrieve_attributes(&mut sharedstate.lock().unwrap().db);
     
     if use_ssl {
         let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
