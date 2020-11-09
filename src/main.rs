@@ -10,6 +10,7 @@ mod db;
 mod sighting_configure;
 mod sighting_reader;
 mod sighting_writer;
+mod db_log;
 
 use clap::Arg;
 use std::sync::Arc;
@@ -107,7 +108,7 @@ fn read_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) 
     match val {
         Some(_v) => {
             with_shadow = false;
-        },
+        }
         None => {}
     }
 
@@ -122,6 +123,7 @@ fn read_with_stats(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) 
         }),
     }
 }
+
 fn read(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> impl Responder {
     let sharedstate = &mut *data.lock().unwrap();
 
@@ -152,24 +154,24 @@ fn read(data: web::Data<Arc<Mutex<SharedState>>>, _req: HttpRequest) -> impl Res
     match val {
         Some(_v) => {
             with_shadow = false;
-        },
+        }
         None => {}
     }
 
-    
+
     let val = query_string.get("val");
     match val {
         Some(v) => {
             let ans = sighting_reader::read(&mut sharedstate.db, path, v, false, with_shadow);
             HttpResponse::Ok().body(ans)
-        },
+        }
         // None => HttpResponse::Ok().json(Message {
         //     message: String::from("Error: val= not found!"),
         // }),
         None => {
             let ans = sighting_reader::read_namespace(&mut sharedstate.db, path);
-            HttpResponse::Ok().body(ans)            
-        },
+            HttpResponse::Ok().body(ans)
+        }
     }
 }
 
@@ -280,7 +282,7 @@ fn read_bulk(
             v.namespace.as_str(),
             v.value.as_str(),
             false, // no stats
-            !v.noshadow, 
+            !v.noshadow,
         );
 
         json_response.push_str("\t\t");
@@ -335,7 +337,7 @@ fn read_bulk_with_stats(
             v.namespace.as_str(),
             v.value.as_str(),
             true,
-            !v.noshadow, 
+            !v.noshadow,
         );
 
         json_response.push_str("\t\t");
@@ -443,7 +445,7 @@ fn create_home_config() {
     match fs::create_dir_all(home_config) {
         Ok(_) => {}
         Err(e) => {
-            println!("Error creating home configuration: {}", e);
+            log::error!("Error creating home configuration: {}", e);
         }
     }
 }
@@ -481,7 +483,7 @@ fn sightingdb_get_pid() -> String {
             match can_create_home_pid_file {
                 Ok(_) => String::from(pid_file),
                 Err(..) => {
-                    println!("Cannot write pid to /var/run not ~/.sightingdb/, using current dir: sightingdb.pid");
+                    log::error!("Cannot write pid to /var/run not ~/.sightingdb/, using current dir: sightingdb.pid");
                     String::from("./sightingdb.pid")
                 }
             }
@@ -508,6 +510,13 @@ fn main() {
                 .takes_value(true),
         )
         .arg(
+            Arg::with_name("logging-config")
+                .short("l")
+                .long("logging-config")
+                .value_name("LOGGING_CONFIG")
+                .takes_value(true)
+        )
+        .arg(
             Arg::with_name("v")
                 .short("v")
                 .multiple(true)
@@ -519,9 +528,11 @@ fn main() {
                 .long("apikey")
                 .value_name("APIKEY")
                 .help("Set the default API KEY")
-                .takes_value(true)                
+                .takes_value(true)
         )
         .get_matches();
+
+    log4rs::init_file(matches.value_of("logging_config").unwrap_or("etc/log4rs.yml"), Default::default()).unwrap();
 
     // match matches.occurrences_of("v") {
     //     0 => println!("No verbose info"),
@@ -544,20 +555,20 @@ fn main() {
 
     let apikeyarg = matches.value_of("apikey");
     match apikeyarg {
-        Some(apikey)  => {            
+        Some(apikey) => {
             sharedstate.lock().unwrap().db.delete("_config/acl/apikeys/changeme");
             let mut namespace_withkey = String::from("_config/acl/apikeys/");
             namespace_withkey.push_str(apikey);
             sharedstate.lock().unwrap().db.write(&namespace_withkey, "", 0, false);
-        },
-        None => {},
+        }
+        None => {}
     }
-    
-    
-    println!("Using configuration file: {}", configstr);
+
+
+    log::info!("Using configuration file: {}", configstr);
     let configpath = Path::new(&configstr);
     let config = Ini::load_from_file(&configstr).unwrap();
-    println!("Config path:{}", configpath.parent().unwrap().display());
+    log::info!("Config path:{}", configpath.parent().unwrap().display());
 
     let daemon_config = config.section(Some("daemon")).unwrap();
 
@@ -567,7 +578,7 @@ fn main() {
     let server_address = format!("{}:{}", listen_ip, listen_port);
 
     let welcome_string = Red.paint("Starting Sighting Daemon").to_string();
-    println!("{}", welcome_string);
+    log::info!("{}", welcome_string);
 
     let use_ssl;
     match daemon_config.get("ssl").unwrap().as_ref() {
@@ -584,7 +595,7 @@ fn main() {
         let auth_string = Red
             .paint("No authentication used for the database.")
             .to_string();
-        println!("{}", auth_string);
+        log::info!("{}", auth_string);
     }
 
     let mut ssl_cert: PathBuf;
@@ -612,12 +623,12 @@ fn main() {
 
             let pid_file = sightingdb_get_pid();
             match Daemonize::new().pid_file(pid_file).stdout(stdout).stderr(stderr).start() {
-                Ok(_) => {},
-                Err(e) => println!("Error starting daemon: {}", e),
+                Ok(_) => {}
+                Err(e) => log::error!("Error starting daemon: {}", e),
             }
-        },
-        "false" => println!("This daemon is not daemonized. To run in background, set 'daemonize = true' in sigthing-daemon.ini"),
-        _ => println!("Unknown daemon setting. Starting in foreground."),
+        }
+        "false" => log::warn!("This daemon is not daemonized. To run in background, set 'daemonize = true' in sigthing-daemon.ini"),
+        _ => log::info!("Unknown daemon setting. Starting in foreground."),
     }
 
     if use_ssl {
@@ -657,10 +668,10 @@ fn main() {
                 .default_service(web::to(help))
                 .data(web::JsonConfig::default().limit(post_limit))
         })
-        .bind_ssl(server_address, builder)
-        .unwrap()
-        .run()
-        .unwrap();
+            .bind_ssl(server_address, builder)
+            .unwrap()
+            .run()
+            .unwrap();
     }
 }
 

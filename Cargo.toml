@@ -24,6 +24,8 @@ atomicwrites = "0.2.3"
 #protobuf = "2.6.2"
 
 rust-ini = "0.13.0"
+log4rs = "0.13.0"
+log = "0.4.11"
 openssl = "0.10.23"
 base64 = "0.10.1"
 #memory-balloon = "0.1.0"
