@@ -3,9 +3,11 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 use crate::attribute::Attribute;
+use crate::db_log::log_attribute;
 
 pub struct Database {
-    db_path: String, // Where are DB is stored on disk
+    db_path: String,
+    // Where are DB is stored on disk
     hashtable: HashMap<String, HashMap<String, Attribute>>,
     re_stats: Regex,
 }
@@ -44,57 +46,34 @@ impl Database {
         timestamp: i64,
         write_consensus: bool,
     ) -> u128 {
-        let valuestable = self.hashtable.get_mut(&path.to_string());
-        let mut new_value_to_path = false;
-        let retval;
-
-        match valuestable {
+        let (attr, new_value_to_path) = match self.hashtable.get_mut(path) {
             Some(valuestable) => {
-                //let mut valuestable = self.hashtable.get_mut(&path.to_string()).unwrap();
-                let attr = valuestable.get(&value.to_string());
-                match attr {
-                    Some(_attr) => {
-                        let iattr = valuestable.get_mut(&value.to_string()).unwrap();
-                        if timestamp > 0 {
-                            iattr.incr_from_timestamp(timestamp);
-                        } else {
-                            iattr.incr();
-                        }
-                        retval = iattr.count;
-                    }
+                match valuestable.get_mut(value) {
+                    // New attribute in a path that exists
                     None => {
-                        // New Value to existing path
-                        let mut iattr = Attribute::new(&value);
-                        if timestamp > 0 {
-                            iattr.incr_from_timestamp(timestamp);
-                        } else {
-                            iattr.incr();
-                        }
-
-                        retval = iattr.count;
-
-                        valuestable.insert(value.to_string(), iattr);
-                        new_value_to_path = true;
+                        let mut attr = Attribute::new(value);
+                        attr.increment(timestamp);
+                        valuestable.insert(value.to_string(), attr.clone());
+                        (attr, false)
+                    }
+                    // Update to an existing attribute
+                    Some(attr) => {
+                        attr.increment(timestamp);
+                        (attr.clone(), true)
                     }
                 }
             }
             None => {
-                // New Value to a path that does not exist
+                // New value to a path that does not exist
                 let mut newvaluestable = HashMap::new();
-                let mut iattr = Attribute::new(&value);
-                if timestamp > 0 {
-                    iattr.incr_from_timestamp(timestamp);
-                } else {
-                    iattr.incr();
-                }
-
-                retval = iattr.count;
-
-                newvaluestable.insert(value.to_string(), iattr);
+                let mut attr = Attribute::new(value);
+                attr.increment(timestamp);
+                newvaluestable.insert(value.to_string(), attr.clone());
                 self.hashtable.insert(path.to_string(), newvaluestable);
-                new_value_to_path = true;
+                (attr, true)
             }
-        }
+        };
+
 
         if new_value_to_path && write_consensus {
             // Check for consensus
@@ -103,9 +82,10 @@ impl Database {
             // value from _all.
             self.write(&"_all".to_string(), value, 0, false);
         }
-
-        retval
+        log_attribute(path, &attr);
+        attr.count
     }
+
     pub fn new_consensus(&mut self, path: &str, value: &str, consensus_count: u128) -> u128 {
         let valuestable = self.hashtable.get_mut(&path.to_string()).unwrap();
         let attr = valuestable.get_mut(&value.to_string());
@@ -158,7 +138,7 @@ impl Database {
                     }
                 }
                 return all_attrs;
-            },
+            }
             None => {
                 let err = serde_json::to_string(&DbError {
                     error: String::from("Namespace not found"),
@@ -166,11 +146,10 @@ impl Database {
                     value: "".to_string(),
                 });
                 err.unwrap()
-
             }
         }
     }
-    
+
     pub fn get_attr(
         &mut self,
         path: &str,

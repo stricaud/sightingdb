@@ -5,7 +5,7 @@ use std::fmt;
 use chrono::serde::ts_seconds;
 use std::collections::BTreeMap;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Attribute {
     pub value: String,
     #[serde(with = "ts_seconds")]
@@ -16,7 +16,8 @@ pub struct Attribute {
     pub tags: String,
     pub ttl: u128,
     // #[serde(skip)]
-    pub stats: BTreeMap<i64, u128>, // i64 because DateTime.timestamp() returns i64 :'(; We track count by time.
+    pub stats: BTreeMap<i64, u128>,
+    // i64 because DateTime.timestamp() returns i64 :'(; We track count by time.
     pub consensus: u128,
 }
 
@@ -80,6 +81,13 @@ impl Attribute {
         }
         self.make_stats_from_timestamp(timestamp);
         self.count += 1;
+    }
+    pub fn increment(&mut self, timestamp: i64) {
+        if timestamp.is_negative() {
+            self.incr()
+        } else {
+            self.incr_from_timestamp(timestamp)
+        }
     }
 }
 
