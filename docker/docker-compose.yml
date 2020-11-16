@@ -1,0 +1,8 @@
+version: '3'
+services:
+  sightingdb:
+    build: .
+    environment:
+      - SIGHTINGDB_APIKEY=changeme
+    ports:
+      - "9999:9999"
