@@ -1,4 +1,3 @@
-use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -8,8 +7,7 @@ use crate::db_log::log_attribute;
 pub struct Database {
     db_path: String,
     // Where are DB is stored on disk
-    hashtable: HashMap<String, HashMap<String, Attribute>>,
-    re_stats: Regex,
+    hashtable: HashMap<String, HashMap<String, Attribute>>
 }
 
 #[derive(Serialize)]
@@ -24,8 +22,6 @@ impl Database {
         let mut db = Database {
             db_path: String::from(""),
             hashtable: HashMap::new(),
-            // "stats":{"1586548800":1},
-            re_stats: Regex::new(r"\x22stats\x22:\{.+\},").unwrap(),
         };
         // We initialize the default apikey: 'changeme'
         let attr = Attribute::new("");
@@ -121,23 +117,9 @@ impl Database {
 
         match valuestable {
             Some(valuestable) => {
-                let mut all_attrs = String::from("{\n    \"attributes\": [\n");
-                let tablelen = valuestable.len();
-                let mut counter = 0;
-                for (_value, attr) in valuestable.iter() {
-                    let jattr = serde_json::to_string(&attr).unwrap();
-                    let nostats = self.re_stats.replace(&jattr, "");
-                    nostats.to_string();
-                    all_attrs.push_str("        ");
-                    all_attrs.push_str(&nostats);
-                    counter += 1;
-                    if counter == tablelen {
-                        all_attrs.push_str("\n    ]\n}\n");
-                    } else {
-                        all_attrs.push_str(",\n");
-                    }
-                }
-                return all_attrs;
+                let mut response: HashMap<&str, Vec<&Attribute>> = HashMap::new();
+                response.insert("attributes", valuestable.iter().map(|(_, attr)| attr).collect::<Vec<_>>());
+                serde_json::to_string(&response).unwrap()
             }
             None => {
                 let err = serde_json::to_string(&DbError {
@@ -169,19 +151,11 @@ impl Database {
                         }
                         attr.consensus = consensus_count;
 
-                        // FIXME: There MUST be a better way to handle the stats de-serialization
-                        // in short I want to store stats with attributes, but at the same time
-                        // not send them everytime one want to fetch an attribute, only
-                        // when the user requests the statistics. Otherwise it can be rather large.
-                        // I find regex more elegant (and faster) than deserializing to reserialize.
-                        // Maybe I should use deserialize_with, but I could not find a great way to
-                        // use it for what I want. Open to suggestions here :)
-                        let jattr = serde_json::to_string(&attr).unwrap();
                         if with_stats {
-                            return jattr;
+                            attr.serialize_with_stats().unwrap()
+                        } else {
+                            serde_json::to_string(attr).unwrap()
                         }
-                        let nostats = self.re_stats.replace(&jattr, "");
-                        nostats.to_string()
                     }
                     None => {
                         let err = serde_json::to_string(&DbError {
