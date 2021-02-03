@@ -26,7 +26,7 @@ To run from the source directory:
 1. Generate a certificate: `cd etc; mkdir ssl; cd ssl; openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 -keyout key.pem -out cert.pem; cd ../..`
 2. `ln -s etc/ssl ssl`
 3. `ln -s etc/sighting-daemon.ini sighting-daemon.ini`
-4. Start the Sighting DB: ./target/debug/sighting-daemon
+4. Start the Sighting DB: ./target/debug/sightingdb
 
 Client Demo
 ===========
