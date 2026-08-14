@@ -2,43 +2,33 @@
 name = "sightingdb"
 version = "0.0.4"
 authors = ["Sebastien Tricaud <sebastien.tricaud@devo.com>"]
-edition = "2018"
+edition = "2024"
+rust-version = "1.85"
+license = "BSD-3-Clause"
+description = "A database designed for Sightings, a technique to count items"
+repository = "https://github.com/stricaud/sightingdb"
 
 [[bin]]
 name = "sightingdb"
 path = "src/main.rs"
 
 [dependencies]
-dirs = "2.0.2"
-rustyline = "5.0.0"
+actix-web = { version = "4.14", features = ["openssl"] }
+anyhow = "1.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6", features = ["derive"] }
+daemonize = "0.5"
+dirs = "6.0"
+log = "0.4"
+log4rs = "1.4"
+openssl = "0.10.81"
+rust-ini = "0.21"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
-reqwest = "0.9.18"
-daemonize = "0.4.1"
+[dev-dependencies]
+actix-rt = "2.11"
 
-serde = "1.0.94"
-serde_json = { version = "1.0.39", features = ["arbitrary_precision"] }
-
-ansi_term = "0.9"
-atomicwrites = "0.2.3"
-#protobuf = "2.6.2"
-
-rust-ini = "0.13.0"
-log4rs = "0.13.0"
-log = "0.4.11"
-openssl = "0.10.23"
-base64 = "0.10.1"
-#memory-balloon = "0.1.0"
-clap = "2.33.0"
-qstring = "0.7.0"
-anyhow = "1.0.34"
-
-bincode = "*"
-flate2 = "*"
-
-[dependencies.chrono]
-version = "0.4.7"
-features = ["serde"]
-
-[dependencies.actix-web]
-version = "1.0.0"
-features = ["ssl"]
+[profile.release]
+lto = "thin"
+codegen-units = 1

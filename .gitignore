@@ -2,3 +2,5 @@
 log/
 etc/ssl
 ssl
+.idea/
+*.pid
