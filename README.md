@@ -91,7 +91,7 @@ Authentication
 	$ curl -H 'Authorization: changeme' -k https://localhost:9999/w/my/namespace/?val=127.0.0.1
 	{"message":"ok","count":1}
 
-Authentication is on unless `authenticate=false` is set in the configuration. Any registered key currently grants full access to every namespace; per-namespace permissions are not implemented yet.
+Authentication is on unless `authenticate=false` is set in the configuration. Keys and their permissions are declared in the `[acl]` section; see below.
 
 REST Endpoints
 ==============
@@ -134,6 +134,42 @@ install never starts discarding data on its own. The configuration shipped in
 growth — without them, statistics accumulate one bucket per hour per value and
 `_shadow/*` grows for every distinct search, forever.
 
+Access control
+==============
+
+API keys and what each may reach are declared in an `[acl]` section:
+
+	[acl]
+	admin     = rw
+	analyst   = r
+	feed-misp = rw:feeds/misp
+	mixed     = r, w:staging
+
+Each entry is `<apikey> = <grant>[, <grant>...]`. A grant is `r`, `w` or `rw`,
+optionally scoped with `:<namespace prefix>`; without a prefix it covers every
+namespace. A key's grants are unioned, and anything not granted is denied.
+
+Prefixes match **whole path segments**, so `rw:feeds/misp` covers
+`feeds/misp` and `feeds/misp/ips` but not `feeds/misp-internal` or `feeds`.
+
+A refusal is always `403` with the same body whether the key is unknown or
+merely out of scope, so that probing cannot tell valid keys from invalid ones.
+
+`-k <key>` still overrides everything with a single full-access key, replacing
+the built-in `changeme`.
+
+Keys are stored in the configuration in the clear. Keep that file readable only
+by the user the daemon runs as, and serve over TLS.
+
+### Upgrading
+
+Older versions kept API keys in the database and gave every key full access to
+everything. If the configuration has no `[acl]` section, keys restored from a
+snapshot keep exactly that access, so upgrading does not lock out a running
+deployment — the daemon logs a warning telling you to scope them. Adding an
+`[acl]` section makes it authoritative, and the keys in the snapshot are then
+ignored.
+
 Persistence
 ===========
 
@@ -147,8 +183,8 @@ A snapshot that exists but cannot be parsed is a fatal startup error rather than
 a silent fresh start, since starting empty would look like total data loss and
 the next save would make it real.
 
-API keys live in the database, so they are part of the snapshot and survive a
-restart. `-k` still applies on top of whatever was restored.
+API keys are *not* in the snapshot: they come from the configuration, so
+permissions are reviewable and can live in version control.
 
 Tests
 =====

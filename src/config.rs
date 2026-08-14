@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use ini::Ini;
 
+use crate::acl::{Acl, parse_grants};
 use crate::db::DatabasePolicy;
 
 /// Fallback body size limit for bulk POSTs, used when the config value cannot
@@ -35,6 +36,9 @@ pub struct Settings {
     pub stats_retention: usize,
     /// TTL applied to shadow sightings; 0 means they never expire.
     pub shadow_ttl: u64,
+    /// API keys and their permissions. `None` means the config declared no
+    /// `[acl]` section at all, which is what an un-migrated install looks like.
+    pub acl: Option<Acl>,
 }
 
 impl Settings {
@@ -100,6 +104,8 @@ impl Settings {
         let stats_retention = optional_number(daemon.get("stats_retention"), 0, path);
         let shadow_ttl = optional_number(daemon.get("shadow_ttl"), 0, path);
 
+        let acl = load_acl(&ini, path)?;
+
         Ok(Settings {
             listen,
             authenticate,
@@ -113,8 +119,32 @@ impl Settings {
             sweep_interval,
             stats_retention,
             shadow_ttl,
+            acl,
         })
     }
+}
+
+/// Read the optional `[acl]` section, where each entry is
+/// `<apikey> = <grants>`. A malformed entry is fatal rather than ignored:
+/// quietly dropping a grant would either lock someone out or, worse, leave a
+/// key with wider access than intended.
+fn load_acl(ini: &Ini, path: &Path) -> Result<Option<Acl>> {
+    let Some(section) = ini.section(Some("acl")) else {
+        return Ok(None);
+    };
+
+    let mut acl = Acl::new();
+    for (key, spec) in section.iter() {
+        let grants = parse_grants(spec).with_context(|| {
+            format!(
+                "in the [acl] entry for '{key}' in {}: {spec:?}",
+                path.display()
+            )
+        })?;
+        acl.set(key, grants);
+    }
+
+    Ok(Some(acl))
 }
 
 /// Parse an optional numeric setting, warning and falling back rather than
@@ -317,6 +347,46 @@ shadow_ttl=86400
         );
 
         assert_eq!(Settings::load(&path).unwrap().sweep_interval, 60);
+    }
+
+    // -- [acl] -------------------------------------------------------------
+
+    #[test]
+    fn no_acl_section_means_none() {
+        let dir = TempDir::new("noacl");
+        let path = write_config(&dir.0, FULL);
+
+        assert_eq!(Settings::load(&path).unwrap().acl, None);
+    }
+
+    #[test]
+    fn the_acl_section_is_parsed() {
+        let dir = TempDir::new("acl");
+        let path = write_config(
+            &dir.0,
+            &format!("{FULL}\n[acl]\nadmin = rw\nanalyst = r\nfeed = rw:feeds/misp\n"),
+        );
+
+        let acl = Settings::load(&path).unwrap().acl.unwrap();
+
+        assert_eq!(acl.len(), 3);
+        assert!(acl.can_write("admin", "anything"));
+        assert!(acl.can_read("analyst", "anything"));
+        assert!(!acl.can_write("analyst", "anything"));
+        assert!(acl.can_write("feed", "feeds/misp/ips"));
+        assert!(!acl.can_write("feed", "feeds/other"));
+    }
+
+    /// A typo in a grant must stop the server rather than silently leaving a
+    /// key with the wrong permissions.
+    #[test]
+    fn a_malformed_grant_is_fatal_and_names_the_key() {
+        let dir = TempDir::new("badacl");
+        let path = write_config(&dir.0, &format!("{FULL}\n[acl]\nbroken = admin\n"));
+
+        let err = format!("{:#}", Settings::load(&path).unwrap_err());
+        assert!(err.contains("broken"), "{err}");
+        assert!(err.contains("unknown permission"), "{err}");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use serde::{Deserialize, Serialize};
 
-use crate::acl;
+use crate::acl::Acl;
 use crate::attribute::AttributeView;
 use crate::db::{CONFIG_PREFIX, Database, NotFound};
 use crate::error::{ApiError, Message};
@@ -12,16 +12,23 @@ use crate::sighting_writer::{self, timestamp_to_instant};
 pub struct SharedState {
     pub db: Database,
     pub authenticate: bool,
+    /// Which API keys exist and what each may reach. Built from the
+    /// configuration at startup and read-only thereafter.
+    pub acl: Acl,
 }
 
 impl SharedState {
     /// `main` builds this directly, because it restores the database from a
-    /// snapshot first. This is the shorthand the tests use.
+    /// snapshot first. This is the shorthand the tests use: one full-access
+    /// key named after the historical default.
     #[cfg(test)]
     pub fn new(authenticate: bool) -> Self {
+        let mut acl = Acl::new();
+        acl.grant_full(crate::db::DEFAULT_APIKEY);
         Self {
             db: Database::new(),
             authenticate,
+            acl,
         }
     }
 }
@@ -148,15 +155,19 @@ fn authorize(
             .json(Message::new("Authorization header is not valid UTF-8.")));
     };
 
-    let allowed = match access {
-        Access::Read => acl::can_read(&state.db, apikey, namespace),
-        Access::Write => acl::can_write(&state.db, apikey, namespace),
+    let (allowed, verb) = match access {
+        Access::Read => (state.acl.can_read(apikey, namespace), "read"),
+        Access::Write => (state.acl.can_write(apikey, namespace), "write"),
     };
 
     if allowed {
         Ok(())
     } else {
-        Err(HttpResponse::Forbidden().json(Message::new("API key not found.")))
+        // Deliberately the same answer whether the key is unknown or merely
+        // unauthorised here, so that probing cannot distinguish the two.
+        Err(HttpResponse::Forbidden().json(Message::new(format!(
+            "API key is not permitted to {verb} this namespace."
+        ))))
     }
 }
 
@@ -435,6 +446,7 @@ pub fn query_config() -> web::QueryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acl::parse_grants;
     use actix_web::http::StatusCode;
     use actix_web::{App, test};
     use serde_json::{Value, json};
@@ -819,6 +831,150 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A key scoped to one subtree must be usable there and nowhere else.
+    #[actix_web::test]
+    async fn a_scoped_key_is_confined_to_its_namespace() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .set("feed", parse_grants("rw:feeds/misp").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let cases = [
+            ("/w/feeds/misp/ips?val=1.2.3.4", StatusCode::OK),
+            ("/w/feeds/misp?val=1.2.3.4", StatusCode::OK),
+            // A sibling that merely starts with the same characters.
+            ("/w/feeds/misp-internal?val=x", StatusCode::FORBIDDEN),
+            ("/w/feeds?val=x", StatusCode::FORBIDDEN),
+            ("/w/other?val=x", StatusCode::FORBIDDEN),
+            ("/d/other", StatusCode::FORBIDDEN),
+        ];
+
+        for (uri, expected) in cases {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(uri)
+                    .insert_header(("Authorization", "feed"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), expected, "{uri}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_read_only_key_cannot_write() {
+        let mut inner = SharedState::new(true);
+        inner.acl.set("analyst", parse_grants("r").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let write = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/ns?val=x")
+                .insert_header(("Authorization", "analyst"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(write.status(), StatusCode::FORBIDDEN);
+
+        // Reading a namespace it cannot write is still fine.
+        let read = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/ns?val=x&noshadow")
+                .insert_header(("Authorization", "analyst"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(read.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Bulk requests are checked per item, so one out-of-scope entry must not
+    /// ride in on the back of an in-scope one.
+    #[actix_web::test]
+    async fn bulk_requests_are_authorized_per_item() {
+        let mut inner = SharedState::new(true);
+        inner.acl.set("feed", parse_grants("rw:feeds").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .insert_header(("Authorization", "feed"))
+                .set_json(json!({"items": [
+                    {"namespace": "feeds/a", "value": "ok"},
+                    {"namespace": "secrets", "value": "nope"}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(st.db.count("secrets", "nope"), 0);
+    }
+
+    /// The refusal must read the same whether the key is unknown or merely
+    /// out of scope, so that probing cannot tell valid keys from invalid ones.
+    #[actix_web::test]
+    async fn refusals_do_not_reveal_whether_a_key_exists() {
+        let mut inner = SharedState::new(true);
+        inner.acl.set("real", parse_grants("rw:allowed").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let mut bodies = Vec::new();
+        for key in ["real", "totally-made-up"] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/w/denied?val=x")
+                    .insert_header(("Authorization", key))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            bodies.push(test::read_body(resp).await);
+        }
+
+        assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[actix_web::test]
+    async fn several_grants_on_one_key_are_unioned() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .set("mixed", parse_grants("r:public, w:inbox").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let write_inbox = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/inbox/x?val=v")
+                .insert_header(("Authorization", "mixed"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(write_inbox.status(), StatusCode::OK);
+
+        let write_public = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/public/x?val=v")
+                .insert_header(("Authorization", "mixed"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(write_public.status(), StatusCode::FORBIDDEN);
+    }
+
     // -- the _config tree --------------------------------------------------
 
     #[actix_web::test]
@@ -836,9 +992,11 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
         }
 
-        // The minted key must not exist, and the seeded one must survive.
+        // Nothing was created under _config, and the ACL still holds the key
+        // the delete tried to revoke.
         assert!(!st.db.namespace_exists("_config/acl/apikeys/mine"));
-        assert!(st.db.namespace_exists("_config/acl/apikeys/changeme"));
+        assert!(st.db.legacy_apikeys().is_empty());
+        assert!(st.acl.can_write(KEY, "any/namespace"));
     }
 
     // -- bulk --------------------------------------------------------------

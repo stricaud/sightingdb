@@ -124,7 +124,6 @@ mod tests {
 
         assert_eq!(restored.count("my/ns", "1.2.3.4"), 2);
         assert_eq!(restored.count("other/ns", "5.6.7.8"), 1);
-        assert!(restored.has_any_apikey());
     }
 
     #[test]

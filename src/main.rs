@@ -23,6 +23,7 @@ use clap::Parser;
 use daemonize::Daemonize;
 use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 
+use crate::acl::Acl;
 use crate::config::{Settings, TlsSettings};
 use crate::db::{DEFAULT_APIKEY, Database};
 use crate::handlers::SharedState;
@@ -82,19 +83,11 @@ fn main() -> Result<()> {
     let snapshot = usable_snapshot_path(&settings);
     let db = open_database(&settings, snapshot.as_deref())?;
 
-    if let Some(apikey) = &cli.apikey {
-        db.remove_apikey(DEFAULT_APIKEY);
-        db.add_apikey(apikey);
-        log::info!("API key set from the command line");
-    }
-    if !db.has_any_apikey() {
-        log::warn!("No API key in the database; seeding '{DEFAULT_APIKEY}'");
-        db.add_apikey(DEFAULT_APIKEY);
-    }
+    let acl = build_acl(&settings, &db, cli.apikey.as_deref());
 
     log::info!("Starting Sighting Daemon");
     if !settings.authenticate {
-        log::warn!("No authentication used for the database.");
+        log::warn!("No authentication used for the database; the ACL is not consulted.");
     }
     if settings.tls.is_none() {
         log::warn!("TLS is disabled; serving plain HTTP.");
@@ -117,6 +110,7 @@ fn main() -> Result<()> {
     let state = Arc::new(SharedState {
         db,
         authenticate: settings.authenticate,
+        acl,
     });
 
     let shutdown = Shutdown::new();
@@ -139,6 +133,61 @@ fn main() -> Result<()> {
     }
 
     result
+}
+
+/// Decide which API keys exist and what each may reach.
+///
+/// The `[acl]` section is authoritative when present. Without one we fall back
+/// to the keys an older build stored in the database, granting each of them the
+/// unrestricted access it used to have — upgrading must not lock a running
+/// deployment out of its own data. `-k` always wins, and replaces the built-in
+/// default key exactly as it always did.
+fn build_acl(settings: &Settings, db: &Database, cli_apikey: Option<&str>) -> Acl {
+    let legacy = db.legacy_apikeys();
+
+    let mut acl = match &settings.acl {
+        Some(acl) => {
+            if !legacy.is_empty() {
+                log::warn!(
+                    "Ignoring {} API key(s) stored in the snapshot: the configuration has an \
+                     [acl] section, which takes precedence",
+                    legacy.len()
+                );
+            }
+            log::info!("Loaded {} API key(s) from the [acl] section", acl.len());
+            acl.clone()
+        }
+        None => {
+            let mut acl = Acl::new();
+            for key in &legacy {
+                acl.grant_full(key);
+            }
+            if !legacy.is_empty() {
+                log::warn!(
+                    "Granting full access to {} API key(s) restored from the snapshot. Declare \
+                     an [acl] section to scope them to particular namespaces.",
+                    legacy.len()
+                );
+            }
+            acl
+        }
+    };
+
+    if let Some(apikey) = cli_apikey {
+        acl.remove(DEFAULT_APIKEY);
+        acl.grant_full(apikey);
+        log::info!("API key from -k granted full access");
+    }
+
+    if acl.is_empty() {
+        log::warn!(
+            "No API keys configured; seeding '{DEFAULT_APIKEY}' with full access. Add an [acl] \
+             section or pass -k."
+        );
+        acl.grant_full(DEFAULT_APIKEY);
+    }
+
+    acl
 }
 
 /// Load the database from disk when there is a snapshot, otherwise start fresh.

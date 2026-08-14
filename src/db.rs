@@ -287,12 +287,10 @@ impl Database {
     }
 
     pub fn with_policy(policy: DatabasePolicy) -> Database {
-        let db = Database {
+        Database {
             namespaces: RwLock::new(HashMap::new()),
             policy,
-        };
-        db.add_apikey(DEFAULT_APIKEY);
-        db
+        }
     }
 
     /// Rebuild a database from a snapshot. No API key is seeded here: the
@@ -310,24 +308,20 @@ impl Database {
         }
     }
 
-    /// Register an API key. Keys are modelled as namespaces so that the
-    /// existing ACL lookup is a plain namespace check. The placeholder
-    /// attribute keeps the namespace non-empty for snapshots.
-    pub fn add_apikey(&self, key: &str) {
-        let namespace = self.namespace_or_create(&format!("{APIKEYS_NAMESPACE}{key}"));
-        namespace.record("", Utc::now(), None, self.policy.stats_retention);
-    }
-
-    pub fn remove_apikey(&self, key: &str) -> bool {
-        self.delete(&format!("{APIKEYS_NAMESPACE}{key}"))
-    }
-
-    pub fn has_any_apikey(&self) -> bool {
+    /// API keys found in a snapshot written by an older build, which stored
+    /// them as `_config/acl/apikeys/<key>` namespaces.
+    ///
+    /// Permissions now come from the configuration instead; this exists only so
+    /// that upgrading does not lock an existing deployment out of its own data.
+    pub fn legacy_apikeys(&self) -> Vec<String> {
         self.namespaces
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .keys()
-            .any(|name| name.starts_with(APIKEYS_NAMESPACE))
+            .filter_map(|name| name.strip_prefix(APIKEYS_NAMESPACE))
+            .filter(|key| !key.is_empty())
+            .map(String::from)
+            .collect()
     }
 
     /// Record one sighting of `value` in `path` at `when`, returning the new count.
@@ -659,17 +653,35 @@ mod tests {
         assert!(db.namespace_views("nope").is_none());
     }
 
+    /// Older builds kept API keys as namespaces. We no longer write them, but
+    /// we must still recognise them in a restored snapshot.
     #[test]
-    fn apikeys_are_namespaces() {
+    fn legacy_apikeys_are_recovered_from_old_snapshots() {
+        let db = Database::default();
+        assert!(db.legacy_apikeys().is_empty());
+
+        db.write(
+            &format!("{APIKEYS_NAMESPACE}{DEFAULT_APIKEY}"),
+            "",
+            at(100),
+            WriteOpts::default(),
+        );
+        db.write(
+            &format!("{APIKEYS_NAMESPACE}secret"),
+            "",
+            at(100),
+            WriteOpts::default(),
+        );
+
+        let mut keys = db.legacy_apikeys();
+        keys.sort();
+        assert_eq!(keys, [DEFAULT_APIKEY, "secret"]);
+    }
+
+    #[test]
+    fn a_fresh_database_stores_no_keys() {
         let db = Database::new();
-        assert!(db.namespace_exists(&format!("{APIKEYS_NAMESPACE}{DEFAULT_APIKEY}")));
-        assert!(db.has_any_apikey());
-
-        db.add_apikey("secret");
-        assert!(db.namespace_exists(&format!("{APIKEYS_NAMESPACE}secret")));
-
-        assert!(db.remove_apikey(DEFAULT_APIKEY));
-        assert!(!db.namespace_exists(&format!("{APIKEYS_NAMESPACE}{DEFAULT_APIKEY}")));
+        assert!(db.legacy_apikeys().is_empty());
     }
 
     // -- delete ------------------------------------------------------------
@@ -757,13 +769,18 @@ mod tests {
         assert_eq!(db.namespace_views("ns").unwrap().len(), 2);
     }
 
+    /// A legacy key namespace has no TTL, but the sweeper skips the whole
+    /// `_config` tree anyway rather than relying on that.
     #[test]
     fn sweeping_never_touches_api_keys() {
-        let db = Database::new();
+        let db = Database::default();
+        let namespace = format!("{APIKEYS_NAMESPACE}{DEFAULT_APIKEY}");
+        db.write(&namespace, "", at(100), WriteOpts::default());
+
         db.sweep(Utc::now());
 
-        assert!(db.namespace_exists(&format!("{APIKEYS_NAMESPACE}{DEFAULT_APIKEY}")));
-        assert!(db.has_any_apikey());
+        assert!(db.namespace_exists(&namespace));
+        assert_eq!(db.legacy_apikeys(), [DEFAULT_APIKEY]);
     }
 
     #[test]
@@ -822,7 +839,6 @@ mod tests {
 
         assert_eq!(restored.count("my/ns", "1.2.3.4"), 2);
         assert_eq!(restored.count(ALL_NAMESPACE, "1.2.3.4"), 2);
-        assert!(restored.namespace_exists(&format!("{APIKEYS_NAMESPACE}{DEFAULT_APIKEY}")));
 
         let view = restored.view("my/ns", "1.2.3.4", 0, true).unwrap();
         assert_eq!(view.first_seen, 1_600_000_000);
