@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use ini::Ini;
 
 use crate::acl::{Acl, parse_grants};
 use crate::db::DatabasePolicy;
+use crate::dns::name::{Encoding, Exposed};
 
 /// Fallback body size limit for bulk POSTs, used when the config value cannot
 /// be parsed. Matches the historical default.
@@ -18,6 +19,9 @@ pub struct TlsSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
+    /// Whether to serve the HTTP API at all. Set `enabled = false` in
+    /// `[daemon]` to run a DNS-only instance.
+    pub http_enabled: bool,
     pub listen: String,
     pub authenticate: bool,
     pub daemonize: bool,
@@ -39,6 +43,24 @@ pub struct Settings {
     /// API keys and their permissions. `None` means the config declared no
     /// `[acl]` section at all, which is what an un-migrated install looks like.
     pub acl: Option<Acl>,
+    /// DNS listener. `None` unless a `[dns]` section turns it on.
+    pub dns: Option<DnsSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsSettings {
+    pub listen: String,
+    /// Zone we answer for, without a trailing dot.
+    pub zone: String,
+    pub ttl: u32,
+    /// Queries per second per source address; 0 disables the limit.
+    pub rate_limit: u32,
+    pub threads: usize,
+    /// Whether a DNS lookup raises a shadow sighting. Off by default: DNS has
+    /// no authentication, so this would be an unauthenticated write path.
+    pub shadow: bool,
+    /// The only namespaces reachable over DNS.
+    pub exposed: Vec<Exposed>,
 }
 
 impl Settings {
@@ -63,6 +85,9 @@ impl Settings {
                 .ok_or_else(|| anyhow!("missing '{key}' in [daemon] of {}", path.display()))
         };
 
+        // Only the literal "false" turns the HTTP API off, matching how the
+        // other booleans here behave.
+        let http_enabled = daemon.get("enabled") != Some("false");
         let listen = format!("{}:{}", required("listen_ip")?, required("listen_port")?);
 
         // Historically only the literal "false" disables these, so that a typo
@@ -105,8 +130,17 @@ impl Settings {
         let shadow_ttl = optional_number(daemon.get("shadow_ttl"), 0, path);
 
         let acl = load_acl(&ini, path)?;
+        let dns = load_dns(&ini, path)?;
+
+        if !http_enabled && dns.is_none() {
+            bail!(
+                "both the HTTP API and DNS are disabled in {}, so there is nothing to serve",
+                path.display()
+            );
+        }
 
         Ok(Settings {
+            http_enabled,
             listen,
             authenticate,
             daemonize,
@@ -120,6 +154,7 @@ impl Settings {
             stats_retention,
             shadow_ttl,
             acl,
+            dns,
         })
     }
 }
@@ -163,6 +198,84 @@ where
         }),
         None => default,
     }
+}
+
+/// Read the optional `[dns]` section and the `[dns.namespaces]` map that says
+/// which namespaces it may reach.
+///
+/// Nothing is exposed implicitly: DNS bypasses the API-key ACL entirely, so a
+/// namespace answers queries only if it is named here.
+fn load_dns(ini: &Ini, path: &Path) -> Result<Option<DnsSettings>> {
+    let Some(section) = ini.section(Some("dns")) else {
+        return Ok(None);
+    };
+    if section.get("enabled") == Some("false") {
+        return Ok(None);
+    }
+
+    let required = |key: &str| -> Result<&str> {
+        section
+            .get(key)
+            .ok_or_else(|| anyhow!("missing '{key}' in [dns] of {}", path.display()))
+    };
+
+    // Defaults to loopback rather than every interface: an open DNS responder
+    // publishes whatever it is given to anyone who can send a packet.
+    let listen_ip = section.get("listen_ip").unwrap_or("127.0.0.1");
+    let listen_port = section.get("listen_port").unwrap_or("5353");
+    let zone = required("zone")?
+        .trim()
+        .trim_matches('.')
+        .to_ascii_lowercase();
+    if zone.is_empty() {
+        bail!("'zone' in [dns] of {} is empty", path.display());
+    }
+
+    let mut exposed = Vec::new();
+    if let Some(namespaces) = ini.section(Some("dns.namespaces")) {
+        for (label, spec) in namespaces.iter() {
+            let (namespace, encoding) = spec.rsplit_once(':').ok_or_else(|| {
+                anyhow!(
+                    "[dns.namespaces] entry '{label}' in {} should read \
+                     <namespace>:<ip|domain|base32>, got {spec:?}",
+                    path.display()
+                )
+            })?;
+            let namespace = namespace.trim();
+            if namespace.starts_with('_') {
+                bail!(
+                    "[dns.namespaces] entry '{label}' in {} exposes the internal namespace \
+                     '{namespace}'",
+                    path.display()
+                );
+            }
+            exposed.push(Exposed {
+                label: label.trim().to_ascii_lowercase(),
+                namespace: namespace.to_string(),
+                encoding: Encoding::parse(encoding).with_context(|| {
+                    format!("in [dns.namespaces] entry '{label}' of {}", path.display())
+                })?,
+            });
+        }
+    }
+
+    if exposed.is_empty() {
+        log::warn!(
+            "[dns] is configured in {} but [dns.namespaces] exposes nothing, so every \
+             query will be NXDOMAIN",
+            path.display()
+        );
+    }
+
+    Ok(Some(DnsSettings {
+        listen: format!("{listen_ip}:{listen_port}"),
+        zone,
+        ttl: optional_number(section.get("ttl"), 60, path),
+        rate_limit: optional_number(section.get("rate_limit"), 100, path),
+        threads: optional_number(section.get("threads"), 2, path),
+        shadow: section.get("shadow") == Some("true"),
+        exposed,
+    }))
 }
 
 fn resolve(base: &Path, value: &str) -> PathBuf {
@@ -248,6 +361,17 @@ snapshot_interval=120
 sweep_interval=30
 stats_retention=720
 shadow_ttl=86400
+";
+
+    const DNS: &str = "\
+[dns]
+listen_ip=127.0.0.1
+listen_port=5353
+zone=sdb.example.com
+
+[dns.namespaces]
+malware=malware/ips:ip
+domains=malware/domains:domain
 ";
 
     #[test]
@@ -352,6 +476,130 @@ shadow_ttl=86400
         );
 
         assert_eq!(Settings::load(&path).unwrap().sweep_interval, 60);
+    }
+
+    // -- enabling and disabling listeners ----------------------------------
+
+    #[test]
+    fn both_listeners_run_by_default() {
+        let dir = TempDir::new("bothdefault");
+        let path = write_config(&dir.0, &format!("{FULL}\n{DNS}"));
+        let settings = Settings::load(&path).unwrap();
+
+        assert!(settings.http_enabled);
+        assert!(settings.dns.is_some());
+    }
+
+    #[test]
+    fn http_can_be_turned_off_for_a_dns_only_instance() {
+        let dir = TempDir::new("dnsonly");
+        let path = write_config(
+            &dir.0,
+            &format!(
+                "{}\n{DNS}",
+                FULL.replace("[daemon]", "[daemon]\nenabled=false")
+            ),
+        );
+        let settings = Settings::load(&path).unwrap();
+
+        assert!(!settings.http_enabled);
+        assert!(settings.dns.is_some());
+    }
+
+    #[test]
+    fn dns_can_be_turned_off_without_deleting_the_section() {
+        let dir = TempDir::new("dnsoff");
+        let path = write_config(
+            &dir.0,
+            &format!("{FULL}\n{}", DNS.replace("[dns]", "[dns]\nenabled=false")),
+        );
+        let settings = Settings::load(&path).unwrap();
+
+        assert!(settings.http_enabled);
+        assert_eq!(settings.dns, None);
+    }
+
+    /// Refusing to start beats starting a process that listens on nothing.
+    #[test]
+    fn disabling_both_is_an_error() {
+        let dir = TempDir::new("neither");
+        let path = write_config(&dir.0, &FULL.replace("[daemon]", "[daemon]\nenabled=false"));
+
+        let err = Settings::load(&path).unwrap_err().to_string();
+        assert!(err.contains("nothing to serve"), "{err}");
+    }
+
+    // -- [dns] -------------------------------------------------------------
+
+    #[test]
+    fn no_dns_section_means_no_dns() {
+        let dir = TempDir::new("nodns");
+        let path = write_config(&dir.0, FULL);
+        assert_eq!(Settings::load(&path).unwrap().dns, None);
+    }
+
+    #[test]
+    fn the_dns_section_is_parsed() {
+        let dir = TempDir::new("dns");
+        let path = write_config(&dir.0, &format!("{FULL}\n{DNS}"));
+        let dns = Settings::load(&path).unwrap().dns.unwrap();
+
+        assert_eq!(dns.listen, "127.0.0.1:5353");
+        assert_eq!(dns.zone, "sdb.example.com");
+        assert_eq!(dns.ttl, 60);
+        assert_eq!(dns.rate_limit, 100);
+        assert!(!dns.shadow);
+        assert_eq!(dns.exposed.len(), 2);
+        assert_eq!(dns.exposed[0].namespace, "malware/ips");
+        assert_eq!(dns.exposed[0].encoding, Encoding::Ip);
+    }
+
+    #[test]
+    fn a_trailing_dot_on_the_zone_is_ignored() {
+        let dir = TempDir::new("dnsdot");
+        let path = write_config(
+            &dir.0,
+            &format!(
+                "{FULL}\n{}",
+                DNS.replace("zone=sdb.example.com", "zone=SDB.Example.Com.")
+            ),
+        );
+        assert_eq!(
+            Settings::load(&path).unwrap().dns.unwrap().zone,
+            "sdb.example.com"
+        );
+    }
+
+    /// The internal trees hold API keys and search history; publishing them over
+    /// an unauthenticated protocol must not be a typo away.
+    #[test]
+    fn internal_namespaces_cannot_be_exposed() {
+        let dir = TempDir::new("dnsinternal");
+        let path = write_config(
+            &dir.0,
+            &format!(
+                "{FULL}\n{}",
+                DNS.replace("malware=malware/ips:ip", "keys=_config/acl/apikeys:domain")
+            ),
+        );
+
+        let err = Settings::load(&path).unwrap_err().to_string();
+        assert!(err.contains("_config/acl/apikeys"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_namespace_mapping_is_fatal() {
+        let dir = TempDir::new("dnsbadmap");
+        let path = write_config(
+            &dir.0,
+            &format!(
+                "{FULL}\n{}",
+                DNS.replace("malware=malware/ips:ip", "malware=malware/ips:rot13")
+            ),
+        );
+
+        let err = format!("{:#}", Settings::load(&path).unwrap_err());
+        assert!(err.contains("unknown DNS encoding"), "{err}");
     }
 
     // -- [acl] -------------------------------------------------------------

@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod db;
 mod db_log;
+mod dns;
 mod error;
 mod handlers;
 mod maintenance;
@@ -26,6 +27,7 @@ use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 use crate::acl::Acl;
 use crate::config::{Settings, TlsSettings};
 use crate::db::{DEFAULT_APIKEY, Database};
+use crate::dns::answer::Responder;
 use crate::handlers::SharedState;
 use crate::maintenance::Shutdown;
 
@@ -97,7 +99,7 @@ fn main() -> Result<()> {
     if !settings.authenticate {
         log::warn!("No authentication used for the database; the ACL is not consulted.");
     }
-    if settings.tls.is_none() {
+    if settings.http_enabled && settings.tls.is_none() {
         log::warn!("TLS is disabled; serving plain HTTP.");
     }
     if snapshot.is_none() {
@@ -119,9 +121,20 @@ fn main() -> Result<()> {
     });
 
     let shutdown = Shutdown::new();
-    let workers = spawn_workers(&state, &settings, snapshot.as_deref(), &shutdown)?;
+    let mut workers = spawn_workers(&state, &settings, snapshot.as_deref(), &shutdown)?;
+    workers.extend(spawn_dns(&state, &settings, &shutdown)?);
 
-    let result = actix_web::rt::System::new().block_on(serve(Arc::clone(&state), &settings));
+    let result = actix_web::rt::System::new().block_on(async {
+        if settings.http_enabled {
+            serve(Arc::clone(&state), &settings).await
+        } else {
+            // DNS-only: the listeners are already running on their own threads,
+            // so this future exists purely to hold the process open until asked
+            // to stop.
+            log::info!("HTTP API disabled; serving DNS only");
+            wait_for_signal(Arc::clone(&shutdown)).await
+        }
+    });
 
     // Stop the background workers before the final save, so nothing is writing
     // a snapshot underneath us.
@@ -294,6 +307,61 @@ fn spawn_workers(
     Ok(workers)
 }
 
+/// Start the DNS listeners, if a `[dns]` section asked for them.
+///
+/// DNS has no authentication, so this deliberately answers only for the
+/// namespaces named in `[dns.namespaces]` — the API-key ACL does not apply here.
+fn spawn_dns(
+    state: &Arc<SharedState>,
+    settings: &Settings,
+    shutdown: &Arc<Shutdown>,
+) -> Result<Vec<JoinHandle<()>>> {
+    let Some(dns) = &settings.dns else {
+        return Ok(Vec::new());
+    };
+
+    let zone = hickory_proto::rr::Name::parse(&dns.zone, Some(&hickory_proto::rr::Name::root()))
+        .with_context(|| format!("parsing the DNS zone '{}'", dns.zone))?;
+
+    let responder = Arc::new(Responder::new(
+        Arc::clone(state),
+        zone,
+        dns.exposed.clone(),
+        dns.ttl,
+        dns.shadow,
+    ));
+
+    let handles = dns::server::spawn(
+        responder,
+        &dns.listen,
+        dns.threads,
+        dns.rate_limit,
+        Arc::clone(shutdown),
+    )?;
+
+    log::info!(
+        "DNS listening on {} for zone {} ({} namespace(s) exposed, {} threads)",
+        dns.listen,
+        dns.zone,
+        dns.exposed.len(),
+        dns.threads
+    );
+    for exposed in &dns.exposed {
+        log::info!(
+            "  {}.{} -> namespace '{}' ({:?})",
+            exposed.label,
+            dns.zone,
+            exposed.namespace,
+            exposed.encoding
+        );
+    }
+    if dns.shadow {
+        log::warn!("DNS lookups will raise shadow sightings, an unauthenticated write path");
+    }
+
+    Ok(handles)
+}
+
 async fn serve(state: Arc<SharedState>, settings: &Settings) -> Result<()> {
     let state = web::Data::from(state);
     let post_limit = settings.post_limit;
@@ -326,6 +394,43 @@ async fn serve(state: Arc<SharedState>, settings: &Settings) -> Result<()> {
     log::info!("Listening on {scheme}://{}", settings.listen);
 
     server.run().await.context("running the HTTP server")
+}
+
+/// Block until the process is asked to stop, for the DNS-only case where no
+/// HTTP server is holding the runtime open.
+///
+/// Both signals feed the same `Shutdown` that the background workers watch,
+/// and we poll it rather than awaiting the signals directly: `System::stop()`
+/// does not interrupt `block_on`, so a task that only stopped the system would
+/// leave this future waiting forever.
+async fn wait_for_signal(shutdown: Arc<Shutdown>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use actix_web::rt::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
+        let shutdown = Arc::clone(&shutdown);
+        actix_web::rt::spawn(async move {
+            terminate.recv().await;
+            log::info!("SIGTERM received, shutting down");
+            shutdown.stop();
+        });
+    }
+
+    {
+        let shutdown = Arc::clone(&shutdown);
+        actix_web::rt::spawn(async move {
+            if actix_web::rt::signal::ctrl_c().await.is_ok() {
+                log::info!("Interrupt received, shutting down");
+                shutdown.stop();
+            }
+        });
+    }
+
+    while !shutdown.is_stopped() {
+        actix_web::rt::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(())
 }
 
 fn tls_acceptor(tls: &TlsSettings) -> Result<SslAcceptorBuilder> {

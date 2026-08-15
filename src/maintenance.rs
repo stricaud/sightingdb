@@ -31,6 +31,11 @@ impl Shutdown {
         *stopped
     }
 
+    /// Non-blocking check, for workers that poll rather than wait.
+    pub fn is_stopped(&self) -> bool {
+        *self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn stop(&self) {
         *self.stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
         self.changed.notify_all();

@@ -10,6 +10,7 @@ However, it will also provide the following features:
 * Keep track of the hourly statistics per item
 * Get the consensus for each item (how many namespaces contain the same value)
 * Expire data with a per-value TTL
+* Answer lookups over DNS, using the DNSBL conventions security tooling already speaks
 
 SightingDB is designed to scale writing and reading. There is no global lock: namespaces are locked independently, and within a namespace each value has its own lock, so concurrent writes to different values never contend.
 
@@ -150,7 +151,14 @@ Every endpoint answers with JSON and a meaningful status code:
 Configuration
 =============
 
+Either listener can be turned off, so one instance can serve HTTP, DNS, or
+both. `enabled = false` under `[daemon]` runs DNS only; `enabled = false` under
+`[dns]` (or simply omitting the section) runs HTTP only. Disabling both is a
+startup error rather than a process that listens on nothing.
+
 Beyond the listen address and TLS settings, `[daemon]` accepts:
+
+	enabled           Serve the HTTP API (default true).
 
 	dbdir             Directory for snapshots. Unset or blank runs in memory only.
 	snapshot_interval Seconds between snapshots (default 300). 0 saves only on shutdown.
@@ -163,6 +171,56 @@ install never starts discarding data on its own. The configuration shipped in
 `etc/sightingdb.conf` sets 30-day windows for both, which is what bounds memory
 growth — without them, statistics accumulate one bucket per hour per value and
 `_shadow/*` grows for every distinct search, forever.
+
+DNS lookups
+===========
+
+SightingDB can answer over DNS as well as HTTP, following the DNSBL/RBL
+conventions, so anything that can already consult a blocklist — Postfix,
+rspamd, Suricata, a shell script with `dig` — can query it unmodified.
+
+	$ dig +short 4.3.2.1.malware.sdb.example.com
+	127.0.0.1
+
+	$ dig +short 9.9.9.9.malware.sdb.example.com
+	127.0.0.3
+
+	$ dig +short TXT 9.9.9.9.malware.sdb.example.com
+	"count=15 first_seen=1786774648 last_seen=1786774648 consensus=1"
+
+A value that was never seen answers NXDOMAIN, which is both the DNSBL idiom and
+what lets resolvers cache the negative. A value that was seen answers with a
+`127.0.0.x` address whose last octet gives the order of magnitude: `1` is once,
+`2` is single digits, `3` is tens, and so on up to `9`. A client that only
+checks "did I get an address at all" works unchanged.
+
+Three ways of spelling a value in the query name are supported, chosen per
+namespace in the configuration:
+
+	ip      4.3.2.1.malware.sdb.example.com    ->  1.2.3.4
+	        (reversed octets, as RBLs do; IPv6 uses the ip6.arpa nibble form)
+	domain  evil.com.domains.sdb.example.com   ->  evil.com
+	base32  <base32 of the value>.hashes.sdb.example.com
+
+TCP is supported, and a reply too large for a datagram comes back truncated so
+the client retries over it.
+
+### Before you enable it
+
+**DNS has no authentication.** The `[acl]` section does not apply, so anything
+reachable over DNS is readable by anyone who can send a packet. Accordingly:
+
+* Only namespaces named under `[dns.namespaces]` answer at all; everything else
+  in the database is NXDOMAIN, indistinguishable from a value that was never
+  seen. Namespaces beginning with `_` are refused at startup.
+* The listener binds to `127.0.0.1` unless you say otherwise.
+* Names outside the configured zone are REFUSED rather than answered, so this
+  can never act as an open resolver.
+* `rate_limit` caps queries per second per source address, dropping rather than
+  refusing once a source is over budget — an error reply is still an amplified
+  packet. Responses are capped at 1232 bytes even if a client advertises more.
+* Shadow sightings are off by default, since over DNS they would be an
+  unauthenticated write path.
 
 Access control
 ==============
