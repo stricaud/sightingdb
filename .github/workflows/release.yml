@@ -1,14 +1,16 @@
 name: Release
 
-# Publishes to crates.io when a version tag is pushed:
+# Publishes to crates.io and cuts a GitHub Release with prebuilt binaries when
+# a version tag is pushed:
 #
 #     cargo set-version 0.0.5   # or edit Cargo.toml by hand
 #     git commit -am "Release 0.0.5" && git push
 #     git tag v0.0.5 && git push origin v0.0.5
 #
-# Setup, once: create a crates.io API token scoped to publish-new + publish-update
-# (https://crates.io/settings/tokens) and add it as the repository secret
-# CARGO_REGISTRY_TOKEN. See the note at the bottom for the token-free alternative.
+# Setup, once: create a crates.io API token scoped to publish-new +
+# publish-update (https://crates.io/settings/tokens) and add it as the
+# repository secret CARGO_REGISTRY_TOKEN. See the note at the bottom for the
+# token-free alternative.
 
 on:
   push:
@@ -24,18 +26,15 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  publish:
-    name: Publish to crates.io
+  # ---------------------------------------------------------------------------
+  # Gate: the tag must agree with the manifest, and the code must be sound.
+  # ---------------------------------------------------------------------------
+  check:
+    name: Check
     runs-on: ubuntu-latest
-    # A crates.io release cannot be undone, only yanked. Add required reviewers
-    # to this environment (Settings > Environments) to gate it behind an
-    # approval; GitHub creates the environment on first use if it is missing.
-    environment: crates-io
-
     steps:
       - uses: actions/checkout@v5
 
-      # The toolchain comes from rust-toolchain.toml.
       - name: Show toolchain
         run: rustc --version && cargo --version
 
@@ -69,6 +68,129 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # ---------------------------------------------------------------------------
+  # Prebuilt binaries, one native runner per target so nothing is cross-compiled.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on the oldest supported image so the glibc floor stays low.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # `vendored-openssl` builds OpenSSL from source and links it statically,
+      # so the binary does not depend on the libssl of whoever runs it.
+      - name: Build
+        run: cargo build --release --locked --features vendored-openssl
+
+      - name: Stage the archive
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          stage="sightingdb-${version}-${{ matrix.target }}"
+          mkdir -p "$stage/etc"
+          cp target/release/sightingdb "$stage/"
+          cp README.md LICENSE "$stage/"
+          cp etc/sightingdb.conf etc/log4rs.yml etc/sightingdb.service "$stage/etc/"
+          tar czf "${stage}.tar.gz" "$stage"
+          echo "ARCHIVE=${stage}.tar.gz" >> "$GITHUB_ENV"
+
+      # The whole point of vendoring is that the binary carries its own
+      # OpenSSL, so a leftover dynamic link is a broken release, not a warning.
+      - name: Confirm the binary is self-contained
+        run: |
+          target/release/sightingdb --version
+          if command -v ldd > /dev/null; then
+            links="$(ldd target/release/sightingdb)"
+          else
+            links="$(otool -L target/release/sightingdb)"
+          fi
+          echo "$links"
+          if echo "$links" | grep -qiE 'libssl|libcrypto'; then
+            echo "::error::Binary still links OpenSSL dynamically; vendoring did not take effect"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # The GitHub Release itself.
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so the generated notes can see the previous tag.
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A tag like v0.1.0-rc1 is a prerelease; v0.1.0 is not.
+          case "$GITHUB_REF_NAME" in
+            *-*) prerelease=--prerelease ;;
+            *)   prerelease= ;;
+          esac
+
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            $prerelease \
+            artifacts/*.tar.gz \
+            artifacts/SHA256SUMS
+
+  # ---------------------------------------------------------------------------
+  # crates.io. Kept separate so a registry hiccup does not cost you the binaries.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to crates.io
+    needs: check
+    runs-on: ubuntu-latest
+    # A crates.io release cannot be undone, only yanked. Add required reviewers
+    # to this environment (Settings > Environments) to gate it behind an
+    # approval; GitHub creates the environment on first use if it is missing.
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+
       # `cargo publish` packages and builds the result before uploading, so a
       # crate that cannot be built from its own tarball fails here rather than
       # after it is public.
@@ -86,8 +208,8 @@ jobs:
 # repository and the workflow file `release.yml`, which means the crate must
 # already exist — publish once with a token, then switch.
 #
-# To switch: add `id-token: write` to `permissions` above, then replace the
-# Publish step with:
+# To switch: give the publish job `permissions: id-token: write`, then replace
+# the Publish step with:
 #
 #   - name: Authenticate to crates.io
 #     uses: rust-lang/crates-io-auth-action@v1
