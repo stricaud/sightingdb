@@ -167,11 +167,16 @@ where
 
 fn resolve(base: &Path, value: &str) -> PathBuf {
     let candidate = Path::new(value);
-    if candidate.is_absolute() {
+    let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         base.join(candidate)
-    }
+    };
+
+    // Anchor it to the working directory now, so the path keeps resolving no
+    // matter where the process ends up, and so failures name the full location.
+    // This is lexical, unlike `canonicalize`, so the file need not exist yet.
+    std::path::absolute(&joined).unwrap_or(joined)
 }
 
 /// Locate `sightingdb.conf` when `-c` was not supplied: system-wide first, then

@@ -36,6 +36,36 @@ Without `-c`, the configuration is looked up in `/etc/sightingdb/sightingdb.conf
 
 Set `ssl=false` in the configuration to serve plain HTTP instead.
 
+Running as a service
+--------------------
+
+The recommended way to run SightingDB in the background is under a service
+manager, which handles restarts, log capture and startup ordering for you. A
+hardened systemd unit is provided:
+
+	sudo install -m 0644 etc/sightingdb.service /etc/systemd/system/
+	sudo systemctl daemon-reload
+	sudo systemctl enable --now sightingdb
+
+Keep `daemonize = false` for that, and point log4rs at a console appender so the
+logs land in the journal (`journalctl -u sightingdb`).
+
+Setting `daemonize = true` instead makes SightingDB detach on its own: it
+re-executes itself with `stdin` on `/dev/null`, `stdout` and `stderr` on the
+`log_out` and `log_err` files, and its own process group, then the launcher
+exits. A pid file is written to the first writable location out of
+`/var/run/sightingdb.pid`, `~/.sightingdb/sightingdb.pid` or `./sightingdb.pid`,
+and removed again on a clean shutdown.
+
+Detaching by re-executing rather than by forking is deliberate. `fork` carries
+over only the calling thread, so a forked daemon silently loses anything already
+running in the background — including log4rs' own configuration reloader. The
+child here starts from a clean `exec`, so `refresh_rate` keeps working. Nothing
+changes directory either, so relative paths in the configuration keep resolving.
+
+Send `SIGTERM` to stop: in-flight requests are drained, the database is written
+out, and the pid file is removed.
+
 Options
 -------
 

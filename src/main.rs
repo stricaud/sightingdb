@@ -1,6 +1,7 @@
 mod acl;
 mod attribute;
 mod config;
+mod daemon;
 mod db;
 mod db_log;
 mod error;
@@ -10,7 +11,7 @@ mod persistence;
 mod sighting_reader;
 mod sighting_writer;
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -20,7 +21,6 @@ use actix_web::{App, HttpServer, web};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
-use daemonize::Daemonize;
 use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 
 use crate::acl::Acl;
@@ -78,6 +78,14 @@ fn main() -> Result<()> {
     log::info!("Using configuration file: {}", config_path.display());
     let settings = Settings::load(&config_path)?;
 
+    // Detach before doing anything expensive, so the launcher does not restore
+    // a database it is only going to throw away.
+    if settings.daemonize && !daemon::is_child() {
+        let pid = daemon::detach(&settings.log_out, &settings.log_err)?;
+        log::info!("Running in the background as pid {pid}");
+        return Ok(());
+    }
+
     // Persistence is only on when dbdir is set *and* usable; a database that
     // cannot save is still better than one that refuses to start.
     let snapshot = usable_snapshot_path(&settings);
@@ -96,13 +104,10 @@ fn main() -> Result<()> {
         log::warn!("Persistence is disabled; data will be lost when the process stops.");
     }
 
-    // Daemonizing forks, which must happen before any runtime or worker threads
-    // exist — hence a plain `main` rather than `#[actix_web::main]`.
-    if settings.daemonize {
-        daemonize(&settings)?;
-    } else {
-        log::warn!(
-            "This daemon is not daemonized. To run in background, set 'daemonize = true' in {}",
+    if !settings.daemonize {
+        log::info!(
+            "Running in the foreground. Set 'daemonize = true' in {} to detach, or run under \
+             a service manager (see etc/sightingdb.service).",
             config_path.display()
         );
     }
@@ -131,6 +136,8 @@ fn main() -> Result<()> {
             log::error!("Could not save the database: {e:#}");
         }
     }
+
+    daemon::remove_pid_file();
 
     result
 }
@@ -333,20 +340,6 @@ fn tls_acceptor(tls: &TlsSettings) -> Result<SslAcceptorBuilder> {
     Ok(builder)
 }
 
-fn daemonize(settings: &Settings) -> Result<()> {
-    let stdout = File::create(&settings.log_out)
-        .with_context(|| format!("creating {}", settings.log_out.display()))?;
-    let stderr = File::create(&settings.log_err)
-        .with_context(|| format!("creating {}", settings.log_err.display()))?;
-
-    Daemonize::new()
-        .pid_file(pid_file())
-        .stdout(stdout)
-        .stderr(stderr)
-        .start()
-        .context("daemonizing")
-}
-
 /// Make sure `~/.sightingdb` exists so a user-local config has somewhere to live.
 fn create_home_config() {
     let Some(mut home_config) = dirs::home_dir() else {
@@ -361,23 +354,4 @@ fn create_home_config() {
             home_config.display()
         );
     }
-}
-
-/// First writable location out of `/var/run`, `~/.sightingdb`, then the cwd.
-fn pid_file() -> PathBuf {
-    let system = PathBuf::from("/var/run/sightingdb.pid");
-    if File::create(&system).is_ok() {
-        return system;
-    }
-
-    if let Some(mut home) = dirs::home_dir() {
-        home.push(".sightingdb");
-        home.push("sightingdb.pid");
-        if File::create(&home).is_ok() {
-            return home;
-        }
-    }
-
-    log::warn!("Cannot write the pid to /var/run or ~/.sightingdb, using ./sightingdb.pid");
-    PathBuf::from("./sightingdb.pid")
 }
