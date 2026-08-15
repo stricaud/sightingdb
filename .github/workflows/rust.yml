@@ -38,6 +38,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Installed by hand rather than via rustsec/audit-check: that action runs
+      # `cargo install cargo-audit` without `--locked`, which resolves the very
+      # newest dependencies and can pull in crates needing a newer compiler than
+      # the one in use. `--locked` uses cargo-audit's own lockfile instead, so
+      # the build is reproducible and cannot drift above our toolchain.
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+        env:
+          # Don't impose this repository's lint policy on a third-party tool.
+          RUSTFLAGS: ""
+
+      - name: Audit dependencies
+        run: cargo audit
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+
+      # rust-toolchain.toml tracks stable, so without this nothing would notice
+      # a change that quietly raised the floor below the `rust-version` we
+      # publish. Read from the manifest so the two cannot drift apart.
+      - name: Build with the declared MSRV
+        run: |
+          msrv="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')"
+          echo "Cargo.toml declares rust-version = $msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" build --locked --all-targets

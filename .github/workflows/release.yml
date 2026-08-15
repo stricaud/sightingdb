@@ -63,10 +63,19 @@ jobs:
       - name: Test
         run: cargo test --locked --verbose
 
+      # Installed by hand rather than via rustsec/audit-check: that action runs
+      # `cargo install cargo-audit` without `--locked`, which resolves the very
+      # newest dependencies and can pull in crates needing a newer compiler than
+      # the one in use. `--locked` uses cargo-audit's own lockfile instead, so
+      # the build is reproducible and cannot drift above our toolchain.
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+        env:
+          # Don't impose this repository's lint policy on a third-party tool.
+          RUSTFLAGS: ""
+
       - name: Audit dependencies
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
 
   # ---------------------------------------------------------------------------
   # Prebuilt binaries, one native runner per target so nothing is cross-compiled.

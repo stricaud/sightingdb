@@ -10,8 +10,8 @@ repository = "https://github.com/stricaud/sightingdb"
 readme = "README.md"
 keywords = ["sightings", "threat-intelligence", "indicators", "database"]
 categories = ["database-implementations", "command-line-utilities"]
-# Pinned for developing this repository; shipping it would force anyone running
-# `cargo install` onto that exact toolchain rather than any 1.88+.
+# Development-only: shipping it would push anyone running `cargo install` onto
+# the stable channel rather than letting any 1.88+ toolchain build the crate.
 exclude = ["rust-toolchain.toml", ".idea/*", ".github/*"]
 
 [[bin]]
