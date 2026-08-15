@@ -7,6 +7,7 @@ mod db_log;
 mod dns;
 mod error;
 mod handlers;
+mod ingest;
 mod maintenance;
 mod persistence;
 mod sighting_reader;
@@ -56,6 +57,10 @@ struct Cli {
     #[arg(short = 'k', long, value_name = "APIKEY")]
     apikey: Option<String>,
 
+    /// Import STIX 2.1 bundles from a file or directory, then exit
+    #[arg(long, value_name = "PATH")]
+    import_stix: Option<PathBuf>,
+
     /// Sets the level of verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -95,6 +100,20 @@ fn main() -> Result<()> {
 
     let acl = build_acl(&settings, &db, cli.apikey.as_deref());
 
+    // A one-shot import: load, write, save, exit. No listeners start.
+    if let Some(path) = &cli.import_stix {
+        let imported = import_stix(&db, &settings, path)?;
+        log::info!("Imported {imported} sighting(s) from {}", path.display());
+        if let Some(snapshot) = snapshot.as_deref() {
+            persistence::save(&db, snapshot)
+                .with_context(|| format!("saving to {}", snapshot.display()))?;
+            log::info!("Saved the database to {}", snapshot.display());
+        } else {
+            log::warn!("No dbdir configured, so the import was not persisted");
+        }
+        return Ok(());
+    }
+
     log::info!("Starting Sighting Daemon");
     if !settings.authenticate {
         log::warn!("No authentication used for the database; the ACL is not consulted.");
@@ -125,13 +144,25 @@ fn main() -> Result<()> {
     workers.extend(spawn_dns(&state, &settings, &shutdown)?);
 
     let result = actix_web::rt::System::new().block_on(async {
+        if let Some(zmq) = settings.zmq.clone() {
+            log::info!(
+                "ZMQ ingest subscribing to {} ({} format)",
+                zmq.endpoint,
+                match zmq.format {
+                    ingest::Format::Misp => "MISP",
+                    ingest::Format::Native => "native",
+                }
+            );
+            actix_web::rt::spawn(ingest::run(Arc::clone(&state), zmq, Arc::clone(&shutdown)));
+        }
+
         if settings.http_enabled {
             serve(Arc::clone(&state), &settings).await
         } else {
             // DNS-only: the listeners are already running on their own threads,
             // so this future exists purely to hold the process open until asked
             // to stop.
-            log::info!("HTTP API disabled; serving DNS only");
+            log::info!("HTTP API disabled; running listeners only");
             wait_for_signal(Arc::clone(&shutdown)).await
         }
     });
@@ -153,6 +184,81 @@ fn main() -> Result<()> {
     daemon::remove_pid_file();
 
     result
+}
+
+/// Read STIX bundles from a file, or from every `.json` in a directory.
+///
+/// One unreadable bundle does not abort the run: an import of a hundred files
+/// should tell you which one was broken and keep the other ninety-nine.
+fn import_stix(db: &Database, settings: &Settings, path: &Path) -> Result<u64> {
+    let files = stix_files(path)?;
+    if files.is_empty() {
+        log::warn!("No .json files found at {}", path.display());
+        return Ok(0);
+    }
+    if settings.stix.mapping.types.is_empty() && settings.stix.mapping.default_namespace.is_none() {
+        log::warn!("No [stix.types] mapping is configured, so every observable will be discarded");
+    }
+
+    let mut total = 0;
+    for file in files {
+        let body = match fs::read_to_string(&file) {
+            Ok(body) => body,
+            Err(e) => {
+                log::error!("Could not read {}: {e}", file.display());
+                continue;
+            }
+        };
+
+        let sightings = match ingest::stix::parse_bundle(&body, &settings.stix.mapping) {
+            Ok(sightings) => sightings,
+            Err(e) => {
+                log::error!("Could not parse {}: {e}", file.display());
+                continue;
+            }
+        };
+
+        let mut written = 0;
+        for sighting in &sightings {
+            match ingest::record(db, settings.stix.ttl, sighting) {
+                Ok(()) => written += sighting.count.max(1),
+                Err(e) => log::warn!(
+                    "Skipped {}/{} from {}: {e}",
+                    sighting.namespace,
+                    sighting.value,
+                    file.display()
+                ),
+            }
+        }
+        log::info!(
+            "{}: {} observable(s), {written} sighting(s)",
+            file.display(),
+            sightings.len()
+        );
+        total += written;
+    }
+
+    Ok(total)
+}
+
+fn stix_files(path: &Path) -> Result<Vec<PathBuf>> {
+    let metadata = fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    if metadata.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+
+    let mut files: Vec<PathBuf> = fs::read_dir(path)
+        .with_context(|| format!("listing {}", path.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    // Deterministic order, so repeated imports log identically.
+    files.sort();
+    Ok(files)
 }
 
 /// Decide which API keys exist and what each may reach.

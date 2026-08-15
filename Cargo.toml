@@ -28,9 +28,14 @@ clap = { version = "4.6", features = ["derive"] }
 dirs = "6.0"
 # Wire-format only: we run our own socket loop and responder.
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
+# Native Rust ZeroMQ: speaks ZMTP to libzmq publishers such as MISP without
+# linking the C library, which keeps the release binaries self-contained.
+zeromq = { version = "0.6", default-features = false, features = ["tcp-transport", "tokio-runtime"] }
 log = "0.4"
 log4rs = "1.4"
 openssl = "0.10.81"
+# Already in the tree via actix-router; used for STIX pattern literals.
+regex = "1.13"
 rust-ini = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

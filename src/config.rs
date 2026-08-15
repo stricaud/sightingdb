@@ -6,6 +6,9 @@ use ini::Ini;
 use crate::acl::{Acl, parse_grants};
 use crate::db::DatabasePolicy;
 use crate::dns::name::{Encoding, Exposed};
+use crate::ingest::misp::Mapping;
+use crate::ingest::stix::Mapping as StixMapping;
+use crate::ingest::{Format, Settings as ZmqSettings};
 
 /// Fallback body size limit for bulk POSTs, used when the config value cannot
 /// be parsed. Matches the historical default.
@@ -45,6 +48,17 @@ pub struct Settings {
     pub acl: Option<Acl>,
     /// DNS listener. `None` unless a `[dns]` section turns it on.
     pub dns: Option<DnsSettings>,
+    /// ZeroMQ ingest. `None` unless a `[zmq]` section turns it on.
+    pub zmq: Option<ZmqSettings>,
+    /// How STIX observables map to namespaces, for `--import-stix`.
+    pub stix: StixSettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StixSettings {
+    pub mapping: StixMapping,
+    /// TTL applied to imported sightings; 0 leaves them permanent.
+    pub ttl: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,8 +145,10 @@ impl Settings {
 
         let acl = load_acl(&ini, path)?;
         let dns = load_dns(&ini, path)?;
+        let zmq = load_zmq(&ini, path)?;
+        let stix = load_stix(&ini, path)?;
 
-        if !http_enabled && dns.is_none() {
+        if !http_enabled && dns.is_none() && zmq.is_none() {
             bail!(
                 "both the HTTP API and DNS are disabled in {}, so there is nothing to serve",
                 path.display()
@@ -155,6 +171,8 @@ impl Settings {
             shadow_ttl,
             acl,
             dns,
+            zmq,
+            stix,
         })
     }
 }
@@ -276,6 +294,149 @@ fn load_dns(ini: &Ini, path: &Path) -> Result<Option<DnsSettings>> {
         shadow: section.get("shadow") == Some("true"),
         exposed,
     }))
+}
+
+/// Read the optional `[zmq]` section and the `[zmq.types]` map that turns MISP
+/// attribute types into namespaces.
+fn load_zmq(ini: &Ini, path: &Path) -> Result<Option<ZmqSettings>> {
+    let Some(section) = ini.section(Some("zmq")) else {
+        return Ok(None);
+    };
+    if section.get("enabled") == Some("false") {
+        return Ok(None);
+    }
+
+    let endpoint = section
+        .get("endpoint")
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .ok_or_else(|| anyhow!("missing 'endpoint' in [zmq] of {}", path.display()))?
+        .to_string();
+
+    let topics: Vec<String> = section
+        .get("topics")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect();
+
+    let format = Format::parse(section.get("format").unwrap_or("misp"))
+        .with_context(|| format!("in [zmq] of {}", path.display()))?;
+
+    let mut types = std::collections::HashMap::new();
+    if let Some(mapped) = ini.section(Some("zmq.types")) {
+        for (misp_type, namespace) in mapped.iter() {
+            let namespace = namespace.trim();
+            if namespace.contains('=') {
+                bail!(
+                    "[zmq.types] entry '{misp_type}' in {} has '=' in its value; a ':' in the \
+                     key would do that, since INI treats it as a key/value separator",
+                    path.display()
+                );
+            }
+            if namespace.starts_with('_') {
+                bail!(
+                    "[zmq.types] entry '{misp_type}' in {} targets the internal namespace \
+                     '{namespace}'",
+                    path.display()
+                );
+            }
+            types.insert(misp_type.trim().to_string(), namespace.to_string());
+        }
+    }
+
+    let default_namespace = section
+        .get("default_namespace")
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(String::from);
+    if let Some(namespace) = &default_namespace
+        && namespace.starts_with('_')
+    {
+        bail!(
+            "'default_namespace' in [zmq] of {} is the internal namespace '{namespace}'",
+            path.display()
+        );
+    }
+
+    if types.is_empty() && default_namespace.is_none() && format == Format::Misp {
+        log::warn!(
+            "[zmq] is configured in {} but [zmq.types] maps nothing and no default_namespace \
+             is set, so every attribute will be discarded",
+            path.display()
+        );
+    }
+
+    Ok(Some(ZmqSettings {
+        endpoint,
+        topics,
+        format,
+        mapping: Mapping {
+            types,
+            default_namespace,
+            require_to_ids: section.get("require_to_ids") == Some("true"),
+        },
+        ttl: optional_number(section.get("ttl"), 0, path),
+        reconnect: optional_number(section.get("reconnect"), 5, path),
+    }))
+}
+
+/// Read the `[stix]` section and its `[stix.types]` map.
+///
+/// Unlike the listeners this is not a runtime service, so an absent section is
+/// not an error — it just means `--import-stix` has nothing mapped and will say so.
+fn load_stix(ini: &Ini, path: &Path) -> Result<StixSettings> {
+    let section = ini.section(Some("stix"));
+
+    let mut types = std::collections::HashMap::new();
+    if let Some(mapped) = ini.section(Some("stix.types")) {
+        for (stix_type, namespace) in mapped.iter() {
+            let namespace = namespace.trim();
+            // A ':' in the key would have been eaten by the INI parser, leaving
+            // the rest of the line in the value. Say so rather than quietly
+            // building a mapping that can never match.
+            if namespace.contains('=') {
+                bail!(
+                    "[stix.types] entry '{stix_type}' in {} looks like it used ':' in the key. \
+                     INI treats ':' as a key/value separator, so write 'file.MD5' rather than \
+                     'file:MD5'",
+                    path.display()
+                );
+            }
+            if namespace.starts_with('_') {
+                bail!(
+                    "[stix.types] entry '{stix_type}' in {} targets the internal namespace \
+                     '{namespace}'",
+                    path.display()
+                );
+            }
+            types.insert(stix_type.trim().to_string(), namespace.to_string());
+        }
+    }
+
+    let default_namespace = section
+        .and_then(|s| s.get("default_namespace"))
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(String::from);
+    if let Some(namespace) = &default_namespace
+        && namespace.starts_with('_')
+    {
+        bail!(
+            "'default_namespace' in [stix] of {} is the internal namespace '{namespace}'",
+            path.display()
+        );
+    }
+
+    Ok(StixSettings {
+        mapping: StixMapping {
+            types,
+            default_namespace,
+        },
+        ttl: optional_number(section.and_then(|s| s.get("ttl")), 0, path),
+    })
 }
 
 fn resolve(base: &Path, value: &str) -> PathBuf {

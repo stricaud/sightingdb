@@ -11,6 +11,7 @@ However, it will also provide the following features:
 * Get the consensus for each item (how many namespaces contain the same value)
 * Expire data with a per-value TTL
 * Answer lookups over DNS, using the DNSBL conventions security tooling already speaks
+* Ingest from a MISP ZeroMQ feed, and import STIX 2.1 bundles
 
 SightingDB is designed to scale writing and reading. There is no global lock: namespaces are locked independently, and within a namespace each value has its own lock, so concurrent writes to different values never contend.
 
@@ -221,6 +222,60 @@ reachable over DNS is readable by anyone who can send a packet. Accordingly:
   packet. Responses are capped at 1232 bytes even if a client advertises more.
 * Shadow sightings are off by default, since over DNS they would be an
   unauthenticated write path.
+
+Importing
+=========
+
+ZeroMQ
+------
+
+SightingDB can subscribe to a ZeroMQ publisher and record what it hears. The
+usual source is MISP, whose publisher sends `<topic> <json>` frames:
+
+	[zmq]
+	endpoint=tcp://misp.example.com:50000
+	topics=misp_json_attribute,misp_json
+	format=misp
+	require_to_ids=true
+
+	[zmq.types]
+	ip-src=misp/ips
+	domain=misp/domains
+	md5=misp/hashes
+
+Attributes are read from `misp_json_attribute`, and from whole events on
+`misp_json` including attributes nested inside objects. Only mapped types are
+ingested unless `default_namespace` is set, MISP's own timestamps are preserved,
+and `require_to_ids=true` limits ingest to attributes MISP flagged as
+actionable. A publisher that goes away is retried rather than being fatal.
+
+`format=native` instead reads `{"items":[{"namespace":..,"value":..}]}`, for
+publishers that speak SightingDB directly. Note that in this mode the publisher
+chooses its own namespaces, so only subscribe to a source you trust — the
+`_config` tree is refused, but nothing else is.
+
+This uses a native Rust ZeroMQ implementation, so the release binaries stay
+self-contained; it interoperates with libzmq publishers like MISP's.
+
+STIX 2.1
+--------
+
+	$ sightingdb -c /etc/sightingdb/sightingdb.conf --import-stix bundles/
+
+Reads one file or every `.json` in a directory, then exits. Three kinds of
+object are understood:
+
+* `observed-data` — `number_observed` observations between `first_observed` and
+  `last_observed`, following `object_refs` (and the deprecated embedded
+  `objects`).
+* `sighting` — its `count` and `first_seen`/`last_seen`, resolving
+  `sighting_of_ref` and `observed_data_refs`.
+* `indicator` — the literal values in its STIX pattern.
+
+Counts and windows survive the import: an observed-data seen 12 times between
+two instants becomes a value with `count=12` whose `first_seen` and `last_seen`
+bracket that window. A file object yields one sighting per hash. A bundle that
+fails to parse is reported and skipped so the rest of the import continues.
 
 Access control
 ==============
