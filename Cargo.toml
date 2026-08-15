@@ -4,9 +4,15 @@ version = "0.0.4"
 authors = ["Sebastien Tricaud <sebastien.tricaud@devo.com>"]
 edition = "2024"
 rust-version = "1.88"
-license = "BSD-3-Clause"
+license = "MIT"
 description = "A database designed for Sightings, a technique to count items"
 repository = "https://github.com/stricaud/sightingdb"
+readme = "README.md"
+keywords = ["sightings", "threat-intelligence", "indicators", "database"]
+categories = ["database-implementations", "command-line-utilities"]
+# Pinned for developing this repository; shipping it would force anyone running
+# `cargo install` onto that exact toolchain rather than any 1.88+.
+exclude = ["rust-toolchain.toml", ".idea/*", ".github/*"]
 
 [[bin]]
 name = "sightingdb"

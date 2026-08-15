@@ -1,0 +1,101 @@
+name: Release
+
+# Publishes to crates.io when a version tag is pushed:
+#
+#     cargo set-version 0.0.5   # or edit Cargo.toml by hand
+#     git commit -am "Release 0.0.5" && git push
+#     git tag v0.0.5 && git push origin v0.0.5
+#
+# Setup, once: create a crates.io API token scoped to publish-new + publish-update
+# (https://crates.io/settings/tokens) and add it as the repository secret
+# CARGO_REGISTRY_TOKEN. See the note at the bottom for the token-free alternative.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      - '[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    # A crates.io release cannot be undone, only yanked. Add required reviewers
+    # to this environment (Settings > Environments) to gate it behind an
+    # approval; GitHub creates the environment on first use if it is missing.
+    environment: crates-io
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # The toolchain comes from rust-toolchain.toml.
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # A tag that disagrees with Cargo.toml would publish the wrong number
+      # under the right name, and a published version can never be replaced.
+      - name: Check the tag matches Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "tag=$tag  Cargo.toml=$manifest"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the Cargo.toml version $manifest"
+            exit 1
+          fi
+
+      # A tag can point at a commit that never went through CI, so re-run the
+      # checks here rather than assuming.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --verbose
+
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # `cargo publish` packages and builds the result before uploading, so a
+      # crate that cannot be built from its own tarball fails here rather than
+      # after it is public.
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+# ---------------------------------------------------------------------------
+# Token-free alternative: Trusted Publishing
+#
+# crates.io can hand out a short-lived token over OIDC, so no long-lived secret
+# needs to live in this repository. It has to be configured on the crate first
+# (crates.io > your crate > Settings > Trusted Publishing), naming this
+# repository and the workflow file `release.yml`, which means the crate must
+# already exist — publish once with a token, then switch.
+#
+# To switch: add `id-token: write` to `permissions` above, then replace the
+# Publish step with:
+#
+#   - name: Authenticate to crates.io
+#     uses: rust-lang/crates-io-auth-action@v1
+#     id: auth
+#   - name: Publish
+#     run: cargo publish --locked
+#     env:
+#       CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+#
+# The CARGO_REGISTRY_TOKEN secret can then be deleted.
+# ---------------------------------------------------------------------------
