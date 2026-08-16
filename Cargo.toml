@@ -12,7 +12,17 @@ keywords = ["sightings", "threat-intelligence", "indicators", "database"]
 categories = ["database-implementations", "command-line-utilities"]
 # Development-only: shipping it would push anyone running `cargo install` onto
 # the stable channel rather than letting any 1.88+ toolchain build the crate.
-exclude = ["rust-toolchain.toml", ".idea/*", ".github/*"]
+# tests/ holds Python scripts that need a running server and the external
+# client library, so they are no use inside the crate tarball — and their
+# presence makes CI's cache step probe for Rust test directories that do not
+# exist. docker/ is likewise a deployment concern, not part of the library.
+exclude = [
+    "rust-toolchain.toml",
+    ".idea/*",
+    ".github/*",
+    "tests/*",
+    "docker/*",
+]
 
 [[bin]]
 name = "sightingdb"

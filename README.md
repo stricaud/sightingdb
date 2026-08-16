@@ -196,7 +196,11 @@ rspamd, Suricata, a shell script with `dig` — can query it unmodified.
 	127.0.0.3
 
 	$ dig +short TXT 9.9.9.9.malware.sdb.example.com
-	"count=15 first_seen=1786774648 last_seen=1786774648 consensus=1"
+	"count=15 first_seen=1786774648 last_seen=1786774648 consensus=1 ttl=86400 tags=\"\""
+
+The TXT record carries every field the HTTP API reports. `tags` is quoted
+because it is free-form, and a record too long for one DNS character-string is
+split across several, which clients join back together.
 
 A value that was never seen answers NXDOMAIN, which is both the DNSBL idiom and
 what lets resolvers cache the negative. A value that was seen answers with a

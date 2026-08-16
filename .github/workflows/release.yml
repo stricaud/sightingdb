@@ -198,7 +198,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache here on purpose: `cargo publish` builds from a freshly
+      # packaged tarball, so the cache saves little, and its cleanup step walks
+      # target/package/ and logs ENOENT errors for test directories that do not
+      # exist.
 
       # `cargo publish` packages and builds the result before uploading, so a
       # crate that cannot be built from its own tarball fails here rather than

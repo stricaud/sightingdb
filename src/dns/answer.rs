@@ -158,12 +158,25 @@ impl Responder {
         Record::from_rdata(name.clone(), self.ttl, RData::A(A(address)))
     }
 
+    /// Everything the HTTP API reports for a value, as `key=value` pairs.
+    ///
+    /// `tags` is quoted because it is free-form and may contain spaces, which
+    /// would otherwise run into the next pair.
     fn txt_record(&self, name: &Name, view: &AttributeView) -> Record {
         let text = format!(
-            "count={} first_seen={} last_seen={} consensus={}",
-            view.count, view.first_seen, view.last_seen, view.consensus
+            "count={} first_seen={} last_seen={} consensus={} ttl={} tags={}",
+            view.count,
+            view.first_seen,
+            view.last_seen,
+            view.consensus,
+            view.ttl,
+            quote(&view.tags),
         );
-        Record::from_rdata(name.clone(), self.ttl, RData::TXT(TXT::new(vec![text])))
+        Record::from_rdata(
+            name.clone(),
+            self.ttl,
+            RData::TXT(TXT::new(character_strings(&text))),
+        )
     }
 
     fn soa_record(&self) -> Record {
@@ -185,6 +198,38 @@ impl Responder {
         );
         Record::from_rdata(self.zone.clone(), self.ttl, RData::SOA(soa))
     }
+}
+
+/// Quote a free-form field so spaces in it cannot be mistaken for a separator.
+fn quote(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Split into DNS character-strings.
+///
+/// One carries at most 255 bytes and hickory refuses to encode more, which
+/// would turn an over-long tag into a dropped response rather than a truncated
+/// one. A TXT record may hold several; clients concatenate them.
+fn character_strings(text: &str) -> Vec<String> {
+    const MAX: usize = 255;
+    if text.len() <= MAX {
+        return vec![text.to_string()];
+    }
+
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        // Step back to a character boundary so a multi-byte character is never
+        // cut in half.
+        let mut end = (start + MAX).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        parts.push(text[start..end].to_string());
+        start = end;
+    }
+    parts
 }
 
 enum Outcome {
@@ -318,6 +363,104 @@ mod tests {
         let text = txt.to_string();
         assert!(text.contains("count=1"), "{text}");
         assert!(text.contains("consensus=1"), "{text}");
+    }
+
+    #[test]
+    fn the_txt_record_carries_every_field_the_http_api_reports() {
+        let r = responder(false);
+        let response = ask(&r, "4.3.2.1.malware.sdb.example.com.", RecordType::TXT);
+
+        let RData::TXT(txt) = &response.answers[0].data else {
+            panic!("expected TXT")
+        };
+        let text = txt.to_string();
+        for field in [
+            "count=",
+            "first_seen=",
+            "last_seen=",
+            "consensus=",
+            "ttl=",
+            "tags=",
+        ] {
+            assert!(text.contains(field), "{field} missing from {text}");
+        }
+    }
+
+    #[test]
+    fn a_ttl_and_tags_reach_the_txt_record() {
+        let state = Arc::new(SharedState::new(false));
+        state.db.write(
+            "malware/ips",
+            "1.2.3.4",
+            Utc::now(),
+            WriteOpts {
+                consensus: true,
+                ttl: Some(3600),
+            },
+        );
+        let r = Responder::new(
+            state,
+            Name::parse("sdb.example.com.", None).unwrap(),
+            vec![Exposed {
+                label: "malware".into(),
+                namespace: "malware/ips".into(),
+                encoding: Encoding::Ip,
+            }],
+            60,
+            false,
+        );
+
+        let response = ask(&r, "4.3.2.1.malware.sdb.example.com.", RecordType::TXT);
+        let RData::TXT(txt) = &response.answers[0].data else {
+            panic!("expected TXT")
+        };
+        assert!(txt.to_string().contains("ttl=3600"), "{}", txt.to_string());
+    }
+
+    /// A character-string holds 255 bytes and hickory refuses to encode more,
+    /// which would drop the answer entirely rather than truncate it.
+    #[test]
+    fn a_long_field_is_split_across_character_strings() {
+        let text = format!("tags={}", "x".repeat(600));
+        let parts = character_strings(&text);
+
+        assert!(parts.len() > 1);
+        assert!(
+            parts.iter().all(|p| p.len() <= 255),
+            "{:?}",
+            parts.iter().map(String::len).collect::<Vec<_>>()
+        );
+        assert_eq!(parts.concat(), text);
+
+        // And the result actually encodes, which the unsplit form would not.
+        let name = Name::parse("a.example.com.", None).unwrap();
+        let mut message = Message::new(1, MessageType::Response, OpCode::Query);
+        message
+            .answers
+            .push(Record::from_rdata(name, 60, RData::TXT(TXT::new(parts))));
+        assert!(message.to_vec().is_ok());
+        assert!(
+            Message::new(1, MessageType::Response, OpCode::Query)
+                .to_vec()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn splitting_never_cuts_a_multibyte_character() {
+        // 'é' is two bytes, so a naive 255-byte cut would land mid-character.
+        let text = "é".repeat(400);
+        let parts = character_strings(&text);
+
+        assert!(parts.iter().all(|p| p.len() <= 255));
+        assert_eq!(parts.concat(), text);
+    }
+
+    #[test]
+    fn tags_are_quoted_so_spaces_do_not_run_together() {
+        assert_eq!(quote("a b"), "\"a b\"");
+        assert_eq!(quote(""), "\"\"");
+        assert_eq!(quote("say \"hi\""), "\"say \\\"hi\\\"\"");
     }
 
     #[test]
