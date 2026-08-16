@@ -31,13 +31,19 @@ Running
 
 To run from the source directory:
 
-1. Generate a certificate: `cd etc; mkdir -p ssl; cd ssl; openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 -keyout key.pem -out cert.pem; cd ../..`
-2. `ln -s etc/ssl ssl`
-3. Start the daemon: `./target/debug/sightingdb -c etc/sightingdb.toml`
+1. Generate a certificate: `./target/debug/sightingdb -c etc/sightingdb.toml --install-selfsigned-keys`
+2. Start the daemon: `./target/debug/sightingdb -c etc/sightingdb.toml`
+
+`--install-selfsigned-keys` writes a self-signed certificate and a `0600` key at
+the configured `ssl_cert` and `ssl_key` paths and exits. It never overwrites an
+existing file, so pointing those settings at a real certificate is safe. The
+generated certificate names `localhost`, `127.0.0.1` and `::1`, lasts a year,
+and is for getting started — clients have to skip verification (`curl -k`).
+
+Set `ssl = false` in `[daemon]` to serve plain HTTP instead.
 
 Without `-c`, the configuration is looked up in `/etc/sightingdb/sightingdb.toml` and then `~/.sightingdb/sightingdb.toml`.
 
-Set `ssl=false` in the configuration to serve plain HTTP instead.
 
 Running as a service
 --------------------
@@ -73,6 +79,8 @@ Options
 -------
 
 	-c, --config <FILE>          Configuration file (default: see above)
+	    --install-selfsigned-keys Write a self-signed cert and key, then exit
+	    --import-stix <PATH>     Import STIX 2.1 bundles, then exit
 	-l, --logging-config <FILE>  log4rs configuration file (default: etc/log4rs.yml)
 	-k, --apikey <APIKEY>        Set the default API key, replacing the built-in 'changeme'
 	-v, --verbose...             Increase verbosity

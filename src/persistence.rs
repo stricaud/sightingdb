@@ -87,17 +87,17 @@ mod tests {
         }
     }
 
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(pub PathBuf);
 
     impl TempDir {
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             let path = std::env::temp_dir().join(format!("sightingdb-persist-{tag}"));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
             TempDir(path)
         }
 
-        fn snapshot(&self) -> PathBuf {
+        pub(super) fn snapshot(&self) -> PathBuf {
             snapshot_path(&self.0)
         }
     }
@@ -193,5 +193,66 @@ mod tests {
             DatabasePolicy::default(),
         );
         assert_eq!(restored.count("ns", "v"), 1);
+    }
+}
+
+#[cfg(test)]
+mod scale {
+    use super::tests::TempDir;
+    use super::*;
+    use crate::db::{Database, WriteOpts};
+    use chrono::Utc;
+    use std::time::Instant;
+
+    /// Not a correctness test: it reports what a snapshot costs as the database
+    /// grows, which is the number that decides whether this backend is enough.
+    #[test]
+    #[ignore = "measurement, run with --ignored"]
+    fn snapshot_cost_at_scale() {
+        for values in [100_000usize, 500_000, 1_000_000] {
+            let dir = TempDir::new(&format!("scale-{values}"));
+            let db = Database::default();
+
+            let start = Instant::now();
+            for i in 0..values {
+                db.write(
+                    &format!("feeds/ns{}", i % 20),
+                    // Genuinely distinct: an IPv4-shaped generator wraps at
+                    // 65_536 and would measure overwriting, not growth.
+                    &format!(
+                        "{}.{}.{}.{}",
+                        (i >> 24) & 255,
+                        (i >> 16) & 255,
+                        (i >> 8) & 255,
+                        i & 255
+                    ),
+                    Utc::now(),
+                    WriteOpts {
+                        consensus: true,
+                        ttl: None,
+                    },
+                );
+            }
+            let ingest = start.elapsed();
+
+            let start = Instant::now();
+            save(&db, &dir.snapshot()).unwrap();
+            let write = start.elapsed();
+            let bytes = std::fs::metadata(dir.snapshot()).unwrap().len();
+
+            let start = Instant::now();
+            let loaded = load(&dir.snapshot()).unwrap().unwrap();
+            let parse = start.elapsed();
+            let restored = Database::from_snapshot(loaded, Default::default());
+
+            println!(
+                "{values:>9} values | ingest {:>6.2}s | snapshot {:>6.2}s {:>7.1} MB | restore {:>6.2}s | ns={}",
+                ingest.as_secs_f64(),
+                write.as_secs_f64(),
+                bytes as f64 / 1_048_576.0,
+                parse.as_secs_f64(),
+                restored.namespace_count(),
+            );
+        }
     }
 }

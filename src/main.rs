@@ -13,6 +13,7 @@ mod maintenance;
 mod persistence;
 mod sighting_reader;
 mod sighting_writer;
+mod tls;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,13 +22,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use actix_web::{App, HttpServer, web};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
-use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 
 use crate::acl::Acl;
-use crate::config::{Settings, TlsSettings};
+use crate::config::Settings;
 use crate::db::{DEFAULT_APIKEY, Database};
 use crate::dns::answer::Responder;
 use crate::handlers::SharedState;
@@ -62,6 +62,11 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     import_stix: Option<PathBuf>,
 
+    /// Write a self-signed certificate and key at the configured ssl_cert and
+    /// ssl_key paths, then exit. For getting started; not for production.
+    #[arg(long)]
+    install_selfsigned_keys: bool,
+
     /// Sets the level of verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -92,6 +97,17 @@ fn main() -> Result<()> {
         let pid = daemon::detach(&settings.log_out, &settings.log_err)?;
         log::info!("Running in the background as pid {pid}");
         return Ok(());
+    }
+
+    // Before anything touches the database or the network.
+    if cli.install_selfsigned_keys {
+        let Some(tls) = &settings.tls else {
+            bail!(
+                "ssl is off in {}, so there is no certificate to install. Set ssl = true first.",
+                config_path.display()
+            );
+        };
+        return tls::install_self_signed(tls);
     }
 
     // Persistence is only on when dbdir is set *and* usable; a database that
@@ -534,7 +550,7 @@ async fn serve(state: Arc<SharedState>, settings: &Settings) -> Result<()> {
 
     let server = match &settings.tls {
         Some(tls) => {
-            let builder = tls_acceptor(tls)?;
+            let builder = tls::acceptor(tls)?;
             server
                 .bind_openssl(&settings.listen, builder)
                 .with_context(|| format!("binding https://{}", settings.listen))?
@@ -589,18 +605,6 @@ async fn wait_for_signal(shutdown: Arc<Shutdown>) -> Result<()> {
         actix_web::rt::time::sleep(Duration::from_millis(200)).await;
     }
     Ok(())
-}
-
-fn tls_acceptor(tls: &TlsSettings) -> Result<SslAcceptorBuilder> {
-    let mut builder =
-        SslAcceptor::mozilla_intermediate(SslMethod::tls()).context("creating the TLS acceptor")?;
-    builder
-        .set_private_key_file(&tls.key, SslFiletype::PEM)
-        .with_context(|| format!("reading TLS key {}", tls.key.display()))?;
-    builder
-        .set_certificate_chain_file(&tls.cert)
-        .with_context(|| format!("reading TLS certificate {}", tls.cert.display()))?;
-    Ok(builder)
 }
 
 /// Make sure `~/.sightingdb` exists so a user-local config has somewhere to live.

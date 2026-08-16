@@ -201,7 +201,7 @@ pub async fn help() -> impl Responder {
         .body(concat!(
             "SightingDB ",
             env!("CARGO_PKG_VERSION"),
-            ", written by Sebastien Tricaud, (C) Devo Inc. 2019\n",
+            ", written by Sebastien Tricaud\n",
             "REST Endpoints:\n",
             "\t/w: write (GET)\n",
             "\t/wb: write in bulk mode (POST)\n",
@@ -219,7 +219,7 @@ pub async fn info() -> impl Responder {
     HttpResponse::Ok().json(InfoData {
         implementation: "SightingDB",
         version: env!("CARGO_PKG_VERSION"),
-        vendor: "Devo",
+        vendor: "github.com/stricaud/sightingdb",
         author: "Sebastien Tricaud",
     })
 }
