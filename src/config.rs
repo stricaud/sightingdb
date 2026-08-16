@@ -47,6 +47,9 @@ pub struct Settings {
     /// Where snapshots live. `None` disables persistence entirely.
     pub dbdir: Option<PathBuf>,
     pub snapshot_interval: u64,
+    /// zstd level for shard files. 3 is the knee of the curve; higher levels
+    /// cost compression time for little size on a file rewritten this often.
+    pub compression_level: i32,
     pub sweep_interval: u64,
     pub stats_retention: usize,
     pub shadow_ttl: u64,
@@ -141,6 +144,8 @@ struct RawDaemon {
     dbdir: Option<PathBuf>,
     #[serde(default = "default_snapshot_interval")]
     snapshot_interval: u64,
+    #[serde(default = "default_compression_level")]
+    compression_level: i32,
     #[serde(default = "default_sweep_interval")]
     sweep_interval: u64,
     #[serde(default)]
@@ -228,6 +233,9 @@ fn default_post_limit() -> usize {
 fn default_snapshot_interval() -> u64 {
     300
 }
+fn default_compression_level() -> i32 {
+    crate::persistence::default_level()
+}
 fn default_sweep_interval() -> u64 {
     60
 }
@@ -313,6 +321,7 @@ impl RawConfig {
             log_err: daemon.log_err,
             dbdir: daemon.dbdir,
             snapshot_interval: daemon.snapshot_interval,
+            compression_level: daemon.compression_level,
             sweep_interval: daemon.sweep_interval,
             stats_retention: daemon.stats_retention,
             shadow_ttl: daemon.shadow_ttl,

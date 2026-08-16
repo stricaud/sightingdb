@@ -47,12 +47,18 @@ openssl = "0.10.81"
 # Already in the tree via actix-router; used for STIX pattern literals.
 regex = "1.13"
 serde_json = "1.0"
+# Already in the tree via actix-web. Chosen over xz for snapshots: measured on
+# a 50 MB snapshot, zstd -9 compresses in 0.34s to 8.0x where xz -6 takes 15.6s
+# for 12.1x, and decompresses 6x faster — which is the path a namespace being
+# paged back in sits on.
+zstd = "0.13"
 toml = "1.1"
 # Format-preserving TOML, so the management interface can rewrite a config
 # without discarding its comments. This is what cargo uses on Cargo.toml.
 toml_edit = "0.25"
 serde = { version = "1.0", features = ["derive"] }
 rand = "0.10"
+sha2 = "0.11.0"
 
 [features]
 # Build OpenSSL from source and link it statically. Off by default because it

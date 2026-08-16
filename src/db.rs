@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
@@ -285,6 +285,9 @@ impl Namespace {
 pub struct Database {
     namespaces: RwLock<HashMap<String, Arc<Namespace>>>,
     policy: DatabasePolicy,
+    /// Shards written to since the last save, so a snapshot costs what changed
+    /// rather than what exists.
+    dirty: Mutex<HashSet<String>>,
 }
 
 impl Database {
@@ -299,6 +302,7 @@ impl Database {
         Database {
             namespaces: RwLock::new(HashMap::new()),
             policy,
+            dirty: Mutex::new(HashSet::new()),
         }
     }
 
@@ -314,6 +318,7 @@ impl Database {
         Database {
             namespaces: RwLock::new(namespaces),
             policy,
+            dirty: Mutex::new(HashSet::new()),
         }
     }
 
@@ -362,6 +367,7 @@ impl Database {
 
         view.consensus = self.count(ALL_NAMESPACE, value);
         log_attribute(path, &view);
+        self.mark_dirty(path);
 
         count
     }
@@ -417,6 +423,9 @@ impl Database {
             .remove(name)
             .is_some();
 
+        if removed {
+            self.mark_dirty(name);
+        }
         if removed && counts_towards_consensus(name) {
             for value in values {
                 self.release_consensus(&value);
@@ -445,6 +454,9 @@ impl Database {
             }
 
             let expired = namespace.remove_expired(now);
+            if !expired.is_empty() {
+                self.mark_dirty(name);
+            }
             report.values_removed += expired.len();
 
             if counts_towards_consensus(name) {
@@ -461,8 +473,42 @@ impl Database {
         report
     }
 
-    /// A borrowed, streaming view for serialization. Namespaces are locked one
-    /// at a time as they are written, so this never copies the whole database.
+    /// Note that a shard is dirty, so the next save rewrites it.
+    pub fn mark_dirty(&self, namespace: &str) {
+        self.mark_shard_dirty(crate::persistence::shard_of(namespace));
+    }
+
+    pub fn mark_shard_dirty(&self, shard: &str) {
+        self.dirty
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(shard.to_string());
+    }
+
+    /// Take the dirty set, leaving it empty. A failed save puts its shard back.
+    pub fn take_dirty(&self) -> HashSet<String> {
+        std::mem::take(&mut *self.dirty.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Every shard that currently holds a namespace.
+    pub fn shards(&self) -> HashSet<String> {
+        self.namespaces
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .map(|name| crate::persistence::shard_of(name).to_string())
+            .collect()
+    }
+
+    /// A borrowed, streaming view of one shard.
+    pub fn shard_snapshot<'a>(&'a self, shard: &'a str) -> ShardSnapshot<'a> {
+        ShardSnapshot(self, shard)
+    }
+
+    /// A borrowed, streaming view of the whole database. Shards are what gets
+    /// written now; this remains for tests and for comparing against the
+    /// single-file format.
+    #[cfg(test)]
     pub fn snapshot(&self) -> Snapshot<'_> {
         Snapshot(self)
     }
@@ -642,18 +688,37 @@ pub struct SnapshotData {
     pub namespaces: HashMap<String, HashMap<String, Attribute>>,
 }
 
+/// Owned form of one shard, which has the same shape as a whole snapshot.
+pub type ShardData = SnapshotData;
+
+#[cfg(test)]
 pub struct Snapshot<'a>(&'a Database);
 
-impl Serialize for Snapshot<'_> {
+/// One shard, serialized in the same shape as a full snapshot so that either
+/// can be read by the same code.
+pub struct ShardSnapshot<'a>(&'a Database, &'a str);
+
+impl Serialize for ShardSnapshot<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut out = serializer.serialize_struct("Snapshot", 2)?;
         out.serialize_field("version", &SNAPSHOT_VERSION)?;
-        out.serialize_field("namespaces", &NamespacesRef(self.0))?;
+        out.serialize_field("namespaces", &NamespacesRef(self.0, Some(self.1)))?;
         out.end()
     }
 }
 
-struct NamespacesRef<'a>(&'a Database);
+#[cfg(test)]
+impl Serialize for Snapshot<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("Snapshot", 2)?;
+        out.serialize_field("version", &SNAPSHOT_VERSION)?;
+        out.serialize_field("namespaces", &NamespacesRef(self.0, None))?;
+        out.end()
+    }
+}
+
+/// All namespaces, or only those in one shard.
+struct NamespacesRef<'a>(&'a Database, Option<&'a str>);
 
 impl Serialize for NamespacesRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -668,6 +733,10 @@ impl Serialize for NamespacesRef<'_> {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
             map.iter()
+                .filter(|(name, _)| {
+                    self.1
+                        .is_none_or(|shard| crate::persistence::shard_of(name) == shard)
+                })
                 .map(|(name, namespace)| (name.clone(), Arc::clone(namespace)))
                 .collect()
         };

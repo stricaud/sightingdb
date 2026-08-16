@@ -112,8 +112,9 @@ fn main() -> Result<()> {
 
     // Persistence is only on when dbdir is set *and* usable; a database that
     // cannot save is still better than one that refuses to start.
-    let snapshot = usable_snapshot_path(&settings);
-    let db = open_database(&settings, snapshot.as_deref())?;
+    let dbdir = usable_dbdir(&settings);
+    let level = settings.compression_level;
+    let db = open_database(&settings, dbdir.as_deref())?;
 
     let acl = build_acl(&settings, &db, cli.apikey.as_deref());
 
@@ -121,10 +122,14 @@ fn main() -> Result<()> {
     if let Some(path) = &cli.import_stix {
         let imported = import_stix(&db, &settings, path)?;
         log::info!("Imported {imported} sighting(s) from {}", path.display());
-        if let Some(snapshot) = snapshot.as_deref() {
-            persistence::save(&db, snapshot)
-                .with_context(|| format!("saving to {}", snapshot.display()))?;
-            log::info!("Saved the database to {}", snapshot.display());
+        if let Some(dbdir) = dbdir.as_deref() {
+            let report = persistence::save(&db, dbdir, level, true)
+                .with_context(|| format!("saving to {}", dbdir.display()))?;
+            log::info!(
+                "Saved {} shard(s) to {}",
+                report.shards_written,
+                dbdir.display()
+            );
         } else {
             log::warn!("No dbdir configured, so the import was not persisted");
         }
@@ -138,7 +143,7 @@ fn main() -> Result<()> {
     if settings.http_enabled && settings.tls.is_none() {
         log::warn!("TLS is disabled; serving plain HTTP.");
     }
-    if snapshot.is_none() {
+    if dbdir.is_none() {
         log::warn!("Persistence is disabled; data will be lost when the process stops.");
     }
 
@@ -160,7 +165,7 @@ fn main() -> Result<()> {
     });
 
     let shutdown = Shutdown::new();
-    let mut workers = spawn_workers(&state, &settings, snapshot.as_deref(), &shutdown)?;
+    let mut workers = spawn_workers(&state, &settings, dbdir.as_deref(), &shutdown)?;
     workers.extend(spawn_dns(&state, &settings, &shutdown)?);
 
     let result = actix_web::rt::System::new().block_on(async {
@@ -194,9 +199,10 @@ fn main() -> Result<()> {
         let _ = worker.join();
     }
 
-    if let Some(path) = snapshot.as_deref() {
+    if let Some(path) = dbdir.as_deref() {
         log::info!("Saving the database to {}", path.display());
-        if let Err(e) = persistence::save(&state.db, path) {
+        // Everything on the way out, not just what changed.
+        if let Err(e) = persistence::save(&state.db, path, level, true) {
             log::error!("Could not save the database: {e:#}");
         }
     }
@@ -387,10 +393,10 @@ fn build_acl(settings: &Settings, db: &Database, cli_apikey: Option<&str>) -> Ac
 ///
 /// A snapshot that exists but cannot be read is fatal: starting empty would
 /// look like catastrophic data loss, and the next save would make it real.
-fn open_database(settings: &Settings, snapshot: Option<&Path>) -> Result<Database> {
+fn open_database(settings: &Settings, dbdir: Option<&Path>) -> Result<Database> {
     let policy = settings.database_policy();
 
-    let Some(path) = snapshot else {
+    let Some(path) = dbdir else {
         return Ok(Database::with_policy(policy));
     };
 
@@ -405,15 +411,15 @@ fn open_database(settings: &Settings, snapshot: Option<&Path>) -> Result<Databas
             Ok(db)
         }
         None => {
-            log::info!("No snapshot at {}, starting empty", path.display());
+            log::info!("No shards in {}, starting empty", path.display());
             Ok(Database::with_policy(policy))
         }
     }
 }
 
-/// Where snapshots go, or `None` if persistence is off or the directory is not
-/// usable.
-fn usable_snapshot_path(settings: &Settings) -> Option<PathBuf> {
+/// The directory shards are written to, or `None` if persistence is off or the
+/// directory is not usable.
+fn usable_dbdir(settings: &Settings) -> Option<PathBuf> {
     let dbdir = settings.dbdir.as_ref()?;
 
     if let Err(e) = fs::create_dir_all(dbdir) {
@@ -424,15 +430,16 @@ fn usable_snapshot_path(settings: &Settings) -> Option<PathBuf> {
         return None;
     }
 
-    Some(persistence::snapshot_path(dbdir))
+    Some(dbdir.clone())
 }
 
 fn spawn_workers(
     state: &Arc<SharedState>,
     settings: &Settings,
-    snapshot: Option<&Path>,
+    dbdir: Option<&Path>,
     shutdown: &Arc<Shutdown>,
 ) -> Result<Vec<JoinHandle<()>>> {
+    let level = settings.compression_level;
     let mut workers = Vec::new();
 
     if settings.sweep_interval > 0 {
@@ -457,7 +464,7 @@ fn spawn_workers(
         );
     }
 
-    if let Some(path) = snapshot
+    if let Some(path) = dbdir
         && settings.snapshot_interval > 0
     {
         let state = Arc::clone(state);
@@ -467,10 +474,16 @@ fn spawn_workers(
                 "sightingdb-snapshot",
                 Duration::from_secs(settings.snapshot_interval),
                 Arc::clone(shutdown),
-                move || {
-                    if let Err(e) = persistence::save(&state.db, &path) {
-                        log::error!("Snapshot failed: {e:#}");
-                    }
+                move || match persistence::save(&state.db, &path, level, false) {
+                    // Incremental: shards untouched since the last save are
+                    // left alone, so an idle database costs nothing.
+                    Ok(report) if report.shards_written > 0 => log::info!(
+                        "Snapshot wrote {} shard(s), skipped {}",
+                        report.shards_written,
+                        report.shards_skipped
+                    ),
+                    Ok(_) => {}
+                    Err(e) => log::error!("Snapshot failed: {e:#}"),
                 },
             )
             .context("starting the snapshot thread")?,

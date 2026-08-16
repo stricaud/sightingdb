@@ -34,7 +34,17 @@ dbdir = "/var/lib/sighting"
 
 # Seconds between snapshots. The database is always saved on a clean shutdown;
 # this bounds how much a crash can lose. 0 saves only on shutdown.
+#
+# Storage is split into one zstd-compressed file per top-level namespace, so
+# "myorg/thisone" lives in myorg-<hash>.json.zst and a periodic snapshot only
+# rewrites the files that changed. Everything internal (_all, _shadow, _config)
+# shares sightingdb.json.zst.
 snapshot_interval = 300
+
+# zstd level for those files. 3 is the knee of the curve: measured on a 50 MB
+# snapshot it reaches 7.3x in 0.07s, where level 19 takes 25s for 11.3x. Higher
+# levels cost compression time on every save for very little space.
+compression_level = 3
 
 # Seconds between eviction sweeps, which reclaim expired values and the
 # namespaces left empty by them. 0 disables the sweeper.
