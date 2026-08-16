@@ -34,6 +34,16 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
+  # Workflow shell cannot be exercised by cargo test and only fails when a
+  # release is already under way, so it gets its own check.
+  workflows:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check for unbound shell variables
+        run: python3 .github/lint-workflows.py
+
   audit:
     runs-on: ubuntu-latest
     steps:

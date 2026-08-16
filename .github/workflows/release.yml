@@ -92,7 +92,7 @@ jobs:
             git push origin HEAD "refs/tags/v$version"
             echo "Bumped to $version and tagged v$version"
           else
-            version="${TAG#v}"
+            version="${GITHUB_REF_NAME#v}"
             manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
             echo "tag=$version  Cargo.toml=$manifest"
             if [ "$version" != "$manifest" ]; then
