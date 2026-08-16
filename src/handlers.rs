@@ -22,6 +22,8 @@ pub struct SharedState {
     pub info: crate::admin::ServerInfo,
     /// Where the ACL is written back. `None` makes keys read-only.
     pub acl_file: Option<std::path::PathBuf>,
+    /// Where tiers are written back. `None` makes them read-only.
+    pub tiers_file: Option<std::path::PathBuf>,
 }
 
 impl SharedState {
@@ -38,6 +40,7 @@ impl SharedState {
             acl: std::sync::RwLock::new(acl),
             info: crate::admin::ServerInfo::default(),
             acl_file: None,
+            tiers_file: None,
         }
     }
 }

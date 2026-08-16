@@ -9,10 +9,11 @@
 //! rather than one per operation.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
-use serde::Serialize;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -87,6 +88,79 @@ impl TierPolicy {
     }
 }
 
+/// The on-disk form, written by the management interface.
+///
+/// Kept in its own file for the same reason API keys are: it is rewritten by
+/// the program, and rewriting the hand-maintained configuration would discard
+/// its comments.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TierFile {
+    pub default_tier: String,
+    pub warm_idle: u64,
+    #[serde(default)]
+    pub tiers: HashMap<String, String>,
+}
+
+impl TierPolicy {
+    pub fn load(path: &Path) -> Result<TierPolicy> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let file: TierFile =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+
+        let mut shards = HashMap::new();
+        for (shard, tier) in file.tiers {
+            let tier = Tier::parse(&tier)
+                .with_context(|| format!("for '{shard}' in {}", path.display()))?;
+            shards.insert(shard, tier);
+        }
+
+        Ok(TierPolicy {
+            default_tier: Tier::parse(&file.default_tier)
+                .with_context(|| format!("for 'default_tier' in {}", path.display()))?,
+            shards,
+            warm_idle: Duration::from_secs(file.warm_idle),
+        })
+    }
+
+    /// Write atomically, so a crash mid-write cannot leave a file that fails to
+    /// parse and takes the next startup with it.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut body = String::from(
+            "# Written by the SightingDB management interface. Comments added here\n\
+             # are replaced the next time a tier is changed.\n\
+             #\n\
+             # hot   never evicted\n\
+             # warm  dropped once untouched for warm_idle seconds\n\
+             # cold  dropped at the next sweep once idle\n\n",
+        );
+        body.push_str(&format!(
+            "default_tier = \"{}\"\n",
+            self.default_tier.as_str()
+        ));
+        body.push_str(&format!(
+            "warm_idle = {}\n\n[tiers]\n",
+            self.warm_idle.as_secs()
+        ));
+
+        let mut shards: Vec<(&String, &Tier)> = self.shards.iter().collect();
+        shards.sort_by(|a, b| a.0.cmp(b.0));
+        for (shard, tier) in shards {
+            body.push_str(&format!("\"{shard}\" = \"{}\"\n", tier.as_str()));
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, body).with_context(|| format!("writing {}", temp.display()))?;
+        std::fs::rename(&temp, path)
+            .with_context(|| format!("renaming {} to {}", temp.display(), path.display()))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +203,55 @@ mod tests {
 
         assert_eq!(p.tier_of(crate::persistence::INTERNAL_SHARD), Tier::Hot);
         assert_eq!(p.idle_allowance(crate::persistence::INTERNAL_SHARD), None);
+    }
+
+    #[test]
+    fn a_policy_round_trips_through_its_file() {
+        let dir = std::env::temp_dir().join("sightingdb-tierfile");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiers.toml");
+
+        let original = policy();
+        original.save(&path).unwrap();
+        let restored = TierPolicy::load(&path).unwrap();
+
+        assert_eq!(restored, original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_written_file_says_it_is_generated() {
+        let dir = std::env::temp_dir().join("sightingdb-tierfile-doc");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiers.toml");
+
+        policy().save(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+
+        assert!(body.contains("management interface"), "{body}");
+        // Quoted, so a shard name containing a dot cannot become a sub-table.
+        assert!(body.contains("\"myorg\" = \"hot\""), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bad_tier_in_the_file_names_the_shard() {
+        let dir = std::env::temp_dir().join("sightingdb-tierfile-bad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiers.toml");
+        std::fs::write(
+            &path,
+            "default_tier = \"hot\"\nwarm_idle = 60\n\n[tiers]\nmyorg = \"tepid\"\n",
+        )
+        .unwrap();
+
+        let err = format!("{:#}", TierPolicy::load(&path).unwrap_err());
+        assert!(err.contains("myorg"), "{err}");
+        assert!(err.contains("tepid"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

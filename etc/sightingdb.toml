@@ -78,6 +78,12 @@ shadow_ttl = 2_592_000
 default_tier = "hot"
 warm_idle = 3600
 
+# Rewritten by the management interface whenever a tier is changed there, which
+# is why it is a file of its own: rewriting this one would discard its comments.
+# Without it, tiers come from [storage.tiers] below and the interface can show
+# them but not change them.
+tiers_file = "tiers.toml"
+
 # Per-namespace overrides, keyed by the top-level namespace.
 # [storage.tiers]
 # myorg = "hot"

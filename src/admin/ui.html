@@ -26,7 +26,7 @@
            background: var(--bg); color: var(--fg); border-radius: 6px; cursor: pointer; }
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: .45; cursor: default; }
-  input { font: inherit; padding: .35rem .6rem; border: 1px solid var(--line);
+  input, select { font: inherit; padding: .35rem .6rem; border: 1px solid var(--line);
           border-radius: 6px; background: var(--bg); color: var(--fg); }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line);
@@ -92,9 +92,16 @@
       <button id="ns-next">Next</button>
     </div>
     <div class="scroll"><table>
-      <thead><tr><th>Namespace</th></tr></thead>
+      <thead><tr>
+        <th>Namespace</th><th>In memory</th><th>Tier</th>
+      </tr></thead>
       <tbody id="ns-rows"></tbody>
     </table></div>
+    <p class="muted">A tier applies to the whole top-level namespace, so changing
+       it for <code>myorg/one</code> changes <code>myorg</code> and everything
+       under it. <b>hot</b> stays in memory; <b>warm</b> is dropped once
+       untouched for the configured window; <b>cold</b> is dropped at the next
+       sweep. Evicted data is read back automatically when it is next used.</p>
   </section>
 
   <!-- Values within one namespace -->
@@ -283,16 +290,39 @@ async function loadNamespaces() {
     const page = await api(`/_management/api/namespaces?q=${q}&offset=${state.nsOffset}&limit=${PAGE}`);
     state.nsTotal = page.total;
 
-    $("ns-rows").replaceChildren(...page.items.map((name) => {
+    $("ns-rows").replaceChildren(...page.items.map((item) => {
       const tr = document.createElement("tr");
-      const td = document.createElement("td");
-      td.className = "n";
+
+      const name = document.createElement("td");
+      name.className = "n";
       const a = document.createElement("a");
-      a.href = `/_management/${name}`;
-      a.textContent = name;
-      a.onclick = (e) => { e.preventDefault(); go(name); };
-      td.append(a);
-      tr.append(td);
+      a.href = `/_management/${item.namespace}`;
+      a.textContent = item.namespace;
+      a.onclick = (e) => { e.preventDefault(); go(item.namespace); };
+      name.append(a);
+
+      const resident = document.createElement("td");
+      resident.textContent = item.resident ? "yes" : "on disk";
+      if (!item.resident) resident.className = "muted";
+
+      // The tier belongs to the top-level namespace, so the control is
+      // labelled with the shard it will actually change.
+      const tier = document.createElement("td");
+      const select = document.createElement("select");
+      for (const option of ["hot", "warm", "cold"]) {
+        const o = document.createElement("option");
+        o.value = o.textContent = option;
+        o.selected = option === item.tier;
+        select.append(o);
+      }
+      select.title = `applies to ${item.shard}`;
+      select.onchange = () => setTier(item.shard, select.value, select);
+      const shard = document.createElement("span");
+      shard.className = "muted";
+      shard.textContent = ` ${item.shard}`;
+      tier.append(select, shard);
+
+      tr.append(name, resident, tier);
       return tr;
     }));
 
@@ -301,6 +331,22 @@ async function loadNamespaces() {
     $("ns-prev").disabled = page.offset === 0;
     $("ns-next").disabled = page.offset + page.items.length >= page.total;
   } catch (e) { setError(e.message); }
+}
+
+/**
+ * Tiers are per top-level namespace, so one change moves every row sharing it.
+ * The list is reloaded rather than patched so those rows agree again.
+ */
+async function setTier(shard, tier, control) {
+  control.disabled = true;
+  try {
+    await api("/_management/api/tier", "POST", { shard, tier });
+    await loadNamespaces();
+  } catch (e) {
+    setError(e.message);
+    control.disabled = false;
+    loadNamespaces();
+  }
 }
 
 // --- values ----------------------------------------------------------------

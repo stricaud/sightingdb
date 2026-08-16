@@ -182,6 +182,7 @@ fn main() -> Result<()> {
         acl: std::sync::RwLock::new(acl),
         info,
         acl_file: settings.acl_file.clone(),
+        tiers_file: settings.tiers_file.clone(),
     });
 
     let shutdown = Shutdown::new();

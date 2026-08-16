@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::attribute::{Attribute, AttributeView};
 use crate::db_log::log_attribute;
-use crate::tier::TierPolicy;
+use crate::tier::{Tier, TierPolicy};
 
 /// Namespace holding every value ever written, used to derive consensus.
 pub const ALL_NAMESPACE: &str = "_all";
@@ -67,6 +67,16 @@ pub struct WriteOpts {
     pub consensus: bool,
     /// Set the attribute's TTL. `None` leaves whatever it already had.
     pub ttl: Option<u64>,
+}
+
+/// One namespace as the management interface sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NamespaceEntry {
+    pub namespace: String,
+    /// The top-level namespace, which is what a tier applies to.
+    pub shard: String,
+    pub tier: String,
+    pub resident: bool,
 }
 
 /// A slice of a listing, with the total so a caller can page through it.
@@ -612,7 +622,7 @@ impl Database {
         offset: usize,
         limit: usize,
         allowed: impl Fn(&str) -> bool,
-    ) -> Page<String> {
+    ) -> Page<NamespaceEntry> {
         let filter = filter.to_ascii_lowercase();
 
         // The catalogue, not the resident map: an evicted namespace still
@@ -629,11 +639,20 @@ impl Database {
         names.dedup();
 
         let total = names.len();
+        let tiers = self.tiers.read().unwrap_or_else(PoisonError::into_inner);
         let items = names
             .into_iter()
             .skip(offset)
             .take(limit)
-            .cloned()
+            .map(|name| {
+                let shard = crate::persistence::shard_of(name);
+                NamespaceEntry {
+                    namespace: name.clone(),
+                    shard: shard.to_string(),
+                    tier: tiers.tier_of(shard).as_str().to_string(),
+                    resident: shards.get(shard).is_some_and(|meta| meta.resident),
+                }
+            })
             .collect();
 
         Page {
@@ -641,6 +660,26 @@ impl Database {
             total,
             offset,
         }
+    }
+
+    /// Change a shard's tier, taking effect at once.
+    ///
+    /// Promoting to `hot` does not load anything: the shard is paged in when
+    /// it is next used, as it would have been anyway.
+    pub fn set_tier(&self, shard: &str, tier: Tier) {
+        self.tiers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .shards
+            .insert(shard.to_string(), tier);
+    }
+
+    /// The current policy, for writing back to disk.
+    pub fn tier_policy(&self) -> TierPolicy {
+        self.tiers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Values inside one namespace, sorted, one page at a time.
@@ -1091,6 +1130,11 @@ mod tests {
         DateTime::from_timestamp(secs, 0).expect("timestamp in range")
     }
 
+    /// Listings carry the shard and tier now; most tests only care about names.
+    fn names(page: &Page<NamespaceEntry>) -> Vec<&str> {
+        page.items.iter().map(|e| e.namespace.as_str()).collect()
+    }
+
     fn consensus() -> WriteOpts {
         WriteOpts {
             consensus: true,
@@ -1380,13 +1424,13 @@ mod tests {
         }
 
         let first = db.namespace_page("", 0, 2, |_| true);
-        assert_eq!(first.items, ["a/ns", "b/ns"]);
+        assert_eq!(names(&first), ["a/ns", "b/ns"]);
         // `total` counts matches, not the page, so a UI knows how far it can go.
         assert_eq!(first.total, 3);
         assert_eq!(first.offset, 0);
 
         let second = db.namespace_page("", 2, 2, |_| true);
-        assert_eq!(second.items, ["c/ns"]);
+        assert_eq!(names(&second), ["c/ns"]);
     }
 
     #[test]
@@ -1397,7 +1441,7 @@ mod tests {
         db.write("internal/notes", "v", at(100), consensus());
 
         let page = db.namespace_page("feeds", 0, 10, |_| true);
-        assert_eq!(page.items, ["feeds/misp", "feeds/otx"]);
+        assert_eq!(names(&page), ["feeds/misp", "feeds/otx"]);
         assert_eq!(page.total, 2);
     }
 
@@ -1414,10 +1458,10 @@ mod tests {
         db.write("ns", "v", at(100), consensus());
 
         let page = db.namespace_page("", 0, 100, |_| true);
-        assert!(!page.items.iter().any(|n| n.starts_with("_config")));
+        assert!(!names(&page).iter().any(|n| n.starts_with("_config")));
         // `_all` is a consensus tally, not something to browse.
-        assert!(!page.items.iter().any(|n| n == ALL_NAMESPACE));
-        assert_eq!(page.items, ["ns"]);
+        assert!(!names(&page).contains(&ALL_NAMESPACE));
+        assert_eq!(names(&page), ["ns"]);
     }
 
     #[test]
@@ -1500,7 +1544,7 @@ mod tests {
 
         let page = db.namespace_page("", 0, 100, |name| name.starts_with("feeds"));
 
-        assert_eq!(page.items, ["feeds/misp"]);
+        assert_eq!(names(&page), ["feeds/misp"]);
         // The total must reflect what was allowed, or paging would show gaps.
         assert_eq!(page.total, 1);
     }
@@ -1564,7 +1608,7 @@ mod tests {
 
         // The management interface must not lose sight of it.
         let page = db.namespace_page("", 0, 10, |_| true);
-        assert!(page.items.iter().any(|n| n == "myorg/ns"), "{page:?}");
+        assert!(names(&page).contains(&"myorg/ns"), "{page:?}");
         assert!(db.namespace_exists("myorg/ns"));
         assert_eq!(db.namespace_count(), 2); // myorg/ns and _all
     }

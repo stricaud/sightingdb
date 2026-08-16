@@ -60,6 +60,9 @@ pub struct Settings {
     pub acl_file: Option<PathBuf>,
     /// Which shards stay in memory, and for how long.
     pub tiers: TierPolicy,
+    /// File the management interface rewrites when a tier is changed. Without
+    /// it, tiers are read-only and come from `[storage]`.
+    pub tiers_file: Option<PathBuf>,
     pub dns: Option<DnsSettings>,
     pub zmq: Option<ZmqSettings>,
     pub stix: StixSettings,
@@ -171,6 +174,7 @@ struct RawStorage {
     /// Per-shard overrides, keyed by top-level namespace.
     #[serde(default)]
     tiers: HashMap<String, String>,
+    tiers_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,9 +315,26 @@ impl RawConfig {
             None
         };
 
-        let tiers = match self.storage {
-            Some(storage) => storage.into_policy()?,
-            None => TierPolicy::default(),
+        let (tiers, tiers_file) = match self.storage {
+            Some(storage) => {
+                let file = storage.tiers_file.as_ref().map(|f| resolve(base, f));
+                // The file wins when there is one, since it is the copy the
+                // interface maintains.
+                let policy = match &file {
+                    Some(path) if path.exists() => TierPolicy::load(path)?,
+                    Some(path) => {
+                        log::info!(
+                            "tiers_file {} does not exist yet; it will be created when a tier \
+                             is changed",
+                            path.display()
+                        );
+                        storage.to_policy()?
+                    }
+                    None => storage.to_policy()?,
+                };
+                (policy, file)
+            }
+            None => (TierPolicy::default(), None),
         };
         let acl_file = daemon.acl_file.map(|file| resolve(base, &file));
         let acl = load_acl(self.acl, acl_file.as_deref(), path)?;
@@ -357,6 +378,7 @@ impl RawConfig {
             acl,
             acl_file,
             tiers,
+            tiers_file,
             dns,
             zmq,
             stix,
@@ -365,11 +387,11 @@ impl RawConfig {
 }
 
 impl RawStorage {
-    fn into_policy(self) -> Result<TierPolicy> {
+    fn to_policy(&self) -> Result<TierPolicy> {
         let mut shards = HashMap::new();
-        for (shard, tier) in self.tiers {
-            let tier = Tier::parse(&tier)
-                .with_context(|| format!("in [storage.tiers] entry '{shard}'"))?;
+        for (shard, tier) in &self.tiers {
+            let tier =
+                Tier::parse(tier).with_context(|| format!("in [storage.tiers] entry '{shard}'"))?;
             shards.insert(shard.trim().to_string(), tier);
         }
 

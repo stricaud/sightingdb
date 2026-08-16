@@ -66,6 +66,14 @@ impl ValuesQuery {
     }
 }
 
+/// A tier change from the interface.
+#[derive(Debug, Deserialize)]
+pub struct TierChange {
+    /// The top-level namespace. A tier applies to the whole of it.
+    shard: String,
+    tier: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ValueQuery {
     namespace: String,
@@ -450,6 +458,50 @@ fn random_key() -> String {
         .collect()
 }
 
+/// Change a shard's tier and write it back, so it survives a restart.
+pub async fn set_tier(state: State, body: web::Json<TierChange>, req: HttpRequest) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    let change = body.into_inner();
+    let tier = match crate::tier::Tier::parse(&change.tier) {
+        Ok(tier) => tier,
+        Err(e) => return HttpResponse::BadRequest().json(Message::new(e.to_string())),
+    };
+    if change.shard.is_empty() || change.shard.starts_with('_') {
+        return HttpResponse::BadRequest().json(Message::new(
+            "Internal namespaces are always hot and cannot be retiered.",
+        ));
+    }
+    // Reaching the interface is not the same as being allowed to see the data.
+    if let Err(resp) = require_read(&state, &caller, &change.shard) {
+        return resp;
+    }
+
+    let Some(path) = state.tiers_file.as_ref() else {
+        return HttpResponse::Conflict().json(Message::new(
+            "No tiers_file is configured, so tiers cannot be changed here. Set tiers_file in \
+             [storage] and restart.",
+        ));
+    };
+
+    state.db.set_tier(&change.shard, tier);
+    if let Err(e) = state.db.tier_policy().save(path) {
+        log::error!("Could not write {}: {e:#}", path.display());
+        return HttpResponse::InternalServerError()
+            .json(Message::new(format!("Could not write the tier file: {e}")));
+    }
+
+    log::info!(
+        "Tier of '{}' set to {} by '{caller}'",
+        change.shard,
+        tier.as_str()
+    );
+    HttpResponse::Ok().json(Message::new("ok"))
+}
+
 /// Register the admin routes.
 pub fn routes(cfg: &mut web::ServiceConfig) {
     // Order matters: the catch-all must come last or it would swallow the API.
@@ -466,6 +518,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
             web::get().to(generate_key),
         )
         .route("/_management/api/keys/{key}", web::delete().to(delete_key))
+        .route("/_management/api/tier", web::post().to(set_tier))
         .route("/_management", web::get().to(index))
         .route("/_management/{namespace:.*}", web::get().to(index));
 }
@@ -918,6 +971,124 @@ mod tests {
             "not-a-key"
         );
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // -- tiers -------------------------------------------------------------
+
+    fn tiered_state(dir: &std::path::Path) -> State {
+        let mut inner = SharedState::new(true);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner.tiers_file = Some(dir.join("tiers.toml"));
+        inner.db.write(
+            "myorg/one",
+            "v",
+            Utc::now(),
+            WriteOpts {
+                consensus: true,
+                ttl: None,
+            },
+        );
+        web::Data::new(inner)
+    }
+
+    macro_rules! post_tier {
+        ($app:expr, $body:expr, $key:expr) => {
+            test::call_service(
+                &$app,
+                test::TestRequest::post()
+                    .uri("/_management/api/tier")
+                    .insert_header(("Authorization", $key))
+                    .set_json($body)
+                    .to_request(),
+            )
+            .await
+        };
+    }
+
+    #[actix_web::test]
+    async fn a_namespace_listing_carries_its_tier_and_residency() {
+        let dir = TempDir::new("tierlist");
+        let st = tiered_state(&dir.0);
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/namespaces", Some(ADMIN))).await;
+        let item = &body["items"][0];
+
+        assert_eq!(item["namespace"], "myorg/one");
+        // The tier belongs to the top-level namespace, which the row names so
+        // the interface can say what a change will affect.
+        assert_eq!(item["shard"], "myorg");
+        assert_eq!(item["tier"], "hot");
+        assert_eq!(item["resident"], true);
+    }
+
+    #[actix_web::test]
+    async fn a_tier_change_takes_effect_and_is_written_out() {
+        let dir = TempDir::new("tierset");
+        let st = tiered_state(&dir.0);
+        let app = app!(st);
+
+        let resp = post_tier!(app, json!({"shard": "myorg", "tier": "cold"}), ADMIN);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/namespaces", Some(ADMIN))).await;
+        assert_eq!(body["items"][0]["tier"], "cold");
+
+        let written = std::fs::read_to_string(dir.0.join("tiers.toml")).unwrap();
+        assert!(written.contains("\"myorg\" = \"cold\""), "{written}");
+    }
+
+    #[actix_web::test]
+    async fn an_unknown_tier_is_refused() {
+        let dir = TempDir::new("tierbad");
+        let st = tiered_state(&dir.0);
+        let app = app!(st);
+
+        let resp = post_tier!(app, json!({"shard": "myorg", "tier": "tepid"}), ADMIN);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!dir.0.join("tiers.toml").exists());
+    }
+
+    /// Consensus and API keys are consulted constantly, so the internal shard
+    /// is not something the interface may demote.
+    #[actix_web::test]
+    async fn internal_namespaces_cannot_be_retiered() {
+        let dir = TempDir::new("tierinternal");
+        let st = tiered_state(&dir.0);
+        let app = app!(st);
+
+        for shard in ["_all", "_config", ""] {
+            let resp = post_tier!(app, json!({"shard": shard, "tier": "cold"}), ADMIN);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{shard:?}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn changing_a_tier_needs_an_admin_key() {
+        let dir = TempDir::new("tierauth");
+        let st = tiered_state(&dir.0);
+        let app = app!(st);
+
+        let resp = post_tier!(app, json!({"shard": "myorg", "tier": "cold"}), "plain");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Without a file there is nowhere to record the change, and a tier that
+    /// silently reverted on restart would be worse than refusing.
+    #[actix_web::test]
+    async fn changing_a_tier_without_a_file_says_so() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = post_tier!(app, json!({"shard": "feeds", "tier": "cold"}), ADMIN);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: Json = test::read_body_json(resp).await;
+        assert!(
+            body["message"].as_str().unwrap().contains("tiers_file"),
+            "{body}"
+        );
     }
 
     #[actix_web::test]
