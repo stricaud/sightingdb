@@ -49,6 +49,22 @@
            color: var(--fg); padding: 1.2rem; max-width: 420px; }
   dialog::backdrop { background: rgba(0,0,0,.45); }
   .hidden { display: none !important; }
+  .chip { display: inline-block; font-family: var(--mono); font-size: .82rem;
+          border: 1px solid var(--line); border-radius: 999px; padding: .05rem .5rem;
+          margin: 0 .2rem .2rem 0; background: var(--bg); }
+  .chip.all { border-style: dashed; }
+  .chip.none { color: var(--muted); border: none; padding-left: 0; }
+  td.actions { white-space: nowrap; }
+  td.actions button { padding: .2rem .5rem; margin-right: .3rem; }
+  button.danger { border-color: var(--danger); color: var(--danger); }
+  dialog.wide { max-width: 640px; }
+  .grant-row { display: flex; gap: .5rem; align-items: center; margin-bottom: .35rem; }
+  .grant-row input[type=text] { flex: 1; }
+  .grant-row label { font-size: .85rem; color: var(--muted); display: flex;
+                     gap: .25rem; align-items: center; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: .8rem 0; }
+  legend { color: var(--muted); font-size: .8rem; text-transform: uppercase;
+           letter-spacing: .04em; padding: 0 .3rem; }
 </style>
 </head>
 <body>
@@ -57,7 +73,9 @@
   <span class="crumbs" id="crumbs"></span>
   <span class="spacer"></span>
   <span class="muted" id="version"></span>
-  <button id="config-btn">Configuration</button>
+  <button id="nav-browse">Browse</button>
+  <button id="nav-keys">Keys</button>
+  <button id="nav-config">Configuration</button>
   <button id="signout">Sign out</button>
 </header>
 
@@ -98,6 +116,29 @@
     </table></div>
   </section>
 
+  <!-- API keys -->
+  <section id="view-keys" class="hidden">
+    <div class="row">
+      <button id="k-new">New key</button>
+      <span class="muted" id="k-count"></span>
+      <span class="spacer"></span>
+      <span class="muted" id="k-readonly"></span>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>API key</th><th>Admin</th><th>Read</th><th>Write</th><th></th>
+      </tr></thead>
+      <tbody id="k-rows"></tbody>
+    </table></div>
+  </section>
+
+  <!-- Server configuration, read-only -->
+  <section id="view-config" class="hidden">
+    <p class="muted">Read from the configuration file at startup. Change it there
+       and restart; only API keys are editable here.</p>
+    <div class="scroll"><table><tbody id="c-rows"></tbody></table></div>
+  </section>
+
   <!-- One value, with its histogram -->
   <section id="view-value" class="hidden">
     <div class="row">
@@ -122,6 +163,43 @@
   </form>
 </dialog>
 
+<dialog id="key-editor" class="wide">
+  <form method="dialog" id="key-form">
+    <h2 style="margin-top:0;font-size:1.05rem" id="ke-title">New API key</h2>
+
+    <div class="row">
+      <input id="ke-key" type="text" placeholder="API key" size="42">
+      <button type="button" id="ke-generate">Generate</button>
+    </div>
+    <p class="muted" style="margin-top:0">
+      No spaces, quotes, <code>=</code>, <code>:</code> or <code>,</code>.
+    </p>
+
+    <fieldset>
+      <legend>Namespaces</legend>
+      <div id="ke-grants"></div>
+      <button type="button" id="ke-add">Add namespace</button>
+      <p class="muted">Leave a namespace blank to grant every namespace. Prefixes
+         match whole path segments, so <code>feeds/misp</code> covers
+         <code>feeds/misp/ips</code> but not <code>feeds/misp-internal</code>.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Management</legend>
+      <label style="display:flex;gap:.4rem;align-items:center">
+        <input type="checkbox" id="ke-admin">
+        Can use this management interface
+      </label>
+    </fieldset>
+
+    <p class="err" id="ke-error"></p>
+    <div class="row">
+      <button type="submit">Save</button>
+      <button type="button" id="ke-cancel">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
 <script src="/_management/echarts.min.js"></script>
 <script>
 "use strict";
@@ -130,6 +208,7 @@ const PAGE = 50;
 const state = {
   key: sessionStorage.getItem("sightingdb.key") || "",
   namespace: null,
+  keys: [], editing: null,
   nsOffset: 0, nsTotal: 0,
   vOffset: 0, vTotal: 0,
   chart: null,
@@ -137,7 +216,7 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const show = (id) => {
-  for (const v of ["view-namespaces", "view-values", "view-value"]) {
+  for (const v of ["view-namespaces", "view-values", "view-value", "view-keys", "view-config"]) {
     $(v).classList.toggle("hidden", v !== id);
   }
 };
@@ -147,15 +226,20 @@ const fmtTime = (unix) =>
 function setError(message) { $("error").textContent = message || ""; }
 
 /** Every call carries the key; a 401/403 sends us back to the login dialog. */
-async function api(path) {
-  const res = await fetch(path, { headers: { Authorization: state.key } });
+async function api(path, method = "GET", body) {
+  const options = { method, headers: { Authorization: state.key } };
+  if (body !== undefined) {
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, options);
   if (res.status === 401 || res.status === 403) {
     signOut("That key was not accepted.");
     throw new Error("unauthorized");
   }
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.message || `${res.status} ${res.statusText}`);
+    const failure = await res.json().catch(() => ({}));
+    throw new Error(failure.message || `${res.status} ${res.statusText}`);
   }
   return res.json();
 }
@@ -352,9 +436,156 @@ function drawHistogram(stats) {
 
 addEventListener("resize", () => state.chart && state.chart.resize());
 
+// --- keys ------------------------------------------------------------------
+
+/** Grants arrive as two prefix lists; the editor works in rows instead. */
+function grantRows(entry) {
+  const byPrefix = new Map();
+  for (const prefix of entry.read) byPrefix.set(prefix, { prefix, read: true, write: false });
+  for (const prefix of entry.write) {
+    const row = byPrefix.get(prefix) || { prefix, read: false, write: false };
+    row.write = true;
+    byPrefix.set(prefix, row);
+  }
+  return [...byPrefix.values()];
+}
+
+function chips(prefixes) {
+  const span = document.createElement("span");
+  if (!prefixes.length) {
+    span.innerHTML = '<span class="chip none">—</span>';
+    return span;
+  }
+  for (const prefix of prefixes) {
+    const chip = document.createElement("span");
+    chip.className = prefix === "" ? "chip all" : "chip";
+    chip.textContent = prefix === "" ? "all namespaces" : prefix;
+    span.append(chip);
+  }
+  return span;
+}
+
+async function loadKeys() {
+  show("view-keys");
+  try {
+    const keys = await api("/_management/api/keys");
+    state.keys = keys;
+
+    $("k-rows").replaceChildren(...keys.map((entry) => {
+      const tr = document.createElement("tr");
+
+      const key = document.createElement("td");
+      key.className = "v";
+      key.textContent = entry.key;
+
+      const admin = document.createElement("td");
+      admin.textContent = entry.admin ? "yes" : "—";
+
+      const read = document.createElement("td");
+      read.append(chips(entry.read));
+      const write = document.createElement("td");
+      write.append(chips(entry.write));
+
+      const actions = document.createElement("td");
+      actions.className = "actions";
+      const edit = document.createElement("button");
+      edit.textContent = "Edit";
+      edit.onclick = () => openKeyEditor(entry);
+      const revoke = document.createElement("button");
+      revoke.textContent = "Revoke";
+      revoke.className = "danger";
+      revoke.onclick = () => deleteKey(entry.key);
+      actions.append(edit, revoke);
+
+      tr.append(key, admin, read, write, actions);
+      return tr;
+    }));
+
+    const admins = keys.filter((k) => k.admin).length;
+    $("k-count").textContent =
+      `${keys.length} key(s), ${admins} with management access`;
+  } catch (e) { setError(e.message); }
+}
+
+function openKeyEditor(entry) {
+  state.editing = entry ? entry.key : null;
+  $("ke-title").textContent = entry ? `Edit ${entry.key}` : "New API key";
+  $("ke-key").value = entry ? entry.key : "";
+  // The name is the identity of the key; changing it would create a second one.
+  $("ke-key").disabled = Boolean(entry);
+  $("ke-generate").disabled = Boolean(entry);
+  $("ke-admin").checked = entry ? entry.admin : false;
+  $("ke-error").textContent = "";
+
+  const rows = entry ? grantRows(entry) : [{ prefix: "", read: true, write: false }];
+  $("ke-grants").replaceChildren();
+  for (const row of rows) addGrantRow(row);
+
+  $("key-editor").showModal();
+}
+
+function addGrantRow(row = { prefix: "", read: true, write: false }) {
+  const div = document.createElement("div");
+  div.className = "grant-row";
+
+  const prefix = document.createElement("input");
+  prefix.type = "text";
+  prefix.placeholder = "namespace prefix (blank = all)";
+  prefix.value = row.prefix;
+
+  const mk = (text, checked) => {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = checked;
+    label.append(box, document.createTextNode(text));
+    return [label, box];
+  };
+  const [readLabel, readBox] = mk("read", row.read);
+  const [writeLabel, writeBox] = mk("write", row.write);
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "×";
+  remove.title = "Remove";
+  remove.onclick = () => div.remove();
+
+  div.append(prefix, readLabel, writeLabel, remove);
+  div._read = () => ({ prefix: prefix.value.trim(), read: readBox.checked, write: writeBox.checked });
+  $("ke-grants").append(div);
+}
+
+async function saveKey() {
+  const rows = [...$("ke-grants").children].map((div) => div._read());
+  const entry = {
+    key: $("ke-key").value.trim(),
+    admin: $("ke-admin").checked,
+    read: rows.filter((r) => r.read).map((r) => r.prefix),
+    write: rows.filter((r) => r.write).map((r) => r.prefix),
+  };
+
+  try {
+    await api("/_management/api/keys", "POST", entry);
+    $("key-editor").close();
+    loadKeys();
+  } catch (e) {
+    // Kept open so the entry is not lost to a rejected name or a lockout guard.
+    $("ke-error").textContent = e.message;
+  }
+}
+
+async function deleteKey(key) {
+  if (!confirm(`Revoke "${key}"? Anything using it stops working immediately.`)) return;
+  try {
+    await api(`/_management/api/keys/${encodeURIComponent(key)}`, "DELETE");
+    loadKeys();
+  } catch (e) { setError(e.message); }
+}
+
 // --- configuration ---------------------------------------------------------
 
 async function showConfig() {
+  setError("");
   try {
     const info = await api("/_management/api/info");
     const rows = [
@@ -378,8 +609,8 @@ async function showConfig() {
       }
     }
 
-    show("view-namespaces");
-    $("ns-rows").replaceChildren(...rows.map(([k, v]) => {
+    show("view-config");
+    $("c-rows").replaceChildren(...rows.map(([k, v]) => {
       const tr = document.createElement("tr");
       const th = document.createElement("th");
       th.textContent = k;
@@ -389,8 +620,6 @@ async function showConfig() {
       tr.append(th, td);
       return tr;
     }));
-    $("ns-count").textContent = "read-only — edit the configuration file and restart";
-    $("ns-prev").disabled = $("ns-next").disabled = true;
   } catch (e) { setError(e.message); }
 }
 
@@ -423,7 +652,19 @@ $("login-form").addEventListener("submit", async () => {
 });
 
 $("signout").onclick = () => signOut("");
-$("config-btn").onclick = showConfig;
+$("nav-browse").onclick = () => go(null);
+$("nav-keys").onclick = () => { setError(""); loadKeys(); };
+$("nav-config").onclick = showConfig;
+$("k-new").onclick = () => openKeyEditor(null);
+$("ke-add").onclick = () => addGrantRow();
+$("ke-cancel").onclick = () => $("key-editor").close();
+$("key-form").addEventListener("submit", (e) => { e.preventDefault(); saveKey(); });
+$("ke-generate").onclick = async () => {
+  try {
+    const { key } = await api("/_management/api/keys/generate");
+    $("ke-key").value = key;
+  } catch (e) { $("ke-error").textContent = e.message; }
+};
 $("v-back").onclick = () => go(null);
 $("d-back").onclick = () => { show("view-values"); };
 $("ns-prev").onclick = () => { state.nsOffset = Math.max(0, state.nsOffset - PAGE); loadNamespaces(); };
