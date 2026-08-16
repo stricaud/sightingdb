@@ -21,6 +21,10 @@ on:
   # They cannot be split across workflows: a tag pushed with GITHUB_TOKEN does
   # not trigger a new workflow run, so a "prepare" workflow that tagged would
   # bump and tag and then nothing further would happen.
+  # Tagging is all that is needed: `git tag v1.2.3 && git push origin v1.2.3`.
+  # If Cargo.toml disagrees, this workflow bumps it, commits, and moves the tag
+  # onto that commit before building. Dispatch is here for releasing without
+  # tagging by hand.
   workflow_dispatch:
     inputs:
       version:
@@ -50,9 +54,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # Full history and credentials retained: this job may commit the
+          # version bump and move the tag onto it.
           fetch-depth: 0
-          # A dispatched run commits onto the branch, so it needs the branch
-          # rather than a detached tag.
           ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.ref }}
 
       - name: Show toolchain
@@ -66,43 +70,65 @@ jobs:
       # and `git checkout <tag>` has to reproduce it.
       - name: Resolve the version
         id: resolve
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             version="${{ inputs.version }}"
             version="${version#v}"
-            if ! echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$'; then
-              echo "::error::'$version' is not a semantic version like 1.2.3"
-              exit 1
-            fi
-            if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
-              echo "::error::Tag v$version already exists"
-              exit 1
-            fi
-
-            # Only the first `version =` line, which is the one in [package].
-            perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' Cargo.toml
-            cargo update --workspace --offline || cargo update --workspace
-
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Cargo.toml Cargo.lock
-            git commit -m "Release $version"
-            git tag "v$version"
-            git push origin HEAD "refs/tags/v$version"
-            echo "Bumped to $version and tagged v$version"
           else
             version="${GITHUB_REF_NAME#v}"
-            manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-            echo "tag=$version  Cargo.toml=$manifest"
-            if [ "$version" != "$manifest" ]; then
-              echo "::error::Tag $GITHUB_REF_NAME does not match the Cargo.toml version \
-          $manifest. Either bump Cargo.toml and re-tag, or delete this tag and use the \
-          Release workflow from the Actions tab with version $version, which does the bump, \
-          the commit and the tag for you."
+          fi
+
+          if ! echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$'; then
+            echo "::error::'$version' is not a semantic version like 1.2.3"
+            exit 1
+          fi
+
+          manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "requested=$version  Cargo.toml=$manifest"
+
+          if [ "$version" = "$manifest" ]; then
+            echo "Cargo.toml already says $version; nothing to bump"
+            echo "tag=v$version" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Bring Cargo.toml up to the requested version and move the tag onto
+          # the commit that contains it. Publishing a version that no commit
+          # holds is what this avoids: `cargo publish` uploads the manifest as
+          # it stands, and `git checkout <tag>` has to reproduce it.
+          git fetch --quiet origin "$DEFAULT_BRANCH"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Only safe when the tag is on the branch tip. Anywhere else,
+            # committing the bump would release something other than what was
+            # tagged.
+            if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$DEFAULT_BRANCH")" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME is not on the tip of $DEFAULT_BRANCH, so the \
+          version cannot be bumped for it. Tag a commit on $DEFAULT_BRANCH, or set the version \
+          in Cargo.toml to $version first."
               exit 1
             fi
           fi
+
+          git checkout -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+
+          # Only the first `version =` line, which is the one in [package].
+          perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' Cargo.toml
+          cargo update --workspace --offline || cargo update --workspace
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release $version"
+          git tag -f "v$version"
+          git push origin "$DEFAULT_BRANCH"
+          git push --force origin "refs/tags/v$version"
+
+          echo "Bumped to $version and moved v$version onto the commit that contains it"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
       # A tag can point at a commit that never went through CI, so re-run the
