@@ -1,0 +1,8 @@
+# Written by the SightingDB management interface. Comments added
+# here are replaced the next time a key is saved.
+#
+# "<apikey>" = "<grant>[, <grant>...]"
+# grant: r | w | rw [:<namespace>]  |  admin
+
+[acl]
+"changeme" = "rw, admin"

@@ -115,7 +115,7 @@ jobs:
           mkdir -p "$stage/etc"
           cp target/release/sightingdb "$stage/"
           cp README.md LICENSE "$stage/"
-          cp etc/sightingdb.conf etc/log4rs.yml etc/sightingdb.service "$stage/etc/"
+          cp etc/sightingdb.toml etc/acl.toml etc/log4rs.yml etc/sightingdb.service "$stage/etc/"
           tar czf "${stage}.tar.gz" "$stage"
           echo "ARCHIVE=${stage}.tar.gz" >> "$GITHUB_ENV"
 

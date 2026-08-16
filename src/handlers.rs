@@ -12,9 +12,16 @@ use crate::sighting_writer::{self, timestamp_to_instant};
 pub struct SharedState {
     pub db: Database,
     pub authenticate: bool,
-    /// Which API keys exist and what each may reach. Built from the
-    /// configuration at startup and read-only thereafter.
-    pub acl: Acl,
+    /// Which API keys exist and what each may reach.
+    ///
+    /// Behind a lock because the management interface can rewrite it while the
+    /// server is running; a saved key takes effect without a restart.
+    pub acl: std::sync::RwLock<Acl>,
+    /// A snapshot of what this server was configured to do, for the management
+    /// interface to report.
+    pub info: crate::admin::ServerInfo,
+    /// Where the ACL is written back. `None` makes keys read-only.
+    pub acl_file: Option<std::path::PathBuf>,
 }
 
 impl SharedState {
@@ -28,8 +35,20 @@ impl SharedState {
         Self {
             db: Database::new(),
             authenticate,
-            acl,
+            acl: std::sync::RwLock::new(acl),
+            info: crate::admin::ServerInfo::default(),
+            acl_file: None,
         }
+    }
+}
+
+impl SharedState {
+    /// Read access to the ACL. Poisoning is recovered from rather than
+    /// propagated: one failed request must not lock everyone out.
+    pub fn acl(&self) -> std::sync::RwLockReadGuard<'_, Acl> {
+        self.acl
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -155,9 +174,10 @@ fn authorize(
             .json(Message::new("Authorization header is not valid UTF-8.")));
     };
 
+    let acl = state.acl();
     let (allowed, verb) = match access {
-        Access::Read => (state.acl.can_read(apikey, namespace), "read"),
-        Access::Write => (state.acl.can_write(apikey, namespace), "write"),
+        Access::Read => (acl.can_read(apikey, namespace), "read"),
+        Access::Write => (acl.can_write(apikey, namespace), "write"),
     };
 
     if allowed {
@@ -837,6 +857,8 @@ mod tests {
         let mut inner = SharedState::new(true);
         inner
             .acl
+            .get_mut()
+            .unwrap()
             .set("feed", parse_grants("rw:feeds/misp").unwrap());
         let st: State = web::Data::new(inner);
         let app = app!(st);
@@ -867,7 +889,11 @@ mod tests {
     #[actix_web::test]
     async fn a_read_only_key_cannot_write() {
         let mut inner = SharedState::new(true);
-        inner.acl.set("analyst", parse_grants("r").unwrap());
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("analyst", parse_grants("r").unwrap());
         let st: State = web::Data::new(inner);
         let app = app!(st);
 
@@ -898,7 +924,11 @@ mod tests {
     #[actix_web::test]
     async fn bulk_requests_are_authorized_per_item() {
         let mut inner = SharedState::new(true);
-        inner.acl.set("feed", parse_grants("rw:feeds").unwrap());
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("feed", parse_grants("rw:feeds").unwrap());
         let st: State = web::Data::new(inner);
         let app = app!(st);
 
@@ -924,7 +954,11 @@ mod tests {
     #[actix_web::test]
     async fn refusals_do_not_reveal_whether_a_key_exists() {
         let mut inner = SharedState::new(true);
-        inner.acl.set("real", parse_grants("rw:allowed").unwrap());
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("real", parse_grants("rw:allowed").unwrap());
         let st: State = web::Data::new(inner);
         let app = app!(st);
 
@@ -950,6 +984,8 @@ mod tests {
         let mut inner = SharedState::new(true);
         inner
             .acl
+            .get_mut()
+            .unwrap()
             .set("mixed", parse_grants("r:public, w:inbox").unwrap());
         let st: State = web::Data::new(inner);
         let app = app!(st);
@@ -996,7 +1032,7 @@ mod tests {
         // the delete tried to revoke.
         assert!(!st.db.namespace_exists("_config/acl/apikeys/mine"));
         assert!(st.db.legacy_apikeys().is_empty());
-        assert!(st.acl.can_write(KEY, "any/namespace"));
+        assert!(st.acl().can_write(KEY, "any/namespace"));
     }
 
     // -- bulk --------------------------------------------------------------

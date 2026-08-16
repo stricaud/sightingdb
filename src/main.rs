@@ -1,4 +1,5 @@
 mod acl;
+mod admin;
 mod attribute;
 mod config;
 mod daemon;
@@ -133,10 +134,13 @@ fn main() -> Result<()> {
         );
     }
 
+    let info = server_info(&settings, &config_path, &db, &acl);
     let state = Arc::new(SharedState {
         db,
         authenticate: settings.authenticate,
-        acl,
+        acl: std::sync::RwLock::new(acl),
+        info,
+        acl_file: settings.acl_file.clone(),
     });
 
     let shutdown = Shutdown::new();
@@ -184,6 +188,53 @@ fn main() -> Result<()> {
     daemon::remove_pid_file();
 
     result
+}
+
+/// Snapshot what this server was configured to do, for the management
+/// interface. Taken once at startup because configuration is read from a file
+/// and does not change while running.
+fn server_info(
+    settings: &Settings,
+    config_path: &Path,
+    db: &Database,
+    acl: &Acl,
+) -> admin::ServerInfo {
+    admin::ServerInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        authenticate: settings.authenticate,
+        http_enabled: settings.http_enabled,
+        config_path: config_path.display().to_string(),
+        dbdir: settings.dbdir.as_ref().map(|d| d.display().to_string()),
+        snapshot_interval: settings.snapshot_interval,
+        sweep_interval: settings.sweep_interval,
+        stats_retention: settings.stats_retention,
+        shadow_ttl: settings.shadow_ttl,
+        dns: settings.dns.as_ref().map(|dns| admin::DnsInfo {
+            listen: dns.listen.clone(),
+            zone: dns.zone.clone(),
+            ttl: dns.ttl,
+            rate_limit: dns.rate_limit,
+            shadow: dns.shadow,
+            exposed: dns
+                .exposed
+                .iter()
+                .map(|e| admin::ExposedInfo {
+                    label: e.label.clone(),
+                    namespace: e.namespace.clone(),
+                    encoding: format!("{:?}", e.encoding).to_lowercase(),
+                })
+                .collect(),
+        }),
+        zmq: settings.zmq.as_ref().map(|zmq| admin::ZmqInfo {
+            endpoint: zmq.endpoint.clone(),
+            topics: zmq.topics.clone(),
+            format: format!("{:?}", zmq.format).to_lowercase(),
+            require_to_ids: zmq.mapping.require_to_ids,
+            mapped_types: zmq.mapping.types.len(),
+        }),
+        namespaces: db.namespace_count(),
+        apikeys: acl.len(),
+    }
 }
 
 /// Read STIX bundles from a file, or from every `.json` in a directory.
@@ -477,6 +528,7 @@ async fn serve(state: Arc<SharedState>, settings: &Settings) -> Result<()> {
             .app_data(state.clone())
             .app_data(handlers::json_config(post_limit))
             .app_data(handlers::query_config())
+            .configure(admin::routes)
             .configure(handlers::routes)
     });
 

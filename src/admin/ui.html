@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SightingDB — management</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1b1f24; --muted: #5c6570; --line: #d9dee4;
+    --panel: #f6f8fa; --accent: #0b5fff; --danger: #b3261e; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171a; --fg: #e6e9ec; --muted: #9aa4af; --line: #2b3138;
+            --panel: #1b1f24; --accent: #6f9dff; --danger: #ff6b5e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+           padding: .7rem 1rem; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  main { padding: 1rem; max-width: 1200px; margin: 0 auto; }
+  a { color: var(--accent); }
+  button { font: inherit; padding: .35rem .7rem; border: 1px solid var(--line);
+           background: var(--bg); color: var(--fg); border-radius: 6px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  input { font: inherit; padding: .35rem .6rem; border: 1px solid var(--line);
+          border-radius: 6px; background: var(--bg); color: var(--fg); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td.v, td.n { font-family: var(--mono); word-break: break-all; }
+  tbody tr:hover { background: var(--panel); }
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-bottom: .8rem; }
+  .muted { color: var(--muted); }
+  .err { color: var(--danger); }
+  .crumbs { font-family: var(--mono); font-size: .9rem; }
+  .cards { display: grid; gap: .6rem; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: .6rem .8rem; background: var(--panel); }
+  .card h3 { margin: 0 0 .3rem; font-size: .8rem; text-transform: uppercase;
+             letter-spacing: .04em; color: var(--muted); }
+  .card p { margin: 0; font-family: var(--mono); word-break: break-all; }
+  #chart { width: 100%; height: 320px; }
+  .scroll { overflow-x: auto; }
+  dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
+           color: var(--fg); padding: 1.2rem; max-width: 420px; }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SightingDB</h1>
+  <span class="crumbs" id="crumbs"></span>
+  <span class="spacer"></span>
+  <span class="muted" id="version"></span>
+  <button id="config-btn">Configuration</button>
+  <button id="signout">Sign out</button>
+</header>
+
+<main>
+  <div id="error" class="err"></div>
+
+  <!-- Namespace list -->
+  <section id="view-namespaces">
+    <div class="row">
+      <input id="ns-filter" placeholder="Filter namespaces" size="30">
+      <span class="muted" id="ns-count"></span>
+      <span class="spacer"></span>
+      <button id="ns-prev">Previous</button>
+      <button id="ns-next">Next</button>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>Namespace</th></tr></thead>
+      <tbody id="ns-rows"></tbody>
+    </table></div>
+  </section>
+
+  <!-- Values within one namespace -->
+  <section id="view-values" class="hidden">
+    <div class="row">
+      <button id="v-back">← Namespaces</button>
+      <input id="v-filter" placeholder="Filter values" size="30">
+      <span class="muted" id="v-count"></span>
+      <span class="spacer"></span>
+      <button id="v-prev">Previous</button>
+      <button id="v-next">Next</button>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>Value</th><th>Count</th><th>First seen</th><th>Last seen</th>
+        <th>Consensus</th><th>TTL</th>
+      </tr></thead>
+      <tbody id="v-rows"></tbody>
+    </table></div>
+  </section>
+
+  <!-- One value, with its histogram -->
+  <section id="view-value" class="hidden">
+    <div class="row">
+      <button id="d-back">← Values</button>
+      <strong class="crumbs" id="d-value"></strong>
+    </div>
+    <div class="cards" id="d-cards"></div>
+    <h3>Sightings over time</h3>
+    <p class="muted" id="d-nostats"></p>
+    <div id="chart"></div>
+  </section>
+</main>
+
+<dialog id="login">
+  <form method="dialog" id="login-form">
+    <h2 style="margin-top:0;font-size:1.05rem">Management access</h2>
+    <p class="muted">Enter an API key holding the <code>admin</code> grant.
+       On a fresh install that is <code>changeme</code>.</p>
+    <p><input id="key" type="password" placeholder="API key" size="32" autofocus></p>
+    <p class="err" id="login-error"></p>
+    <button type="submit">Sign in</button>
+  </form>
+</dialog>
+
+<script src="/_management/echarts.min.js"></script>
+<script>
+"use strict";
+
+const PAGE = 50;
+const state = {
+  key: sessionStorage.getItem("sightingdb.key") || "",
+  namespace: null,
+  nsOffset: 0, nsTotal: 0,
+  vOffset: 0, vTotal: 0,
+  chart: null,
+};
+
+const $ = (id) => document.getElementById(id);
+const show = (id) => {
+  for (const v of ["view-namespaces", "view-values", "view-value"]) {
+    $(v).classList.toggle("hidden", v !== id);
+  }
+};
+const fmtTime = (unix) =>
+  !unix ? "—" : new Date(unix * 1000).toISOString().replace("T", " ").replace(".000Z", "Z");
+
+function setError(message) { $("error").textContent = message || ""; }
+
+/** Every call carries the key; a 401/403 sends us back to the login dialog. */
+async function api(path) {
+  const res = await fetch(path, { headers: { Authorization: state.key } });
+  if (res.status === 401 || res.status === 403) {
+    signOut("That key was not accepted.");
+    throw new Error("unauthorized");
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.message || `${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+// --- routing ---------------------------------------------------------------
+// The namespace lives in the URL, so /_management/feeds/ips/ is a real link.
+
+function namespaceFromPath() {
+  const path = decodeURIComponent(location.pathname);
+  const rest = path.replace(/^\/_management\/?/, "");
+  return rest.length ? rest : null;
+}
+
+function go(namespace, push = true) {
+  state.namespace = namespace;
+  state.vOffset = 0;
+  if (push) {
+    const url = namespace ? `/_management/${namespace}` : "/_management/";
+    history.pushState({ namespace }, "", url);
+  }
+  render();
+}
+
+window.addEventListener("popstate", () => {
+  state.namespace = namespaceFromPath();
+  render();
+});
+
+function render() {
+  setError("");
+  $("crumbs").textContent = state.namespace ? `/${state.namespace}` : "";
+  if (state.namespace) { loadValues(); } else { loadNamespaces(); }
+}
+
+// --- namespaces ------------------------------------------------------------
+
+async function loadNamespaces() {
+  show("view-namespaces");
+  try {
+    const q = encodeURIComponent($("ns-filter").value.trim());
+    const page = await api(`/_management/api/namespaces?q=${q}&offset=${state.nsOffset}&limit=${PAGE}`);
+    state.nsTotal = page.total;
+
+    $("ns-rows").replaceChildren(...page.items.map((name) => {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.className = "n";
+      const a = document.createElement("a");
+      a.href = `/_management/${name}`;
+      a.textContent = name;
+      a.onclick = (e) => { e.preventDefault(); go(name); };
+      td.append(a);
+      tr.append(td);
+      return tr;
+    }));
+
+    const from = page.total ? page.offset + 1 : 0;
+    $("ns-count").textContent = `${from}–${page.offset + page.items.length} of ${page.total}`;
+    $("ns-prev").disabled = page.offset === 0;
+    $("ns-next").disabled = page.offset + page.items.length >= page.total;
+  } catch (e) { setError(e.message); }
+}
+
+// --- values ----------------------------------------------------------------
+
+async function loadValues() {
+  show("view-values");
+  try {
+    const ns = encodeURIComponent(state.namespace);
+    const q = encodeURIComponent($("v-filter").value.trim());
+    const page = await api(
+      `/_management/api/values?namespace=${ns}&q=${q}&offset=${state.vOffset}&limit=${PAGE}`);
+    state.vTotal = page.total;
+
+    $("v-rows").replaceChildren(...page.items.map((item) => {
+      const tr = document.createElement("tr");
+      const cells = [
+        ["v", item.value, true],
+        ["", String(item.count)],
+        ["", fmtTime(item.first_seen)],
+        ["", fmtTime(item.last_seen)],
+        ["", String(item.consensus)],
+        ["", item.ttl ? `${item.ttl}s` : "—"],
+      ];
+      for (const [cls, text, link] of cells) {
+        const td = document.createElement("td");
+        if (cls) td.className = cls;
+        if (link) {
+          const a = document.createElement("a");
+          a.href = "#";
+          a.textContent = text;
+          a.onclick = (e) => { e.preventDefault(); loadValue(text); };
+          td.append(a);
+        } else {
+          td.textContent = text;
+        }
+        tr.append(td);
+      }
+      return tr;
+    }));
+
+    const from = page.total ? page.offset + 1 : 0;
+    $("v-count").textContent = `${from}–${page.offset + page.items.length} of ${page.total}`;
+    $("v-prev").disabled = page.offset === 0;
+    $("v-next").disabled = page.offset + page.items.length >= page.total;
+  } catch (e) { setError(e.message); }
+}
+
+// --- one value, with the histogram ----------------------------------------
+
+async function loadValue(value) {
+  show("view-value");
+  $("d-value").textContent = value;
+  try {
+    const ns = encodeURIComponent(state.namespace);
+    const item = await api(
+      `/_management/api/value?namespace=${ns}&value=${encodeURIComponent(value)}`);
+
+    const cards = [
+      ["Count", item.count],
+      ["First seen", fmtTime(item.first_seen)],
+      ["Last seen", fmtTime(item.last_seen)],
+      ["Consensus", `${item.consensus} namespace(s)`],
+      ["TTL", item.ttl ? `${item.ttl}s` : "none"],
+      ["Tags", item.tags || "—"],
+    ];
+    $("d-cards").replaceChildren(...cards.map(([label, text]) => {
+      const div = document.createElement("div");
+      div.className = "card";
+      const h = document.createElement("h3");
+      h.textContent = label;
+      const p = document.createElement("p");
+      p.textContent = String(text);
+      div.append(h, p);
+      return div;
+    }));
+
+    drawHistogram(item.stats || {});
+  } catch (e) { setError(e.message); }
+}
+
+/**
+ * The server buckets sightings by hour, so the histogram is those buckets
+ * straight through. Empty hours between buckets are filled in, otherwise a
+ * value seen in January and June would look like two adjacent bars.
+ */
+function drawHistogram(stats) {
+  const buckets = Object.keys(stats).map(Number).sort((a, b) => a - b);
+  $("d-nostats").textContent = buckets.length ? "" : "No statistics recorded for this value.";
+
+  if (!state.chart) state.chart = echarts.init($("chart"), null, { renderer: "canvas" });
+  if (!buckets.length) { state.chart.clear(); return; }
+
+  const HOUR = 3600;
+  const data = [];
+  // Cap the gap filling: a value with a multi-year span would otherwise make
+  // tens of thousands of empty points.
+  const span = (buckets[buckets.length - 1] - buckets[0]) / HOUR;
+  if (span <= 20000) {
+    for (let t = buckets[0]; t <= buckets[buckets.length - 1]; t += HOUR) {
+      data.push([t * 1000, stats[t] || 0]);
+    }
+  } else {
+    for (const t of buckets) data.push([t * 1000, stats[t]]);
+  }
+
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  state.chart.setOption({
+    backgroundColor: "transparent",
+    textStyle: { color: dark ? "#e6e9ec" : "#1b1f24" },
+    tooltip: {
+      trigger: "axis",
+      formatter: (p) => {
+        const d = new Date(p[0].value[0]);
+        return `${d.toISOString().replace("T", " ").replace(".000Z", "Z")}<br>` +
+               `<b>${p[0].value[1]}</b> sighting(s) that hour`;
+      },
+    },
+    grid: { left: 56, right: 20, top: 24, bottom: 64 },
+    xAxis: { type: "time", axisLine: { lineStyle: { color: dark ? "#2b3138" : "#d9dee4" } } },
+    yAxis: {
+      type: "value", minInterval: 1, name: "sightings", nameGap: 34,
+      nameLocation: "middle", splitLine: { lineStyle: { color: dark ? "#2b3138" : "#eceff2" } },
+    },
+    // Long histories are common, so shipping the zoom control is worthwhile.
+    dataZoom: [{ type: "inside" }, { type: "slider", height: 22, bottom: 16 }],
+    series: [{
+      type: "bar", data, barMaxWidth: 24, large: true,
+      itemStyle: { color: dark ? "#6f9dff" : "#0b5fff" },
+    }],
+  }, true);
+  state.chart.resize();
+}
+
+addEventListener("resize", () => state.chart && state.chart.resize());
+
+// --- configuration ---------------------------------------------------------
+
+async function showConfig() {
+  try {
+    const info = await api("/_management/api/info");
+    const rows = [
+      ["Version", info.version],
+      ["Configuration file", info.config_path],
+      ["Namespaces", info.namespaces],
+      ["API keys", info.apikeys],
+      ["API authentication", info.authenticate ? "on" : "off"],
+      ["HTTP API", info.http_enabled ? "enabled" : "disabled"],
+      ["Snapshot directory", info.dbdir || "not persisted"],
+      ["Snapshot interval", info.snapshot_interval ? `${info.snapshot_interval}s` : "on shutdown only"],
+      ["Sweep interval", info.sweep_interval ? `${info.sweep_interval}s` : "disabled"],
+      ["Statistics retention", info.stats_retention ? `${info.stats_retention} buckets` : "unlimited"],
+      ["Shadow TTL", info.shadow_ttl ? `${info.shadow_ttl}s` : "never expires"],
+      ["DNS", info.dns ? `${info.dns.listen} for ${info.dns.zone}` : "disabled"],
+      ["ZMQ ingest", info.zmq ? `${info.zmq.endpoint} (${info.zmq.format})` : "disabled"],
+    ];
+    if (info.dns) {
+      for (const e of info.dns.exposed) {
+        rows.push([`DNS ${e.label}.${info.dns.zone}`, `${e.namespace} (${e.encoding})`]);
+      }
+    }
+
+    show("view-namespaces");
+    $("ns-rows").replaceChildren(...rows.map(([k, v]) => {
+      const tr = document.createElement("tr");
+      const th = document.createElement("th");
+      th.textContent = k;
+      const td = document.createElement("td");
+      td.className = "n";
+      td.textContent = String(v);
+      tr.append(th, td);
+      return tr;
+    }));
+    $("ns-count").textContent = "read-only — edit the configuration file and restart";
+    $("ns-prev").disabled = $("ns-next").disabled = true;
+  } catch (e) { setError(e.message); }
+}
+
+// --- session ---------------------------------------------------------------
+
+function signOut(message) {
+  sessionStorage.removeItem("sightingdb.key");
+  state.key = "";
+  $("login-error").textContent = message || "";
+  $("login").showModal();
+}
+
+async function start() {
+  try {
+    await api("/_management/api/session");
+  } catch { return; }
+  $("login").close();
+  try {
+    const info = await api("/_management/api/info");
+    $("version").textContent = `v${info.version}`;
+  } catch { /* the browser still works without the version */ }
+  state.namespace = namespaceFromPath();
+  render();
+}
+
+$("login-form").addEventListener("submit", async () => {
+  state.key = $("key").value;
+  sessionStorage.setItem("sightingdb.key", state.key);
+  await start();
+});
+
+$("signout").onclick = () => signOut("");
+$("config-btn").onclick = showConfig;
+$("v-back").onclick = () => go(null);
+$("d-back").onclick = () => { show("view-values"); };
+$("ns-prev").onclick = () => { state.nsOffset = Math.max(0, state.nsOffset - PAGE); loadNamespaces(); };
+$("ns-next").onclick = () => { state.nsOffset += PAGE; loadNamespaces(); };
+$("v-prev").onclick = () => { state.vOffset = Math.max(0, state.vOffset - PAGE); loadValues(); };
+$("v-next").onclick = () => { state.vOffset += PAGE; loadValues(); };
+
+let debounce;
+const refilter = (fn, reset) => () => {
+  clearTimeout(debounce);
+  debounce = setTimeout(() => { reset(); fn(); }, 200);
+};
+$("ns-filter").addEventListener("input", refilter(loadNamespaces, () => state.nsOffset = 0));
+$("v-filter").addEventListener("input", refilter(loadValues, () => state.vOffset = 0));
+
+if (state.key) { start(); } else { $("login").showModal(); }
+</script>
+</body>
+</html>

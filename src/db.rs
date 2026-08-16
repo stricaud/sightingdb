@@ -67,6 +67,15 @@ pub struct WriteOpts {
     pub ttl: Option<u64>,
 }
 
+/// A slice of a listing, with the total so a caller can page through it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// Matches before paging, not the number returned.
+    pub total: usize,
+    pub offset: usize,
+}
+
 /// What a sweep reclaimed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -463,6 +472,112 @@ impl Database {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
+    }
+
+    /// Namespace names matching `filter`, sorted, one page at a time.
+    ///
+    /// `_config` (server state) and `_all` (the consensus tally) are left out:
+    /// they are bookkeeping, not data anyone browses. `_shadow/*` is kept,
+    /// since what was searched for is genuinely interesting.
+    /// `allowed` decides which namespaces the caller may even know about, so a
+    /// key scoped to one subtree does not learn the names of the others.
+    pub fn namespace_page(
+        &self,
+        filter: &str,
+        offset: usize,
+        limit: usize,
+        allowed: impl Fn(&str) -> bool,
+    ) -> Page<String> {
+        let filter = filter.to_ascii_lowercase();
+        let map = self
+            .namespaces
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        let mut names: Vec<&String> = map
+            .keys()
+            .filter(|name| !name.starts_with(CONFIG_PREFIX) && *name != ALL_NAMESPACE)
+            .filter(|name| filter.is_empty() || name.to_ascii_lowercase().contains(&filter))
+            .filter(|name| allowed(name))
+            .collect();
+        names.sort_unstable();
+
+        let total = names.len();
+        let items = names
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+
+        Page {
+            items,
+            total,
+            offset,
+        }
+    }
+
+    /// Values inside one namespace, sorted, one page at a time.
+    ///
+    /// Only the page's attributes are cloned. The sort is still O(n log n) over
+    /// the namespace, which is the price of stable paging over a hash map — a
+    /// namespace with millions of values will feel it.
+    pub fn value_page(
+        &self,
+        namespace: &str,
+        filter: &str,
+        offset: usize,
+        limit: usize,
+        with_stats: bool,
+    ) -> Option<Page<AttributeView>> {
+        let now = Utc::now();
+        let filter = filter.to_ascii_lowercase();
+        let ns = self.namespace(namespace)?;
+        let values = ns.values.read().unwrap_or_else(PoisonError::into_inner);
+
+        let mut matching: Vec<&String> = values
+            .iter()
+            .filter(|(value, _)| filter.is_empty() || value.to_ascii_lowercase().contains(&filter))
+            .filter(|(_, cell)| {
+                !cell
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_expired(now)
+            })
+            .map(|(value, _)| value)
+            .collect();
+        matching.sort_unstable();
+
+        let total = matching.len();
+        let items: Vec<AttributeView> = matching
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .filter_map(|value| {
+                let attr = values
+                    .get(value)?
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                Some(attr.view(0, with_stats))
+            })
+            .collect();
+        drop(values);
+
+        // Consensus comes from `_all`, so fill it in once this namespace is
+        // released — see the lock-ordering note above.
+        let items = items
+            .into_iter()
+            .map(|mut view| {
+                view.consensus = self.count(ALL_NAMESPACE, &view.value);
+                view
+            })
+            .collect();
+
+        Some(Page {
+            items,
+            total,
+            offset,
+        })
     }
 
     fn release_consensus(&self, value: &str) {
@@ -867,6 +982,141 @@ mod tests {
         let json = serde_json::to_string(&db.snapshot()).unwrap();
 
         assert_eq!(json, r#"{"version":1,"namespaces":{}}"#);
+    }
+
+    // -- paging ------------------------------------------------------------
+
+    #[test]
+    fn namespaces_page_in_sorted_order() {
+        let db = Database::default();
+        for name in ["c/ns", "a/ns", "b/ns"] {
+            db.write(name, "v", at(100), consensus());
+        }
+
+        let first = db.namespace_page("", 0, 2, |_| true);
+        assert_eq!(first.items, ["a/ns", "b/ns"]);
+        // `total` counts matches, not the page, so a UI knows how far it can go.
+        assert_eq!(first.total, 3);
+        assert_eq!(first.offset, 0);
+
+        let second = db.namespace_page("", 2, 2, |_| true);
+        assert_eq!(second.items, ["c/ns"]);
+    }
+
+    #[test]
+    fn namespaces_can_be_filtered() {
+        let db = Database::default();
+        db.write("feeds/misp", "v", at(100), consensus());
+        db.write("feeds/otx", "v", at(100), consensus());
+        db.write("internal/notes", "v", at(100), consensus());
+
+        let page = db.namespace_page("feeds", 0, 10, |_| true);
+        assert_eq!(page.items, ["feeds/misp", "feeds/otx"]);
+        assert_eq!(page.total, 2);
+    }
+
+    /// The admin interface browses data, so server state must not show up in it.
+    #[test]
+    fn the_config_tree_is_not_listed() {
+        let db = Database::default();
+        db.write(
+            "_config/acl/apikeys/changeme",
+            "",
+            at(100),
+            WriteOpts::default(),
+        );
+        db.write("ns", "v", at(100), consensus());
+
+        let page = db.namespace_page("", 0, 100, |_| true);
+        assert!(!page.items.iter().any(|n| n.starts_with("_config")));
+        // `_all` is a consensus tally, not something to browse.
+        assert!(!page.items.iter().any(|n| n == ALL_NAMESPACE));
+        assert_eq!(page.items, ["ns"]);
+    }
+
+    #[test]
+    fn values_page_in_sorted_order_with_a_total() {
+        let db = Database::default();
+        for value in ["ccc", "aaa", "bbb", "ddd"] {
+            db.write("ns", value, at(100), consensus());
+        }
+
+        let page = db.value_page("ns", "", 1, 2, false).unwrap();
+        let values: Vec<&str> = page.items.iter().map(|v| v.value.as_str()).collect();
+        assert_eq!(values, ["bbb", "ccc"]);
+        assert_eq!(page.total, 4);
+        assert_eq!(page.offset, 1);
+    }
+
+    #[test]
+    fn values_can_be_filtered_and_carry_consensus() {
+        let db = Database::default();
+        db.write("a/ns", "1.2.3.4", at(100), consensus());
+        db.write("b/ns", "1.2.3.4", at(100), consensus());
+        db.write("a/ns", "9.9.9.9", at(100), consensus());
+
+        let page = db.value_page("a/ns", "1.2", 0, 10, false).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].value, "1.2.3.4");
+        assert_eq!(page.items[0].consensus, 2);
+    }
+
+    #[test]
+    fn stats_are_included_only_when_asked_for() {
+        let db = Database::default();
+        db.write("ns", "v", at(3600), consensus());
+
+        assert!(
+            db.value_page("ns", "", 0, 10, false).unwrap().items[0]
+                .stats
+                .is_none()
+        );
+        let with = db.value_page("ns", "", 0, 10, true).unwrap();
+        assert_eq!(with.items[0].stats.as_ref().unwrap().get(&3600), Some(&1));
+    }
+
+    #[test]
+    fn expired_values_do_not_appear_in_a_page() {
+        let db = Database::default();
+        db.write("ns", "live", Utc::now(), consensus());
+        db.write("ns", "dead", at(1000), with_ttl(60));
+
+        let page = db.value_page("ns", "", 0, 10, false).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].value, "live");
+    }
+
+    #[test]
+    fn paging_a_missing_namespace_is_none() {
+        assert!(
+            Database::default()
+                .value_page("nope", "", 0, 10, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_offset_past_the_end_is_an_empty_page_not_an_error() {
+        let db = Database::default();
+        db.write("ns", "v", at(100), consensus());
+
+        let page = db.value_page("ns", "", 500, 10, false).unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.total, 1);
+    }
+
+    /// A key that cannot read a namespace should not learn it exists.
+    #[test]
+    fn the_listing_hides_namespaces_the_caller_cannot_read() {
+        let db = Database::default();
+        db.write("feeds/misp", "v", at(100), consensus());
+        db.write("secrets/hr", "v", at(100), consensus());
+
+        let page = db.namespace_page("", 0, 100, |name| name.starts_with("feeds"));
+
+        assert_eq!(page.items, ["feeds/misp"]);
+        // The total must reflect what was allowed, or paging would show gaps.
+        assert_eq!(page.total, 1);
     }
 
     // -- concurrency -------------------------------------------------------

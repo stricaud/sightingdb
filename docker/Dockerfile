@@ -7,7 +7,7 @@ WORKDIR /opt/
 RUN git clone https://github.com/stricaud/sightingdb.git /opt/sightingdb
 WORKDIR /opt/sightingdb
 RUN cargo build --release
-COPY sightingdb.conf /etc/sightingdb/
+COPY sightingdb.toml /etc/sightingdb/
 RUN mkdir /etc/sightingdb/ssl
 WORKDIR /etc/sightingdb/ssl
 COPY ssl-answers /etc/sightingdb/ssl/

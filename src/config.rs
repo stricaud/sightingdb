@@ -1,7 +1,16 @@
+//! Reading `sightingdb.toml`.
+//!
+//! The file is deserialized straight into these structures, so a missing key
+//! gets its default and a misspelled one is an error rather than something
+//! silently ignored. Values that need interpreting — TLS paths relative to the
+//! config file, grant specifications, DNS encodings — are converted once here
+//! so the rest of the program never sees a raw string.
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use ini::Ini;
+use serde::Deserialize;
 
 use crate::acl::{Acl, parse_grants};
 use crate::db::DatabasePolicy;
@@ -10,9 +19,12 @@ use crate::ingest::misp::Mapping;
 use crate::ingest::stix::Mapping as StixMapping;
 use crate::ingest::{Format, Settings as ZmqSettings};
 
-/// Fallback body size limit for bulk POSTs, used when the config value cannot
-/// be parsed. Matches the historical default.
+/// Body size limit for bulk POSTs.
 const DEFAULT_POST_LIMIT: usize = 2_500_000_000;
+
+// ---------------------------------------------------------------------------
+// What the rest of the program sees
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsSettings {
@@ -22,8 +34,7 @@ pub struct TlsSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
-    /// Whether to serve the HTTP API at all. Set `enabled = false` in
-    /// `[daemon]` to run a DNS-only instance.
+    /// Serve the HTTP API. `false` runs a DNS- or ingest-only instance.
     pub http_enabled: bool,
     pub listen: String,
     pub authenticate: bool,
@@ -35,30 +46,17 @@ pub struct Settings {
     pub log_err: PathBuf,
     /// Where snapshots live. `None` disables persistence entirely.
     pub dbdir: Option<PathBuf>,
-    /// Seconds between snapshots; 0 saves only on shutdown.
     pub snapshot_interval: u64,
-    /// Seconds between eviction sweeps; 0 disables the sweeper.
     pub sweep_interval: u64,
-    /// Hourly statistics buckets kept per attribute; 0 keeps all of them.
     pub stats_retention: usize,
-    /// TTL applied to shadow sightings; 0 means they never expire.
     pub shadow_ttl: u64,
-    /// API keys and their permissions. `None` means the config declared no
-    /// `[acl]` section at all, which is what an un-migrated install looks like.
+    /// API keys. `None` means no `[acl]` table and no `acl_file`.
     pub acl: Option<Acl>,
-    /// DNS listener. `None` unless a `[dns]` section turns it on.
+    /// File holding the keys, which the management interface rewrites.
+    pub acl_file: Option<PathBuf>,
     pub dns: Option<DnsSettings>,
-    /// ZeroMQ ingest. `None` unless a `[zmq]` section turns it on.
     pub zmq: Option<ZmqSettings>,
-    /// How STIX observables map to namespaces, for `--import-stix`.
     pub stix: StixSettings,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StixSettings {
-    pub mapping: StixMapping,
-    /// TTL applied to imported sightings; 0 leaves them permanent.
-    pub ttl: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +75,12 @@ pub struct DnsSettings {
     pub exposed: Vec<Exposed>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StixSettings {
+    pub mapping: StixMapping,
+    pub ttl: u64,
+}
+
 impl Settings {
     pub fn database_policy(&self) -> DatabasePolicy {
         DatabasePolicy {
@@ -86,90 +90,234 @@ impl Settings {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let ini = Ini::load_from_file(path)
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
+        let raw: RawConfig =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        raw.into_settings(path)
+    }
+}
 
-        let daemon = ini
-            .section(Some("daemon"))
-            .ok_or_else(|| anyhow!("no [daemon] section in {}", path.display()))?;
+// ---------------------------------------------------------------------------
+// The file's own shape
+// ---------------------------------------------------------------------------
 
-        let required = |key: &str| -> Result<&str> {
-            daemon
-                .get(key)
-                .ok_or_else(|| anyhow!("missing '{key}' in [daemon] of {}", path.display()))
-        };
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    #[serde(default)]
+    daemon: RawDaemon,
+    /// Inline keys, for installs that do not use a separate `acl_file`.
+    acl: Option<HashMap<String, String>>,
+    dns: Option<RawDns>,
+    zmq: Option<RawZmq>,
+    stix: Option<RawStix>,
+}
 
-        // Only the literal "false" turns the HTTP API off, matching how the
-        // other booleans here behave.
-        let http_enabled = daemon.get("enabled") != Some("false");
-        let listen = format!("{}:{}", required("listen_ip")?, required("listen_port")?);
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDaemon {
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default = "default_listen_ip")]
+    listen_ip: String,
+    #[serde(default = "default_listen_port")]
+    listen_port: u16,
+    /// Defaults on: an unauthenticated database should be a deliberate choice.
+    #[serde(default = "yes")]
+    authenticate: bool,
+    #[serde(default)]
+    daemonize: bool,
+    #[serde(default = "yes")]
+    ssl: bool,
+    ssl_cert: Option<PathBuf>,
+    ssl_key: Option<PathBuf>,
+    #[serde(default = "default_post_limit")]
+    post_limit: usize,
+    #[serde(default = "dev_null")]
+    log_out: PathBuf,
+    #[serde(default = "dev_null")]
+    log_err: PathBuf,
+    dbdir: Option<PathBuf>,
+    #[serde(default = "default_snapshot_interval")]
+    snapshot_interval: u64,
+    #[serde(default = "default_sweep_interval")]
+    sweep_interval: u64,
+    #[serde(default)]
+    stats_retention: usize,
+    #[serde(default)]
+    shadow_ttl: u64,
+    acl_file: Option<PathBuf>,
+}
 
-        // Historically only the literal "false" disables these, so that a typo
-        // fails secure rather than silently opening the server up.
-        let authenticate = required("authenticate")? != "false";
-        let use_tls = required("ssl")? != "false";
-        // Daemonizing, conversely, is strictly opt-in.
-        let daemonize = required("daemonize")? == "true";
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDns {
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default = "default_dns_ip")]
+    listen_ip: String,
+    #[serde(default = "default_dns_port")]
+    listen_port: u16,
+    zone: String,
+    #[serde(default = "default_dns_ttl")]
+    ttl: u32,
+    #[serde(default = "default_rate_limit")]
+    rate_limit: u32,
+    #[serde(default = "default_dns_threads")]
+    threads: usize,
+    #[serde(default)]
+    shadow: bool,
+    #[serde(default)]
+    namespaces: HashMap<String, RawExposed>,
+}
 
-        // Certificate paths are relative to the config file, not the cwd.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExposed {
+    namespace: String,
+    encoding: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawZmq {
+    #[serde(default = "yes")]
+    enabled: bool,
+    endpoint: String,
+    #[serde(default)]
+    topics: Vec<String>,
+    #[serde(default = "default_format")]
+    format: String,
+    #[serde(default)]
+    require_to_ids: bool,
+    default_namespace: Option<String>,
+    #[serde(default)]
+    ttl: u64,
+    #[serde(default = "default_reconnect")]
+    reconnect: u64,
+    #[serde(default)]
+    types: Option<toml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStix {
+    default_namespace: Option<String>,
+    #[serde(default)]
+    ttl: u64,
+    #[serde(default)]
+    types: Option<toml::Value>,
+}
+
+fn yes() -> bool {
+    true
+}
+fn dev_null() -> PathBuf {
+    PathBuf::from("/dev/null")
+}
+fn default_listen_ip() -> String {
+    "0.0.0.0".into()
+}
+fn default_listen_port() -> u16 {
+    9999
+}
+fn default_post_limit() -> usize {
+    DEFAULT_POST_LIMIT
+}
+fn default_snapshot_interval() -> u64 {
+    300
+}
+fn default_sweep_interval() -> u64 {
+    60
+}
+fn default_dns_ip() -> String {
+    // Loopback, not every interface: DNS answers without authentication.
+    "127.0.0.1".into()
+}
+fn default_dns_port() -> u16 {
+    5353
+}
+fn default_dns_ttl() -> u32 {
+    60
+}
+fn default_rate_limit() -> u32 {
+    100
+}
+fn default_dns_threads() -> usize {
+    2
+}
+fn default_format() -> String {
+    "misp".into()
+}
+fn default_reconnect() -> u64 {
+    5
+}
+
+// ---------------------------------------------------------------------------
+// Conversion
+// ---------------------------------------------------------------------------
+
+impl RawConfig {
+    fn into_settings(self, path: &Path) -> Result<Settings> {
         let base = path.parent().unwrap_or_else(|| Path::new("."));
-        let tls = if use_tls {
+        let daemon = self.daemon;
+
+        let tls = if daemon.ssl {
+            let cert = daemon
+                .ssl_cert
+                .ok_or_else(|| anyhow!("ssl is on but 'ssl_cert' is missing from [daemon]"))?;
+            let key = daemon
+                .ssl_key
+                .ok_or_else(|| anyhow!("ssl is on but 'ssl_key' is missing from [daemon]"))?;
             Some(TlsSettings {
-                cert: resolve(base, required("ssl_cert")?),
-                key: resolve(base, required("ssl_key")?),
+                cert: resolve(base, &cert),
+                key: resolve(base, &key),
             })
         } else {
             None
         };
 
-        let post_limit = optional_number(daemon.get("post_limit"), DEFAULT_POST_LIMIT, path);
+        let acl_file = daemon.acl_file.map(|file| resolve(base, &file));
+        let acl = load_acl(self.acl, acl_file.as_deref(), path)?;
 
-        // Only consulted when daemonizing, so they are not required otherwise.
-        let log_out = PathBuf::from(daemon.get("log_out").unwrap_or("/dev/null"));
-        let log_err = PathBuf::from(daemon.get("log_err").unwrap_or("/dev/null"));
+        let dns = match self.dns {
+            Some(dns) => dns.into_settings(path)?,
+            None => None,
+        };
+        let zmq = match self.zmq {
+            Some(zmq) => zmq.into_settings(path)?,
+            None => None,
+        };
+        let stix = match self.stix {
+            Some(stix) => stix.into_settings(path)?,
+            None => StixSettings::default(),
+        };
 
-        // An absent or blank dbdir means "do not persist", which is what an
-        // upgraded install gets until it opts in.
-        let dbdir = daemon
-            .get("dbdir")
-            .map(str::trim)
-            .filter(|dir| !dir.is_empty())
-            .map(PathBuf::from);
-
-        // Retention defaults keep everything, so upgrading never silently
-        // starts discarding data.
-        let snapshot_interval = optional_number(daemon.get("snapshot_interval"), 300, path);
-        let sweep_interval = optional_number(daemon.get("sweep_interval"), 60, path);
-        let stats_retention = optional_number(daemon.get("stats_retention"), 0, path);
-        let shadow_ttl = optional_number(daemon.get("shadow_ttl"), 0, path);
-
-        let acl = load_acl(&ini, path)?;
-        let dns = load_dns(&ini, path)?;
-        let zmq = load_zmq(&ini, path)?;
-        let stix = load_stix(&ini, path)?;
-
-        if !http_enabled && dns.is_none() && zmq.is_none() {
+        if !daemon.enabled && dns.is_none() && zmq.is_none() {
             bail!(
-                "both the HTTP API and DNS are disabled in {}, so there is nothing to serve",
+                "the HTTP API is disabled in {} and neither DNS nor ZMQ is configured, so there \
+                 is nothing to do",
                 path.display()
             );
         }
 
         Ok(Settings {
-            http_enabled,
-            listen,
-            authenticate,
-            daemonize,
+            http_enabled: daemon.enabled,
+            listen: format!("{}:{}", daemon.listen_ip, daemon.listen_port),
+            authenticate: daemon.authenticate,
+            daemonize: daemon.daemonize,
             tls,
-            post_limit,
-            log_out,
-            log_err,
-            dbdir,
-            snapshot_interval,
-            sweep_interval,
-            stats_retention,
-            shadow_ttl,
+            post_limit: daemon.post_limit,
+            log_out: daemon.log_out,
+            log_err: daemon.log_err,
+            dbdir: daemon.dbdir,
+            snapshot_interval: daemon.snapshot_interval,
+            sweep_interval: daemon.sweep_interval,
+            stats_retention: daemon.stats_retention,
+            shadow_ttl: daemon.shadow_ttl,
             acl,
+            acl_file,
             dns,
             zmq,
             stix,
@@ -177,301 +325,235 @@ impl Settings {
     }
 }
 
-/// Read the optional `[acl]` section, where each entry is
-/// `<apikey> = <grants>`. A malformed entry is fatal rather than ignored:
-/// quietly dropping a grant would either lock someone out or, worse, leave a
-/// key with wider access than intended.
-fn load_acl(ini: &Ini, path: &Path) -> Result<Option<Acl>> {
-    let Some(section) = ini.section(Some("acl")) else {
-        return Ok(None);
-    };
+impl RawDns {
+    fn into_settings(self, path: &Path) -> Result<Option<DnsSettings>> {
+        if !self.enabled {
+            return Ok(None);
+        }
 
-    let mut acl = Acl::new();
-    for (key, spec) in section.iter() {
-        let grants = parse_grants(spec).with_context(|| {
-            format!(
-                "in the [acl] entry for '{key}' in {}: {spec:?}",
-                path.display()
-            )
-        })?;
-        acl.set(key, grants);
-    }
+        let zone = self.zone.trim().trim_matches('.').to_ascii_lowercase();
+        if zone.is_empty() {
+            bail!("'zone' in [dns] of {} is empty", path.display());
+        }
 
-    Ok(Some(acl))
-}
-
-/// Parse an optional numeric setting, warning and falling back rather than
-/// refusing to start over a typo.
-fn optional_number<T>(raw: Option<&str>, default: T, path: &Path) -> T
-where
-    T: std::str::FromStr + std::fmt::Display + Copy,
-{
-    match raw {
-        Some(raw) => raw.trim().parse().unwrap_or_else(|_| {
-            log::warn!(
-                "could not parse '{raw}' in [daemon] of {}, using {default}",
-                path.display()
-            );
-            default
-        }),
-        None => default,
-    }
-}
-
-/// Read the optional `[dns]` section and the `[dns.namespaces]` map that says
-/// which namespaces it may reach.
-///
-/// Nothing is exposed implicitly: DNS bypasses the API-key ACL entirely, so a
-/// namespace answers queries only if it is named here.
-fn load_dns(ini: &Ini, path: &Path) -> Result<Option<DnsSettings>> {
-    let Some(section) = ini.section(Some("dns")) else {
-        return Ok(None);
-    };
-    if section.get("enabled") == Some("false") {
-        return Ok(None);
-    }
-
-    let required = |key: &str| -> Result<&str> {
-        section
-            .get(key)
-            .ok_or_else(|| anyhow!("missing '{key}' in [dns] of {}", path.display()))
-    };
-
-    // Defaults to loopback rather than every interface: an open DNS responder
-    // publishes whatever it is given to anyone who can send a packet.
-    let listen_ip = section.get("listen_ip").unwrap_or("127.0.0.1");
-    let listen_port = section.get("listen_port").unwrap_or("5353");
-    let zone = required("zone")?
-        .trim()
-        .trim_matches('.')
-        .to_ascii_lowercase();
-    if zone.is_empty() {
-        bail!("'zone' in [dns] of {} is empty", path.display());
-    }
-
-    let mut exposed = Vec::new();
-    if let Some(namespaces) = ini.section(Some("dns.namespaces")) {
-        for (label, spec) in namespaces.iter() {
-            let (namespace, encoding) = spec.rsplit_once(':').ok_or_else(|| {
-                anyhow!(
-                    "[dns.namespaces] entry '{label}' in {} should read \
-                     <namespace>:<ip|domain|base32>, got {spec:?}",
-                    path.display()
-                )
-            })?;
-            let namespace = namespace.trim();
-            if namespace.starts_with('_') {
+        let mut exposed = Vec::new();
+        for (label, entry) in self.namespaces {
+            if entry.namespace.starts_with('_') {
                 bail!(
-                    "[dns.namespaces] entry '{label}' in {} exposes the internal namespace \
-                     '{namespace}'",
-                    path.display()
+                    "[dns.namespaces] entry '{label}' exposes the internal namespace '{}'",
+                    entry.namespace
                 );
             }
             exposed.push(Exposed {
                 label: label.trim().to_ascii_lowercase(),
-                namespace: namespace.to_string(),
-                encoding: Encoding::parse(encoding).with_context(|| {
-                    format!("in [dns.namespaces] entry '{label}' of {}", path.display())
-                })?,
+                namespace: entry.namespace,
+                encoding: Encoding::parse(&entry.encoding)
+                    .with_context(|| format!("in [dns.namespaces] entry '{label}'"))?,
             });
         }
-    }
+        exposed.sort_by(|a, b| a.label.cmp(&b.label));
 
-    if exposed.is_empty() {
-        log::warn!(
-            "[dns] is configured in {} but [dns.namespaces] exposes nothing, so every \
-             query will be NXDOMAIN",
-            path.display()
-        );
-    }
-
-    Ok(Some(DnsSettings {
-        listen: format!("{listen_ip}:{listen_port}"),
-        zone,
-        ttl: optional_number(section.get("ttl"), 60, path),
-        rate_limit: optional_number(section.get("rate_limit"), 100, path),
-        threads: optional_number(section.get("threads"), 2, path),
-        shadow: section.get("shadow") == Some("true"),
-        exposed,
-    }))
-}
-
-/// Read the optional `[zmq]` section and the `[zmq.types]` map that turns MISP
-/// attribute types into namespaces.
-fn load_zmq(ini: &Ini, path: &Path) -> Result<Option<ZmqSettings>> {
-    let Some(section) = ini.section(Some("zmq")) else {
-        return Ok(None);
-    };
-    if section.get("enabled") == Some("false") {
-        return Ok(None);
-    }
-
-    let endpoint = section
-        .get("endpoint")
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
-        .ok_or_else(|| anyhow!("missing 'endpoint' in [zmq] of {}", path.display()))?
-        .to_string();
-
-    let topics: Vec<String> = section
-        .get("topics")
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(String::from)
-        .collect();
-
-    let format = Format::parse(section.get("format").unwrap_or("misp"))
-        .with_context(|| format!("in [zmq] of {}", path.display()))?;
-
-    let mut types = std::collections::HashMap::new();
-    if let Some(mapped) = ini.section(Some("zmq.types")) {
-        for (misp_type, namespace) in mapped.iter() {
-            let namespace = namespace.trim();
-            if namespace.contains('=') {
-                bail!(
-                    "[zmq.types] entry '{misp_type}' in {} has '=' in its value; a ':' in the \
-                     key would do that, since INI treats it as a key/value separator",
-                    path.display()
-                );
-            }
-            if namespace.starts_with('_') {
-                bail!(
-                    "[zmq.types] entry '{misp_type}' in {} targets the internal namespace \
-                     '{namespace}'",
-                    path.display()
-                );
-            }
-            types.insert(misp_type.trim().to_string(), namespace.to_string());
+        if exposed.is_empty() {
+            log::warn!(
+                "[dns] is configured in {} but [dns.namespaces] exposes nothing, so every query \
+                 will be NXDOMAIN",
+                path.display()
+            );
         }
-    }
 
-    let default_namespace = section
-        .get("default_namespace")
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .map(String::from);
-    if let Some(namespace) = &default_namespace
-        && namespace.starts_with('_')
-    {
-        bail!(
-            "'default_namespace' in [zmq] of {} is the internal namespace '{namespace}'",
-            path.display()
-        );
+        Ok(Some(DnsSettings {
+            listen: format!("{}:{}", self.listen_ip, self.listen_port),
+            zone,
+            ttl: self.ttl,
+            rate_limit: self.rate_limit,
+            threads: self.threads,
+            shadow: self.shadow,
+            exposed,
+        }))
     }
-
-    if types.is_empty() && default_namespace.is_none() && format == Format::Misp {
-        log::warn!(
-            "[zmq] is configured in {} but [zmq.types] maps nothing and no default_namespace \
-             is set, so every attribute will be discarded",
-            path.display()
-        );
-    }
-
-    Ok(Some(ZmqSettings {
-        endpoint,
-        topics,
-        format,
-        mapping: Mapping {
-            types,
-            default_namespace,
-            require_to_ids: section.get("require_to_ids") == Some("true"),
-        },
-        ttl: optional_number(section.get("ttl"), 0, path),
-        reconnect: optional_number(section.get("reconnect"), 5, path),
-    }))
 }
 
-/// Read the `[stix]` section and its `[stix.types]` map.
+impl RawZmq {
+    fn into_settings(self, path: &Path) -> Result<Option<ZmqSettings>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+
+        let format = Format::parse(&self.format)
+            .with_context(|| format!("in [zmq] of {}", path.display()))?;
+        let types = type_map(self.types.as_ref(), "zmq.types", path)?;
+        let default_namespace = namespace_option(self.default_namespace, "zmq")?;
+
+        if types.is_empty() && default_namespace.is_none() && format == Format::Misp {
+            log::warn!(
+                "[zmq] is configured in {} but [zmq.types] maps nothing and no \
+                 default_namespace is set, so every attribute will be discarded",
+                path.display()
+            );
+        }
+
+        Ok(Some(ZmqSettings {
+            endpoint: self.endpoint,
+            topics: self.topics,
+            format,
+            mapping: Mapping {
+                types,
+                default_namespace,
+                require_to_ids: self.require_to_ids,
+            },
+            ttl: self.ttl,
+            reconnect: self.reconnect,
+        }))
+    }
+}
+
+impl RawStix {
+    fn into_settings(self, path: &Path) -> Result<StixSettings> {
+        Ok(StixSettings {
+            mapping: StixMapping {
+                types: type_map(self.types.as_ref(), "stix.types", path)?,
+                default_namespace: namespace_option(self.default_namespace, "stix")?,
+            },
+            ttl: self.ttl,
+        })
+    }
+}
+
+/// Read a `<type> = "<namespace>"` table.
 ///
-/// Unlike the listeners this is not a runtime service, so an absent section is
-/// not an error — it just means `--import-stix` has nothing mapped and will say so.
-fn load_stix(ini: &Ini, path: &Path) -> Result<StixSettings> {
-    let section = ini.section(Some("stix"));
-
-    let mut types = std::collections::HashMap::new();
-    if let Some(mapped) = ini.section(Some("stix.types")) {
-        for (stix_type, namespace) in mapped.iter() {
-            let namespace = namespace.trim();
-            // A ':' in the key would have been eaten by the INI parser, leaving
-            // the rest of the line in the value. Say so rather than quietly
-            // building a mapping that can never match.
-            if namespace.contains('=') {
-                bail!(
-                    "[stix.types] entry '{stix_type}' in {} looks like it used ':' in the key. \
-                     INI treats ':' as a key/value separator, so write 'file.MD5' rather than \
-                     'file:MD5'",
-                    path.display()
-                );
-            }
-            if namespace.starts_with('_') {
-                bail!(
-                    "[stix.types] entry '{stix_type}' in {} targets the internal namespace \
-                     '{namespace}'",
-                    path.display()
-                );
-            }
-            types.insert(stix_type.trim().to_string(), namespace.to_string());
-        }
-    }
-
-    let default_namespace = section
-        .and_then(|s| s.get("default_namespace"))
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .map(String::from);
-    if let Some(namespace) = &default_namespace
-        && namespace.starts_with('_')
-    {
-        bail!(
-            "'default_namespace' in [stix] of {} is the internal namespace '{namespace}'",
-            path.display()
-        );
-    }
-
-    Ok(StixSettings {
-        mapping: StixMapping {
-            types,
-            default_namespace,
-        },
-        ttl: optional_number(section.and_then(|s| s.get("ttl")), 0, path),
-    })
-}
-
-fn resolve(base: &Path, value: &str) -> PathBuf {
-    let candidate = Path::new(value);
-    let joined = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        base.join(candidate)
+/// A key containing a dot must be quoted in TOML, or it becomes a nested table
+/// instead — `file.MD5 = "x"` is `{file = {MD5 = "x"}}`. That is easy to get
+/// wrong and would map nothing, so it is reported rather than ignored.
+fn type_map(
+    value: Option<&toml::Value>,
+    table: &str,
+    path: &Path,
+) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    let Some(toml::Value::Table(entries)) = value else {
+        return Ok(map);
     };
 
-    // Anchor it to the working directory now, so the path keeps resolving no
-    // matter where the process ends up, and so failures name the full location.
-    // This is lexical, unlike `canonicalize`, so the file need not exist yet.
+    for (key, entry) in entries {
+        let namespace = match entry {
+            toml::Value::String(namespace) => namespace.trim(),
+            toml::Value::Table(_) => bail!(
+                "[{table}] entry '{key}' in {} is a table, not a namespace. A key containing a \
+                 dot has to be quoted, as in \"file.MD5\" = \"stix/hashes\"",
+                path.display()
+            ),
+            other => bail!(
+                "[{table}] entry '{key}' in {} should be a namespace string, found {}",
+                path.display(),
+                other.type_str()
+            ),
+        };
+        if namespace.starts_with('_') {
+            bail!(
+                "[{table}] entry '{key}' in {} targets the internal namespace '{namespace}'",
+                path.display()
+            );
+        }
+        map.insert(key.trim().to_string(), namespace.to_string());
+    }
+
+    Ok(map)
+}
+
+fn namespace_option(value: Option<String>, table: &str) -> Result<Option<String>> {
+    let Some(namespace) = value
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+    else {
+        return Ok(None);
+    };
+    if namespace.starts_with('_') {
+        bail!("'default_namespace' in [{table}] is the internal namespace '{namespace}'");
+    }
+    Ok(Some(namespace))
+}
+
+/// Keys come from the separate file when there is one, since that is the file
+/// the management interface maintains.
+fn load_acl(
+    inline: Option<HashMap<String, String>>,
+    acl_file: Option<&Path>,
+    path: &Path,
+) -> Result<Option<Acl>> {
+    if let Some(file) = acl_file {
+        if inline.is_some() {
+            log::warn!(
+                "{} has both an [acl] table and acl_file {}; the file wins",
+                path.display(),
+                file.display()
+            );
+        }
+        if !file.exists() {
+            log::info!(
+                "acl_file {} does not exist yet; it will be created when a key is saved",
+                file.display()
+            );
+            return Ok(Some(Acl::new()));
+        }
+
+        #[derive(Deserialize)]
+        struct AclFile {
+            #[serde(default)]
+            acl: HashMap<String, String>,
+        }
+
+        let text = std::fs::read_to_string(file)
+            .with_context(|| format!("reading acl_file {}", file.display()))?;
+        let parsed: AclFile = toml::from_str(&text)
+            .with_context(|| format!("parsing acl_file {}", file.display()))?;
+        return build_acl(parsed.acl, file).map(Some);
+    }
+
+    match inline {
+        Some(entries) => build_acl(entries, path).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn build_acl(entries: HashMap<String, String>, path: &Path) -> Result<Acl> {
+    let mut acl = Acl::new();
+    for (key, spec) in entries {
+        let grants = parse_grants(&spec)
+            .with_context(|| format!("in the [acl] entry for '{key}' in {}", path.display()))?;
+        acl.set(&key, grants);
+    }
+    Ok(acl)
+}
+
+fn resolve(base: &Path, value: &Path) -> PathBuf {
+    let joined = if value.is_absolute() {
+        value.to_path_buf()
+    } else {
+        base.join(value)
+    };
+    // Anchored now so the path keeps resolving wherever the process ends up.
+    // Lexical, unlike `canonicalize`, so the file need not exist yet.
     std::path::absolute(&joined).unwrap_or(joined)
 }
 
-/// Locate `sightingdb.conf` when `-c` was not supplied: system-wide first, then
-/// the user's own copy.
+/// Locate the configuration when `-c` was not given.
 pub fn locate() -> Result<PathBuf> {
-    let system = PathBuf::from("/etc/sightingdb/sightingdb.conf");
-    if system.exists() {
-        return Ok(system);
-    }
-
+    let mut candidates = vec![PathBuf::from("/etc/sightingdb/sightingdb.toml")];
     if let Some(mut home) = dirs::home_dir() {
         home.push(".sightingdb");
-        home.push("sightingdb.conf");
-        if home.exists() {
-            return Ok(home);
+        home.push("sightingdb.toml");
+        candidates.push(home);
+    }
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
         }
     }
 
     Err(anyhow!(
-        "cannot locate sightingdb.conf: pass -c, or place one in \
-         /etc/sightingdb/ or ~/.sightingdb/"
+        "cannot locate sightingdb.toml: pass -c, or place one in /etc/sightingdb/ or \
+         ~/.sightingdb/"
     ))
 }
 
@@ -480,22 +562,21 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn write_config(dir: &Path, body: &str) -> PathBuf {
-        let path = dir.join("sightingdb.conf");
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(body.as_bytes()).unwrap();
-        path
-    }
-
-    /// A scratch directory that cleans up after itself.
     struct TempDir(PathBuf);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("sightingdb-test-{tag}"));
+            let path = std::env::temp_dir().join(format!("sightingdb-cfg-{tag}"));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
             TempDir(path)
+        }
+
+        fn write(&self, name: &str, body: &str) -> PathBuf {
+            let path = self.0.join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+            path
         }
     }
 
@@ -505,325 +586,287 @@ mod tests {
         }
     }
 
-    const FULL: &str = "\
+    const MINIMAL: &str = r#"
 [daemon]
-listen_ip=127.0.0.1
-listen_port=9999
-authenticate=false
-daemonize=false
-ssl=true
-ssl_cert=ssl/cert.pem
-ssl_key=/abs/key.pem
-post_limit=1234
-log_out=/tmp/out.log
-log_err=/tmp/err.log
-dbdir=/var/lib/sighting
-snapshot_interval=120
-sweep_interval=30
-stats_retention=720
-shadow_ttl=86400
-";
-
-    const DNS: &str = "\
-[dns]
-listen_ip=127.0.0.1
-listen_port=5353
-zone=sdb.example.com
-
-[dns.namespaces]
-malware=malware/ips:ip
-domains=malware/domains:domain
-";
+listen_ip = "127.0.0.1"
+listen_port = 9999
+authenticate = false
+ssl = false
+"#;
 
     #[test]
-    fn parses_a_full_config() {
-        let dir = TempDir::new("full");
-        let path = write_config(&dir.0, FULL);
-        let settings = Settings::load(&path).unwrap();
+    fn a_minimal_config_gets_sensible_defaults() {
+        let dir = TempDir::new("minimal");
+        let settings = Settings::load(&dir.write("c.toml", MINIMAL)).unwrap();
 
         assert_eq!(settings.listen, "127.0.0.1:9999");
+        assert!(settings.http_enabled);
         assert!(!settings.authenticate);
+        assert_eq!(settings.tls, None);
+        assert_eq!(settings.post_limit, DEFAULT_POST_LIMIT);
+        assert_eq!(settings.snapshot_interval, 300);
+        assert_eq!(settings.sweep_interval, 60);
+        assert_eq!(settings.dbdir, None);
+        assert_eq!(settings.acl, None);
+        assert_eq!(settings.dns, None);
+        assert_eq!(settings.zmq, None);
+    }
+
+    #[test]
+    fn types_are_real_types_now() {
+        let dir = TempDir::new("types");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            r#"
+[daemon]
+ssl = false
+authenticate = true
+daemonize = false
+post_limit = 1234
+sweep_interval = 30
+stats_retention = 720
+"#,
+        ))
+        .unwrap();
+
+        assert!(settings.authenticate);
         assert!(!settings.daemonize);
         assert_eq!(settings.post_limit, 1234);
-        assert_eq!(settings.dbdir, Some(PathBuf::from("/var/lib/sighting")));
-        assert_eq!(settings.snapshot_interval, 120);
         assert_eq!(settings.sweep_interval, 30);
-        assert_eq!(
-            settings.database_policy(),
-            DatabasePolicy {
-                stats_retention: 720,
-                shadow_ttl: 86400,
-            }
-        );
+        assert_eq!(settings.stats_retention, 720);
+    }
 
-        let tls = settings.tls.unwrap();
-        // Relative to the config file...
+    /// A misspelled key used to be silently ignored, which is how a setting
+    /// quietly fails to apply.
+    #[test]
+    fn a_misspelled_key_is_an_error() {
+        let dir = TempDir::new("typo");
+        let err =
+            Settings::load(&dir.write("c.toml", "[daemon]\nssl = false\nsweep_intervall = 30\n"))
+                .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(text.contains("sweep_intervall"), "{text}");
+    }
+
+    #[test]
+    fn tls_paths_resolve_against_the_config_file() {
+        let dir = TempDir::new("tls");
+        let path = dir.write(
+            "c.toml",
+            "[daemon]\nssl = true\nssl_cert = \"ssl/cert.pem\"\nssl_key = \"/abs/key.pem\"\n",
+        );
+        let tls = Settings::load(&path).unwrap().tls.unwrap();
+
         assert_eq!(tls.cert, dir.0.join("ssl/cert.pem"));
-        // ...but absolute paths are left alone.
         assert_eq!(tls.key, PathBuf::from("/abs/key.pem"));
     }
 
     #[test]
-    fn ssl_false_means_no_tls() {
-        let dir = TempDir::new("nossl");
-        let path = write_config(&dir.0, &FULL.replace("ssl=true", "ssl=false"));
-
-        assert_eq!(Settings::load(&path).unwrap().tls, None);
+    fn ssl_without_a_certificate_is_an_error() {
+        let dir = TempDir::new("nocert");
+        let err = Settings::load(&dir.write("c.toml", "[daemon]\nssl = true\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ssl_cert"), "{err}");
     }
 
     #[test]
-    fn only_the_literal_false_disables_authentication() {
-        let dir = TempDir::new("authtypo");
-        let path = write_config(
-            &dir.0,
-            &FULL.replace("authenticate=false", "authenticate=flase"),
-        );
-
-        assert!(Settings::load(&path).unwrap().authenticate);
+    fn disabling_everything_is_an_error() {
+        let dir = TempDir::new("nothing");
+        let err = Settings::load(&dir.write("c.toml", "[daemon]\nenabled = false\nssl = false\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nothing to do"), "{err}");
     }
 
-    #[test]
-    fn an_unparseable_post_limit_falls_back() {
-        let dir = TempDir::new("postlimit");
-        let path = write_config(&dir.0, &FULL.replace("post_limit=1234", "post_limit=lots"));
-
-        assert_eq!(
-            Settings::load(&path).unwrap().post_limit,
-            DEFAULT_POST_LIMIT
-        );
-    }
-
-    /// Upgrading an old config must not silently switch persistence or
-    /// eviction on.
-    #[test]
-    fn retention_settings_default_to_keeping_everything() {
-        let dir = TempDir::new("defaults");
-        let minimal = FULL
-            .lines()
-            .filter(|line| {
-                !line.starts_with("dbdir")
-                    && !line.starts_with("snapshot_interval")
-                    && !line.starts_with("sweep_interval")
-                    && !line.starts_with("stats_retention")
-                    && !line.starts_with("shadow_ttl")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let path = write_config(&dir.0, &minimal);
-
-        let settings = Settings::load(&path).unwrap();
-
-        assert_eq!(settings.dbdir, None);
-        assert_eq!(settings.database_policy(), DatabasePolicy::default());
-    }
+    // -- acl ---------------------------------------------------------------
 
     #[test]
-    fn a_blank_dbdir_disables_persistence() {
-        let dir = TempDir::new("blankdbdir");
-        let path = write_config(
-            &dir.0,
-            &FULL.replace("dbdir=/var/lib/sighting", "dbdir=   "),
-        );
-
-        assert_eq!(Settings::load(&path).unwrap().dbdir, None);
-    }
-
-    #[test]
-    fn an_unparseable_interval_falls_back() {
-        let dir = TempDir::new("badinterval");
-        let path = write_config(
-            &dir.0,
-            &FULL.replace("sweep_interval=30", "sweep_interval=often"),
-        );
-
-        assert_eq!(Settings::load(&path).unwrap().sweep_interval, 60);
-    }
-
-    // -- enabling and disabling listeners ----------------------------------
-
-    #[test]
-    fn both_listeners_run_by_default() {
-        let dir = TempDir::new("bothdefault");
-        let path = write_config(&dir.0, &format!("{FULL}\n{DNS}"));
-        let settings = Settings::load(&path).unwrap();
-
-        assert!(settings.http_enabled);
-        assert!(settings.dns.is_some());
-    }
-
-    #[test]
-    fn http_can_be_turned_off_for_a_dns_only_instance() {
-        let dir = TempDir::new("dnsonly");
-        let path = write_config(
-            &dir.0,
-            &format!(
-                "{}\n{DNS}",
-                FULL.replace("[daemon]", "[daemon]\nenabled=false")
-            ),
-        );
-        let settings = Settings::load(&path).unwrap();
-
-        assert!(!settings.http_enabled);
-        assert!(settings.dns.is_some());
-    }
-
-    #[test]
-    fn dns_can_be_turned_off_without_deleting_the_section() {
-        let dir = TempDir::new("dnsoff");
-        let path = write_config(
-            &dir.0,
-            &format!("{FULL}\n{}", DNS.replace("[dns]", "[dns]\nenabled=false")),
-        );
-        let settings = Settings::load(&path).unwrap();
-
-        assert!(settings.http_enabled);
-        assert_eq!(settings.dns, None);
-    }
-
-    /// Refusing to start beats starting a process that listens on nothing.
-    #[test]
-    fn disabling_both_is_an_error() {
-        let dir = TempDir::new("neither");
-        let path = write_config(&dir.0, &FULL.replace("[daemon]", "[daemon]\nenabled=false"));
-
-        let err = Settings::load(&path).unwrap_err().to_string();
-        assert!(err.contains("nothing to serve"), "{err}");
-    }
-
-    // -- [dns] -------------------------------------------------------------
-
-    #[test]
-    fn no_dns_section_means_no_dns() {
-        let dir = TempDir::new("nodns");
-        let path = write_config(&dir.0, FULL);
-        assert_eq!(Settings::load(&path).unwrap().dns, None);
-    }
-
-    #[test]
-    fn the_dns_section_is_parsed() {
-        let dir = TempDir::new("dns");
-        let path = write_config(&dir.0, &format!("{FULL}\n{DNS}"));
-        let dns = Settings::load(&path).unwrap().dns.unwrap();
-
-        assert_eq!(dns.listen, "127.0.0.1:5353");
-        assert_eq!(dns.zone, "sdb.example.com");
-        assert_eq!(dns.ttl, 60);
-        assert_eq!(dns.rate_limit, 100);
-        assert!(!dns.shadow);
-        assert_eq!(dns.exposed.len(), 2);
-        assert_eq!(dns.exposed[0].namespace, "malware/ips");
-        assert_eq!(dns.exposed[0].encoding, Encoding::Ip);
-    }
-
-    #[test]
-    fn a_trailing_dot_on_the_zone_is_ignored() {
-        let dir = TempDir::new("dnsdot");
-        let path = write_config(
-            &dir.0,
-            &format!(
-                "{FULL}\n{}",
-                DNS.replace("zone=sdb.example.com", "zone=SDB.Example.Com.")
-            ),
-        );
-        assert_eq!(
-            Settings::load(&path).unwrap().dns.unwrap().zone,
-            "sdb.example.com"
-        );
-    }
-
-    /// The internal trees hold API keys and search history; publishing them over
-    /// an unauthenticated protocol must not be a typo away.
-    #[test]
-    fn internal_namespaces_cannot_be_exposed() {
-        let dir = TempDir::new("dnsinternal");
-        let path = write_config(
-            &dir.0,
-            &format!(
-                "{FULL}\n{}",
-                DNS.replace("malware=malware/ips:ip", "keys=_config/acl/apikeys:domain")
-            ),
-        );
-
-        let err = Settings::load(&path).unwrap_err().to_string();
-        assert!(err.contains("_config/acl/apikeys"), "{err}");
-    }
-
-    #[test]
-    fn a_malformed_namespace_mapping_is_fatal() {
-        let dir = TempDir::new("dnsbadmap");
-        let path = write_config(
-            &dir.0,
-            &format!(
-                "{FULL}\n{}",
-                DNS.replace("malware=malware/ips:ip", "malware=malware/ips:rot13")
-            ),
-        );
-
-        let err = format!("{:#}", Settings::load(&path).unwrap_err());
-        assert!(err.contains("unknown DNS encoding"), "{err}");
-    }
-
-    // -- [acl] -------------------------------------------------------------
-
-    #[test]
-    fn no_acl_section_means_none() {
-        let dir = TempDir::new("noacl");
-        let path = write_config(&dir.0, FULL);
-
-        assert_eq!(Settings::load(&path).unwrap().acl, None);
-    }
-
-    #[test]
-    fn the_acl_section_is_parsed() {
+    fn inline_keys_are_read() {
         let dir = TempDir::new("acl");
-        let path = write_config(
-            &dir.0,
-            &format!("{FULL}\n[acl]\nadmin = rw\nanalyst = r\nfeed = rw:feeds/misp\n"),
-        );
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[acl]\nchangeme = \"rw, admin\"\nanalyst = \"r\"\n",
+        ))
+        .unwrap();
 
-        let acl = Settings::load(&path).unwrap().acl.unwrap();
-
-        assert_eq!(acl.len(), 3);
-        assert!(acl.can_write("admin", "anything"));
+        let acl = settings.acl.unwrap();
+        assert!(acl.is_admin("changeme"));
         assert!(acl.can_read("analyst", "anything"));
         assert!(!acl.can_write("analyst", "anything"));
-        assert!(acl.can_write("feed", "feeds/misp/ips"));
-        assert!(!acl.can_write("feed", "feeds/other"));
     }
 
-    /// A typo in a grant must stop the server rather than silently leaving a
-    /// key with the wrong permissions.
     #[test]
-    fn a_malformed_grant_is_fatal_and_names_the_key() {
-        let dir = TempDir::new("badacl");
-        let path = write_config(&dir.0, &format!("{FULL}\n[acl]\nbroken = admin\n"));
+    fn a_separate_acl_file_takes_precedence() {
+        let dir = TempDir::new("aclfile");
+        dir.write("acl.toml", "[acl]\nfromfile = \"rw, admin\"\n");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\nacl_file = \"acl.toml\"\n\n[acl]\ninline = \"rw\"\n",
+        ))
+        .unwrap();
 
-        let err = format!("{:#}", Settings::load(&path).unwrap_err());
+        let acl = settings.acl.unwrap();
+        assert!(acl.is_admin("fromfile"));
+        assert!(!acl.contains("inline"));
+    }
+
+    #[test]
+    fn a_missing_acl_file_is_not_fatal() {
+        let dir = TempDir::new("noaclfile");
+        let settings = Settings::load(
+            &dir.write("c.toml", "[daemon]\nssl = false\nacl_file = \"acl.toml\"\n"),
+        )
+        .unwrap();
+
+        // Empty rather than absent, so the interface can create it.
+        assert!(settings.acl.unwrap().is_empty());
+        assert!(settings.acl_file.is_some());
+    }
+
+    #[test]
+    fn a_malformed_grant_names_the_key() {
+        let dir = TempDir::new("badgrant");
+        let err = format!(
+            "{:#}",
+            Settings::load(&dir.write(
+                "c.toml",
+                "[daemon]\nssl = false\n\n[acl]\nbroken = \"superuser\"\n",
+            ))
+            .unwrap_err()
+        );
         assert!(err.contains("broken"), "{err}");
         assert!(err.contains("unknown permission"), "{err}");
     }
 
-    #[test]
-    fn a_missing_key_names_itself() {
-        let dir = TempDir::new("missing");
-        let path = write_config(&dir.0, &FULL.replace("listen_port=9999\n", ""));
+    // -- dns ---------------------------------------------------------------
 
-        let err = Settings::load(&path).unwrap_err().to_string();
-        assert!(err.contains("listen_port"), "{err}");
+    #[test]
+    fn dns_namespaces_are_structured() {
+        let dir = TempDir::new("dns");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            r#"
+[daemon]
+ssl = false
+
+[dns]
+zone = "SDB.Example.Com."
+listen_port = 5353
+
+[dns.namespaces]
+malware = { namespace = "malware/ips", encoding = "ip" }
+domains = { namespace = "malware/domains", encoding = "domain" }
+"#,
+        ))
+        .unwrap();
+
+        let dns = settings.dns.unwrap();
+        assert_eq!(dns.zone, "sdb.example.com");
+        assert_eq!(dns.listen, "127.0.0.1:5353");
+        assert_eq!(dns.rate_limit, 100);
+        assert_eq!(dns.exposed.len(), 2);
+        assert_eq!(dns.exposed[0].label, "domains");
+        assert_eq!(dns.exposed[1].encoding, Encoding::Ip);
     }
 
     #[test]
-    fn a_missing_daemon_section_is_an_error() {
-        let dir = TempDir::new("nosection");
-        let path = write_config(&dir.0, "[other]\nkey=value\n");
-
-        let err = Settings::load(&path).unwrap_err().to_string();
-        assert!(err.contains("[daemon]"), "{err}");
+    fn dns_can_be_disabled_without_deleting_the_table() {
+        let dir = TempDir::new("dnsoff");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[dns]\nenabled = false\nzone = \"x.example\"\n",
+        ))
+        .unwrap();
+        assert_eq!(settings.dns, None);
     }
 
     #[test]
-    fn a_missing_file_is_an_error() {
-        let err = Settings::load(Path::new("/nonexistent/sightingdb.conf"))
+    fn exposing_an_internal_namespace_over_dns_is_refused() {
+        let dir = TempDir::new("dnsinternal");
+        let err = Settings::load(&dir.write(
+            "c.toml",
+            r#"
+[daemon]
+ssl = false
+[dns]
+zone = "x.example"
+[dns.namespaces]
+keys = { namespace = "_config/acl", encoding = "domain" }
+"#,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("_config/acl"), "{err}");
+    }
+
+    // -- ingest ------------------------------------------------------------
+
+    #[test]
+    fn zmq_topics_are_a_real_list() {
+        let dir = TempDir::new("zmq");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            r#"
+[daemon]
+ssl = false
+
+[zmq]
+endpoint = "tcp://misp:50000"
+topics = ["misp_json_attribute", "misp_json"]
+require_to_ids = true
+
+[zmq.types]
+ip-src = "misp/ips"
+"#,
+        ))
+        .unwrap();
+
+        let zmq = settings.zmq.unwrap();
+        assert_eq!(zmq.topics, ["misp_json_attribute", "misp_json"]);
+        assert!(zmq.mapping.require_to_ids);
+        assert_eq!(zmq.mapping.types["ip-src"], "misp/ips");
+        assert_eq!(zmq.reconnect, 5);
+    }
+
+    #[test]
+    fn quoted_keys_carry_dots_through_to_the_mapping() {
+        let dir = TempDir::new("stix");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            r#"
+[daemon]
+ssl = false
+
+[stix.types]
+ipv4-addr = "stix/ips"
+"file.MD5" = "stix/hashes"
+"#,
+        ))
+        .unwrap();
+
+        assert_eq!(settings.stix.mapping.types["file.MD5"], "stix/hashes");
+    }
+
+    /// The INI version of this mistake silently mapped nothing. TOML turns it
+    /// into a nested table, which is at least detectable — so detect it.
+    #[test]
+    fn an_unquoted_dotted_key_is_reported() {
+        let dir = TempDir::new("stixdot");
+        let err = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[stix.types]\nfile.MD5 = \"stix/hashes\"\n",
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("has to be quoted"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_file_says_so() {
+        let err = Settings::load(Path::new("/nonexistent/sightingdb.toml"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("reading config file"), "{err}");

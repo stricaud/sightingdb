@@ -36,9 +36,13 @@ log4rs = "1.4"
 openssl = "0.10.81"
 # Already in the tree via actix-router; used for STIX pattern literals.
 regex = "1.13"
-rust-ini = "0.21"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "1.1"
+# Format-preserving TOML, so the management interface can rewrite a config
+# without discarding its comments. This is what cargo uses on Cargo.toml.
+toml_edit = "0.25"
+serde = { version = "1.0", features = ["derive"] }
+rand = "0.10"
 
 [features]
 # Build OpenSSL from source and link it statically. Off by default because it

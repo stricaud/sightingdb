@@ -12,6 +12,7 @@ However, it will also provide the following features:
 * Expire data with a per-value TTL
 * Answer lookups over DNS, using the DNSBL conventions security tooling already speaks
 * Ingest from a MISP ZeroMQ feed, and import STIX 2.1 bundles
+* Browse namespaces and values in a browser, with a histogram of when each value was seen
 
 SightingDB is designed to scale writing and reading. There is no global lock: namespaces are locked independently, and within a namespace each value has its own lock, so concurrent writes to different values never contend.
 
@@ -32,9 +33,9 @@ To run from the source directory:
 
 1. Generate a certificate: `cd etc; mkdir -p ssl; cd ssl; openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 -keyout key.pem -out cert.pem; cd ../..`
 2. `ln -s etc/ssl ssl`
-3. Start the daemon: `./target/debug/sightingdb -c etc/sightingdb.conf`
+3. Start the daemon: `./target/debug/sightingdb -c etc/sightingdb.toml`
 
-Without `-c`, the configuration is looked up in `/etc/sightingdb/sightingdb.conf` and then `~/.sightingdb/sightingdb.conf`.
+Without `-c`, the configuration is looked up in `/etc/sightingdb/sightingdb.toml` and then `~/.sightingdb/sightingdb.toml`.
 
 Set `ssl=false` in the configuration to serve plain HTTP instead.
 
@@ -169,7 +170,7 @@ Beyond the listen address and TLS settings, `[daemon]` accepts:
 
 The retention settings default to keeping everything, so upgrading an existing
 install never starts discarding data on its own. The configuration shipped in
-`etc/sightingdb.conf` sets 30-day windows for both, which is what bounds memory
+`etc/sightingdb.toml` sets 30-day windows for both, which is what bounds memory
 growth — without them, statistics accumulate one bucket per hour per value and
 `_shadow/*` grows for every distinct search, forever.
 
@@ -223,6 +224,40 @@ reachable over DNS is readable by anyone who can send a packet. Accordingly:
 * Shadow sightings are off by default, since over DNS they would be an
   unauthenticated write path.
 
+Management interface
+====================
+
+Point a browser at `/_management/` and sign in with an API key holding the
+`admin` grant — `changeme` on a fresh install:
+
+	[acl]
+	changeme   = "rw, admin"
+	feeds-only = "admin, r:feeds"
+
+It lists namespaces, browses the values inside one namespace (paged and
+filterable, since a namespace can hold a great many), and draws a histogram of
+when a value was seen from the hourly statistics the database already keeps.
+`/_management/feeds/ips/` is a direct link to that namespace, so views are
+bookmarkable.
+
+**Access is two-layered.** The `admin` grant is what reaches the interface at
+all; ordinary read grants then decide which namespaces are visible inside it. In
+the example above, `feeds-only` signs in but sees only `feeds/*` — everything
+else answers `404`, the same as a namespace that does not exist, so browsing
+cannot be used to enumerate what is out of reach.
+
+An admin key is required **even when `authenticate = false`**. Turning
+authentication off is a decision about the sighting API; it should not hand the
+management interface to anyone who can reach the port.
+
+The configuration view is **read-only**: settings are read from the file at
+startup, so changing them means editing the file and restarting. The interface
+reports what the server is actually doing rather than pretending to edit it.
+
+Charts use [Apache ECharts](https://echarts.apache.org/), vendored into the
+binary rather than loaded from a CDN so the interface works on a host with no
+internet access. See `assets/README.md`.
+
 Importing
 =========
 
@@ -233,15 +268,15 @@ SightingDB can subscribe to a ZeroMQ publisher and record what it hears. The
 usual source is MISP, whose publisher sends `<topic> <json>` frames:
 
 	[zmq]
-	endpoint=tcp://misp.example.com:50000
-	topics=misp_json_attribute,misp_json
-	format=misp
-	require_to_ids=true
+	endpoint = "tcp://misp.example.com:50000"
+	topics = ["misp_json_attribute", "misp_json"]
+	format = "misp"
+	require_to_ids = true
 
 	[zmq.types]
-	ip-src=misp/ips
-	domain=misp/domains
-	md5=misp/hashes
+	ip-src = "misp/ips"
+	domain = "misp/domains"
+	md5 = "misp/hashes"
 
 Attributes are read from `misp_json_attribute`, and from whole events on
 `misp_json` including attributes nested inside objects. Only mapped types are
@@ -260,7 +295,7 @@ self-contained; it interoperates with libzmq publishers like MISP's.
 STIX 2.1
 --------
 
-	$ sightingdb -c /etc/sightingdb/sightingdb.conf --import-stix bundles/
+	$ sightingdb -c /etc/sightingdb/sightingdb.toml --import-stix bundles/
 
 Reads one file or every `.json` in a directory, then exits. Three kinds of
 object are understood:
@@ -283,10 +318,10 @@ Access control
 API keys and what each may reach are declared in an `[acl]` section:
 
 	[acl]
-	admin     = rw
-	analyst   = r
-	feed-misp = rw:feeds/misp
-	mixed     = r, w:staging
+	admin     = "rw, admin"
+	analyst   = "r"
+	feed-misp = "rw:feeds/misp"
+	mixed     = "r, w:staging"
 
 Each entry is `<apikey> = <grant>[, <grant>...]`. A grant is `r`, `w` or `rw`,
 optionally scoped with `:<namespace prefix>`; without a prefix it covers every
