@@ -17,6 +17,16 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
       - '[0-9]+.[0-9]+.[0-9]+*'
+  # The version bump, the tag and the release all happen in this one run.
+  # They cannot be split across workflows: a tag pushed with GITHUB_TOKEN does
+  # not trigger a new workflow run, so a "prepare" workflow that tagged would
+  # bump and tag and then nothing further would happen.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without a leading v (e.g. 0.5.0)'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -32,25 +42,68 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    permissions:
+      # Dispatched runs commit the version bump and push the tag.
+      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # A dispatched run commits onto the branch, so it needs the branch
+          # rather than a detached tag.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.ref }}
 
       - name: Show toolchain
         run: rustc --version && cargo --version
 
       - uses: Swatinem/rust-cache@v2
 
-      # A tag that disagrees with Cargo.toml would publish the wrong number
-      # under the right name, and a published version can never be replaced.
-      - name: Check the tag matches Cargo.toml
+      # Either the tag already agrees with Cargo.toml, or this run is the one
+      # that makes it agree. Publishing a number that no commit contains is
+      # what this avoids: `cargo publish` uploads the manifest as it stands,
+      # and `git checkout <tag>` has to reproduce it.
+      - name: Resolve the version
+        id: resolve
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          echo "tag=$tag  Cargo.toml=$manifest"
-          if [ "$tag" != "$manifest" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match the Cargo.toml version $manifest"
-            exit 1
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+            version="${version#v}"
+            if ! echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$'; then
+              echo "::error::'$version' is not a semantic version like 1.2.3"
+              exit 1
+            fi
+            if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+              echo "::error::Tag v$version already exists"
+              exit 1
+            fi
+
+            # Only the first `version =` line, which is the one in [package].
+            perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' Cargo.toml
+            cargo update --workspace --offline || cargo update --workspace
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml Cargo.lock
+            git commit -m "Release $version"
+            git tag "v$version"
+            git push origin HEAD "refs/tags/v$version"
+            echo "Bumped to $version and tagged v$version"
+          else
+            version="${TAG#v}"
+            manifest="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+            echo "tag=$version  Cargo.toml=$manifest"
+            if [ "$version" != "$manifest" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match the Cargo.toml version \
+          $manifest. Either bump Cargo.toml and re-tag, or delete this tag and use the \
+          Release workflow from the Actions tab with version $version, which does the bump, \
+          the commit and the tag for you."
+              exit 1
+            fi
           fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
       # A tag can point at a commit that never went through CI, so re-run the
       # checks here rather than assuming.
@@ -98,6 +151,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.check.outputs.tag }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -109,8 +164,10 @@ jobs:
         run: cargo build --release --locked --features vendored-openssl
 
       - name: Stage the archive
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           stage="sightingdb-${version}-${{ matrix.target }}"
           mkdir -p "$stage/etc"
           cp target/release/sightingdb "$stage/"
@@ -146,13 +203,14 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: GitHub Release
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ needs.check.outputs.tag }}
           # Full history so the generated notes can see the previous tag.
           fetch-depth: 0
 
@@ -170,15 +228,16 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
           # A tag like v0.1.0-rc1 is a prerelease; v0.1.0 is not.
-          case "$GITHUB_REF_NAME" in
+          case "$TAG" in
             *-*) prerelease=--prerelease ;;
             *)   prerelease= ;;
           esac
 
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
+          gh release create "$TAG" \
+            --title "$TAG" \
             --generate-notes \
             $prerelease \
             artifacts/*.tar.gz \
@@ -197,6 +256,8 @@ jobs:
     environment: crates-io
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.check.outputs.tag }}
 
       # No rust-cache here on purpose: `cargo publish` builds from a freshly
       # packaged tarball, so the cache saves little, and its cleanup step walks
