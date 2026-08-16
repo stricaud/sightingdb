@@ -91,6 +91,10 @@ pub struct ServerInfo {
     pub zmq: Option<ZmqInfo>,
     pub namespaces: usize,
     pub apikeys: usize,
+    pub default_tier: String,
+    pub warm_idle: u64,
+    /// Shards with a tier of their own.
+    pub tiers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize)]

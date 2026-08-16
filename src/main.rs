@@ -13,6 +13,7 @@ mod maintenance;
 mod persistence;
 mod sighting_reader;
 mod sighting_writer;
+mod tier;
 mod tls;
 
 use std::fs;
@@ -115,6 +116,25 @@ fn main() -> Result<()> {
     let dbdir = usable_dbdir(&settings);
     let level = settings.compression_level;
     let db = open_database(&settings, dbdir.as_deref())?;
+
+    if let Some(dir) = dbdir.as_deref() {
+        db.attach_store(
+            db::Store {
+                dbdir: dir.to_path_buf(),
+                level,
+            },
+            settings.tiers.clone(),
+        );
+        // Startup reads every shard, so drop the ones their tier does not want
+        // resident rather than holding them until the first sweep. Nothing is
+        // dirty yet, so nothing is written out.
+        let evicted = db.evict_idle(Utc::now().timestamp());
+        let (resident, total) = db.residency();
+        log::info!(
+            "{resident} of {total} shard(s) resident ({} evicted at startup)",
+            evicted.evicted
+        );
+    }
 
     let acl = build_acl(&settings, &db, cli.apikey.as_deref());
 
@@ -256,6 +276,14 @@ fn server_info(
         }),
         namespaces: db.namespace_count(),
         apikeys: acl.len(),
+        default_tier: settings.tiers.default_tier.as_str().to_string(),
+        warm_idle: settings.tiers.warm_idle.as_secs(),
+        tiers: settings
+            .tiers
+            .shards
+            .iter()
+            .map(|(shard, tier)| (shard.clone(), tier.as_str().to_string()))
+            .collect(),
     }
 }
 
@@ -456,6 +484,18 @@ fn spawn_workers(
                             "Swept {} expired values and {} empty namespaces",
                             report.values_removed,
                             report.namespaces_removed
+                        );
+                    }
+
+                    // Shards idle longer than their tier allows are written
+                    // out and dropped from memory.
+                    let evicted = state.db.evict_idle(Utc::now().timestamp());
+                    if !evicted.is_empty() {
+                        log::info!(
+                            "Evicted {} shard(s) ({} still in use, {} could not be saved)",
+                            evicted.evicted,
+                            evicted.busy,
+                            evicted.failed
                         );
                     }
                 },

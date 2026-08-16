@@ -230,6 +230,27 @@ fn check_version(version: u32, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read one shard's namespaces, for paging it back into memory.
+pub fn read_shard_file(
+    dbdir: &Path,
+    shard: &str,
+) -> Result<HashMap<String, HashMap<String, crate::attribute::Attribute>>> {
+    let path = shard_file(dbdir, shard);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let data = read_shard(&path)?;
+    check_version(data.version, &path)?;
+    Ok(data.namespaces)
+}
+
+/// Write one shard, used when evicting it rather than during a full save.
+pub fn save_shard(db: &Database, dbdir: &Path, shard: &str, level: i32) -> Result<()> {
+    fs::create_dir_all(dbdir)
+        .with_context(|| format!("creating snapshot directory {}", dbdir.display()))?;
+    write_shard(db, dbdir, shard, level).map(|_| ())
+}
+
 pub fn default_level() -> i32 {
     DEFAULT_LEVEL
 }

@@ -60,6 +60,30 @@ stats_retention = 720
 # 2592000 is 30 days.
 shadow_ttl = 2_592_000
 
+# How long each top-level namespace stays in memory.
+#
+#   hot   never evicted
+#   warm  written out and dropped once untouched for warm_idle seconds; any
+#         read or write starts the window again
+#   cold  dropped at the next sweep once idle
+#
+# "cold" does not mean a disk round trip per operation: a cold shard is loaded
+# on demand and dropped at the next sweep, so a burst of writes costs one load
+# rather than one per write. Internal state (_all, _config) is always hot,
+# whatever is configured, because consensus and API keys are consulted
+# constantly.
+#
+# Eviction needs somewhere to write, so it only happens when dbdir is set.
+[storage]
+default_tier = "hot"
+warm_idle = 3600
+
+# Per-namespace overrides, keyed by the top-level namespace.
+# [storage.tiers]
+# myorg = "hot"
+# archive = "cold"
+# occasional = "warm"
+
 # API keys live in their own file because the management interface rewrites it
 # whenever a key is created or revoked. Without this, keys can be declared in an
 # [acl] table below, but the interface will not be able to edit them.

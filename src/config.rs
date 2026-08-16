@@ -18,6 +18,7 @@ use crate::dns::name::{Encoding, Exposed};
 use crate::ingest::misp::Mapping;
 use crate::ingest::stix::Mapping as StixMapping;
 use crate::ingest::{Format, Settings as ZmqSettings};
+use crate::tier::{Tier, TierPolicy};
 
 /// Body size limit for bulk POSTs.
 const DEFAULT_POST_LIMIT: usize = 2_500_000_000;
@@ -57,6 +58,8 @@ pub struct Settings {
     pub acl: Option<Acl>,
     /// File holding the keys, which the management interface rewrites.
     pub acl_file: Option<PathBuf>,
+    /// Which shards stay in memory, and for how long.
+    pub tiers: TierPolicy,
     pub dns: Option<DnsSettings>,
     pub zmq: Option<ZmqSettings>,
     pub stix: StixSettings,
@@ -112,6 +115,7 @@ struct RawConfig {
     daemon: RawDaemon,
     /// Inline keys, for installs that do not use a separate `acl_file`.
     acl: Option<HashMap<String, String>>,
+    storage: Option<RawStorage>,
     dns: Option<RawDns>,
     zmq: Option<RawZmq>,
     stix: Option<RawStix>,
@@ -153,6 +157,20 @@ struct RawDaemon {
     #[serde(default)]
     shadow_ttl: u64,
     acl_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStorage {
+    #[serde(default = "default_tier")]
+    default_tier: String,
+    /// Seconds a warm shard may sit untouched before it is written out and
+    /// dropped from memory.
+    #[serde(default = "default_warm_idle")]
+    warm_idle: u64,
+    /// Per-shard overrides, keyed by top-level namespace.
+    #[serde(default)]
+    tiers: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,6 +279,13 @@ fn default_format() -> String {
 fn default_reconnect() -> u64 {
     5
 }
+fn default_tier() -> String {
+    // Everything resident, which is how the database behaved before tiering.
+    "hot".into()
+}
+fn default_warm_idle() -> u64 {
+    3600
+}
 
 // ---------------------------------------------------------------------------
 // Conversion
@@ -286,6 +311,10 @@ impl RawConfig {
             None
         };
 
+        let tiers = match self.storage {
+            Some(storage) => storage.into_policy()?,
+            None => TierPolicy::default(),
+        };
         let acl_file = daemon.acl_file.map(|file| resolve(base, &file));
         let acl = load_acl(self.acl, acl_file.as_deref(), path)?;
 
@@ -327,9 +356,28 @@ impl RawConfig {
             shadow_ttl: daemon.shadow_ttl,
             acl,
             acl_file,
+            tiers,
             dns,
             zmq,
             stix,
+        })
+    }
+}
+
+impl RawStorage {
+    fn into_policy(self) -> Result<TierPolicy> {
+        let mut shards = HashMap::new();
+        for (shard, tier) in self.tiers {
+            let tier = Tier::parse(&tier)
+                .with_context(|| format!("in [storage.tiers] entry '{shard}'"))?;
+            shards.insert(shard.trim().to_string(), tier);
+        }
+
+        Ok(TierPolicy {
+            default_tier: Tier::parse(&self.default_tier)
+                .context("in 'default_tier' of [storage]")?,
+            shards,
+            warm_idle: std::time::Duration::from_secs(self.warm_idle),
         })
     }
 }
