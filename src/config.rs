@@ -631,8 +631,14 @@ pub fn locate() -> Result<PathBuf> {
     }
 
     Err(anyhow!(
-        "cannot locate sightingdb.toml: pass -c, or place one in /etc/sightingdb/ or \
-         ~/.sightingdb/"
+        "no configuration found.\n\
+         Run `sightingdb --setup` to create one, or pass -c to point at an existing file.\n\
+         Looked in: {}",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 

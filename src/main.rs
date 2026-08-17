@@ -47,14 +47,10 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// log4rs configuration file
-    #[arg(
-        short = 'l',
-        long,
-        value_name = "FILE",
-        default_value = "etc/log4rs.yml"
-    )]
-    logging_config: PathBuf,
+    /// log4rs configuration file. Without one, the usual locations are tried
+    /// and logging falls back to the console.
+    #[arg(short = 'l', long, value_name = "FILE")]
+    logging_config: Option<PathBuf>,
 
     /// Set the default API key, replacing the built-in one
     #[arg(short = 'k', long, value_name = "APIKEY")]
@@ -82,12 +78,10 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    log4rs::init_file(&cli.logging_config, Default::default()).with_context(|| {
-        format!(
-            "loading logging configuration {}",
-            cli.logging_config.display()
-        )
-    })?;
+    // Before anything else, and never fatal unless a file was named: `--setup`
+    // exists precisely for the case where nothing is installed yet, so it must
+    // not be blocked by a missing logging configuration.
+    start_logging(cli.logging_config.as_deref(), cli.verbose)?;
 
     if cli.setup {
         return setup::run();
@@ -241,6 +235,55 @@ fn main() -> Result<()> {
     daemon::remove_pid_file();
 
     result
+}
+
+/// Places a logging configuration is looked for when `-l` was not given, in
+/// the same order the main configuration is located.
+fn logging_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/etc/sightingdb/log4rs.yml")];
+    if let Some(mut home) = dirs::home_dir() {
+        home.push(".sightingdb");
+        home.push("log4rs.yml");
+        candidates.push(home);
+    }
+    // Last, because it only exists when running from a source checkout.
+    candidates.push(PathBuf::from("etc/log4rs.yml"));
+    candidates
+}
+
+/// Start logging, falling back to the console.
+///
+/// A named file that cannot be read is an error, since the caller asked for it.
+/// Finding none of the usual ones is not: an installed binary run from an
+/// arbitrary directory should still log somewhere.
+fn start_logging(named: Option<&Path>, verbose: u8) -> Result<()> {
+    if let Some(path) = named {
+        return log4rs::init_file(path, Default::default())
+            .with_context(|| format!("loading logging configuration {}", path.display()));
+    }
+
+    if let Some(found) = logging_candidates().into_iter().find(|p| p.exists())
+        && log4rs::init_file(&found, Default::default()).is_ok()
+    {
+        return Ok(());
+    }
+
+    let level = match verbose {
+        0 => log::LevelFilter::Info,
+        1 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    };
+    let stdout = log4rs::append::console::ConsoleAppender::builder().build();
+    let config = log4rs::Config::builder()
+        .appender(log4rs::config::Appender::builder().build("stdout", Box::new(stdout)))
+        .build(
+            log4rs::config::Root::builder()
+                .appender("stdout")
+                .build(level),
+        )
+        .context("building the default logging configuration")?;
+    log4rs::init_config(config).context("starting the default logger")?;
+    Ok(())
 }
 
 /// Snapshot what this server was configured to do, for the management
@@ -684,5 +727,44 @@ fn create_home_config() {
             "Error creating home configuration {}: {e}",
             home_config.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `--setup` exists for the case where nothing is installed,
+    /// so a missing logging configuration must not stop it. It used to abort
+    /// with "loading logging configuration etc/log4rs.yml".
+    #[test]
+    fn a_missing_logging_configuration_is_not_fatal() {
+        // `etc/log4rs.yml` is only there in a source checkout; none of the
+        // candidates existing has to be survivable.
+        assert!(
+            logging_candidates()
+                .iter()
+                .any(|p| p.ends_with("log4rs.yml"))
+        );
+        // Nothing here can call start_logging twice, so this checks the shape
+        // rather than the effect: a named file is required, an unnamed one is
+        // not.
+        assert!(start_logging(Some(Path::new("/nonexistent/log4rs.yml")), 0).is_err());
+    }
+
+    #[test]
+    fn the_usual_locations_are_searched_before_the_source_tree() {
+        let candidates = logging_candidates();
+        let system = candidates
+            .iter()
+            .position(|p| p.starts_with("/etc/sightingdb"))
+            .expect("system path");
+        let source = candidates
+            .iter()
+            .position(|p| p == Path::new("etc/log4rs.yml"))
+            .expect("source path");
+        // An installed binary run from a checkout should still prefer the
+        // installed configuration.
+        assert!(system < source, "{candidates:?}");
     }
 }
