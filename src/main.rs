@@ -11,6 +11,7 @@ mod handlers;
 mod ingest;
 mod maintenance;
 mod persistence;
+mod setup;
 mod sighting_reader;
 mod sighting_writer;
 mod tier;
@@ -68,6 +69,11 @@ struct Cli {
     #[arg(long)]
     install_selfsigned_keys: bool,
 
+    /// Set up an installation: directories, configuration, certificate, API
+    /// key and a service. Asks before changing anything.
+    #[arg(long)]
+    setup: bool,
+
     /// Sets the level of verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -82,6 +88,10 @@ fn main() -> Result<()> {
             cli.logging_config.display()
         )
     })?;
+
+    if cli.setup {
+        return setup::run();
+    }
 
     create_home_config();
 

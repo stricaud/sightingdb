@@ -18,6 +18,23 @@ SightingDB is designed to scale writing and reading. There is no global lock: na
 
 The database is held in memory and snapshotted to disk (see `dbdir` below). Set no `dbdir` to run purely in memory.
 
+Getting started
+===============
+
+	$ cargo install sightingdb
+	$ sightingdb --setup
+
+`--setup` asks a few questions, prints exactly what it intends to do, and only
+then does it: directories with sensible modes, a configuration, a self-signed
+certificate, an admin API key, and a systemd unit or launchd job. Without root
+it installs under `~/.sightingdb` for the current user; with `sudo` on Linux it
+installs system-wide under `/etc` and `/var/lib` and creates a `sightingdb`
+service account.
+
+Nothing existing is replaced without being asked, file by file, and API keys
+and certificates are never replaced at all — re-running setup on an installed
+system keeps them. The admin key is shown once, when it is first created.
+
 Building
 ========
 
