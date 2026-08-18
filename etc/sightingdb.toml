@@ -73,6 +73,11 @@ shadow_ttl = 2_592_000
 # whatever is configured, because consensus and API keys are consulted
 # constantly.
 #
+# API keys live in their own file because the management interface rewrites it
+# whenever a key is created or revoked. Without this, keys can be declared in an
+# [acl] table below, but the interface will not be able to edit them.
+acl_file = "acl.toml"
+
 # Eviction needs somewhere to write, so it only happens when dbdir is set.
 [storage]
 default_tier = "hot"
@@ -89,11 +94,6 @@ tiers_file = "tiers.toml"
 # myorg = "hot"
 # archive = "cold"
 # occasional = "warm"
-
-# API keys live in their own file because the management interface rewrites it
-# whenever a key is created or revoked. Without this, keys can be declared in an
-# [acl] table below, but the interface will not be able to edit them.
-acl_file = "acl.toml"
 
 # API keys, used only when acl_file is not set.
 #

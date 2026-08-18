@@ -79,6 +79,48 @@ pub struct NamespaceEntry {
     pub resident: bool,
 }
 
+/// One step down the namespace tree, as the management interface browses it.
+///
+/// A path can be both at once: `myorg` may hold values of its own and still
+/// have `myorg/feeds` underneath it, the way a directory holds files as well as
+/// subdirectories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TreeEntry {
+    /// The path segment, which is what a row is labelled with.
+    pub name: String,
+    /// The whole path, which is what the row links to.
+    pub path: String,
+    /// Whether the path is a namespace in its own right, and so may hold values.
+    pub namespace: bool,
+    /// Namespaces below this one, so a folder can say how much is inside it.
+    pub descendants: usize,
+    /// The top-level namespace, which is what a tier applies to.
+    pub shard: String,
+    pub tier: String,
+    pub resident: bool,
+}
+
+/// One namespace a value has been seen in, for the relationship view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Sighting {
+    pub namespace: String,
+    /// The top-level namespace, which is what colours a cluster.
+    pub shard: String,
+    pub count: u64,
+    pub first_seen: i64,
+    pub last_seen: i64,
+}
+
+/// Everywhere one value was found, and what the search cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct Sightings {
+    pub items: Vec<Sighting>,
+    /// True when the search stopped at the limit, so there may be more.
+    pub truncated: bool,
+    /// True when finding them all meant reading shards back from disk.
+    pub paged_in: bool,
+}
+
 /// A slice of a listing, with the total so a caller can page through it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Page<T> {
@@ -534,6 +576,8 @@ impl Database {
         };
 
         let mut report = SweepReport::default();
+        // Namespaces this pass emptied, which are the only ones it may reclaim.
+        let mut emptied: Vec<String> = Vec::new();
         for (name, namespace) in &entries {
             // API keys have no TTL and must never be swept out from under the ACL.
             if name.starts_with(CONFIG_PREFIX) {
@@ -543,6 +587,9 @@ impl Database {
             let expired = namespace.remove_expired(now);
             if !expired.is_empty() {
                 self.mark_dirty(name);
+                if namespace.is_empty() {
+                    emptied.push(name.clone());
+                }
             }
             report.values_removed += expired.len();
 
@@ -556,7 +603,7 @@ impl Database {
         // Our own handles must go before pruning, or `strong_count` below would
         // see them and conclude every namespace is still in use.
         drop(entries);
-        report.namespaces_removed = self.prune_empty();
+        report.namespaces_removed = self.prune_empty(&emptied);
         report
     }
 
@@ -660,6 +707,195 @@ impl Database {
             total,
             offset,
         }
+    }
+
+    /// Declare a namespace before anything has been written to it, so the
+    /// management interface can make one the way a file browser makes a folder.
+    ///
+    /// Returns false if it already exists. Nothing else is needed to make it
+    /// last: an empty namespace is written to its shard like any other, and
+    /// sweeps only reclaim namespaces they emptied themselves.
+    pub fn create_namespace(&self, name: &str) -> bool {
+        if self.namespace_exists(name) {
+            return false;
+        }
+        // Held only long enough to register it; the handle must not outlive
+        // this call or a sweep would take it for a namespace in use.
+        drop(self.namespace_or_create(name));
+        self.mark_dirty(name);
+        true
+    }
+
+    /// One level of the namespace tree: what sits directly under `prefix`.
+    ///
+    /// Namespaces are flat paths in the database — `feeds/misp/ips` is a name,
+    /// not a nesting — so the tree is derived here by grouping on the segment
+    /// that follows the prefix. The same exclusions as [`Database::namespace_page`]
+    /// apply, and `allowed` decides which names the caller may know about, so a
+    /// folder whose whole contents are out of reach is not even listed.
+    pub fn namespace_children(
+        &self,
+        prefix: &str,
+        filter: &str,
+        offset: usize,
+        limit: usize,
+        allowed: impl Fn(&str) -> bool,
+    ) -> Page<TreeEntry> {
+        let prefix = prefix.trim_matches('/');
+        let filter = filter.to_ascii_lowercase();
+
+        // (is a namespace itself, namespaces below it)
+        let mut children: HashMap<&str, (bool, usize)> = HashMap::new();
+        let shards = self.shards.read().unwrap_or_else(PoisonError::into_inner);
+        for name in shards
+            .values()
+            .flat_map(|meta| meta.namespaces.iter())
+            .filter(|name| !name.starts_with(CONFIG_PREFIX) && *name != ALL_NAMESPACE)
+            .filter(|name| allowed(name))
+        {
+            let rest = if prefix.is_empty() {
+                name.as_str()
+            } else if let Some(rest) = name.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')) {
+                rest
+            } else {
+                // Either unrelated, or the prefix itself: neither is a child.
+                continue;
+            };
+            let segment = rest.split('/').next().unwrap_or("");
+            if segment.is_empty() {
+                continue;
+            }
+
+            let entry = children.entry(segment).or_insert((false, 0));
+            if segment.len() == rest.len() {
+                entry.0 = true;
+            } else {
+                entry.1 += 1;
+            }
+        }
+
+        let mut names: Vec<&str> = children
+            .keys()
+            .copied()
+            .filter(|name| filter.is_empty() || name.to_ascii_lowercase().contains(&filter))
+            .collect();
+        names.sort_unstable();
+
+        let total = names.len();
+        let tiers = self.tiers.read().unwrap_or_else(PoisonError::into_inner);
+        let items = names
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|name| {
+                let path = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                let (namespace, descendants) = children[name];
+                let shard = crate::persistence::shard_of(&path);
+                TreeEntry {
+                    name: name.to_string(),
+                    namespace,
+                    descendants,
+                    shard: shard.to_string(),
+                    tier: tiers.tier_of(shard).as_str().to_string(),
+                    resident: shards.get(shard).is_some_and(|meta| meta.resident),
+                    path,
+                }
+            })
+            .collect();
+
+        Page {
+            items,
+            total,
+            offset,
+        }
+    }
+
+    /// Every namespace holding `value`, so the interface can draw what a value
+    /// relates to rather than only where you happened to click.
+    ///
+    /// The cost is one lookup per namespace, so the search is arranged to do as
+    /// little of it as possible. `_all` already knows how many namespaces hold
+    /// the value, which gives a target to stop at; namespaces already in memory
+    /// are searched first, and evicted shards are read back only if the target
+    /// has not been reached by then. A value in two namespaces out of a hundred
+    /// thousand therefore normally touches the disk not at all.
+    ///
+    /// `allowed` decides which namespaces the caller may know about, exactly as
+    /// when browsing. A hidden namespace is still counted towards the target,
+    /// or a scoped key would drive the search to read the whole database.
+    ///
+    /// `_shadow/*` is left out. It records what was *searched* for rather than
+    /// what was seen, does not count towards consensus, and including it would
+    /// make the result depend on where the search happened to stop.
+    pub fn sightings_of(
+        &self,
+        value: &str,
+        limit: usize,
+        allowed: impl Fn(&str) -> bool,
+    ) -> Sightings {
+        let target = self.count(ALL_NAMESPACE, value);
+
+        // Resident first, so the common case never goes near the disk.
+        let (resident, evicted): (Vec<String>, Vec<String>) = {
+            let shards = self.shards.read().unwrap_or_else(PoisonError::into_inner);
+            let mut resident = Vec::new();
+            let mut evicted = Vec::new();
+            for meta in shards.values() {
+                for name in &meta.namespaces {
+                    if !counts_towards_consensus(name) {
+                        continue;
+                    }
+                    if meta.resident {
+                        resident.push(name.clone());
+                    } else {
+                        evicted.push(name.clone());
+                    }
+                }
+            }
+            (resident, evicted)
+        };
+
+        let mut found = Sightings::default();
+        // Namespaces holding the value, visible to this caller or not, counted
+        // against `target`.
+        let mut seen = 0u64;
+
+        'search: for (names, from_disk) in [(resident, false), (evicted, true)] {
+            for name in names {
+                // Everything is accounted for; the rest cannot hold the value.
+                if target > 0 && seen >= target {
+                    break 'search;
+                }
+                let Some(view) = self.view(&name, value, 0, false) else {
+                    continue;
+                };
+                if from_disk {
+                    found.paged_in = true;
+                }
+                seen += 1;
+                if !allowed(&name) {
+                    continue;
+                }
+                if found.items.len() >= limit {
+                    found.truncated = true;
+                    break 'search;
+                }
+                found.items.push(Sighting {
+                    shard: crate::persistence::shard_of(&name).to_string(),
+                    namespace: name,
+                    count: view.count,
+                    first_seen: view.first_seen,
+                    last_seen: view.last_seen,
+                });
+            }
+        }
+
+        found.items.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+        found
     }
 
     /// Change a shard's tier, taking effect at once.
@@ -923,31 +1159,50 @@ impl Database {
         }
     }
 
-    fn prune_empty(&self) -> usize {
-        let mut map = self
-            .namespaces
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        let before = map.len();
-        map.retain(|name, namespace| {
-            if name.starts_with(CONFIG_PREFIX) {
-                return true;
-            }
-            // Only drop a namespace nobody else is holding: a writer that
-            // already took an `Arc` would otherwise record its sighting into an
-            // orphaned namespace and lose it.
-            Arc::strong_count(namespace) > 1 || !namespace.is_empty()
-        });
-        let removed: Vec<String> = map.keys().cloned().collect();
-        drop(map);
+    /// Reclaim the namespaces a sweep has just emptied.
+    ///
+    /// Only those are candidates. An empty namespace is not litter by itself:
+    /// one created through the management interface exists before anything is
+    /// written to it, the way a new directory does, and must survive until it
+    /// is deleted.
+    fn prune_empty(&self, emptied: &[String]) -> usize {
+        if emptied.is_empty() {
+            return 0;
+        }
 
-        if before != removed.len() {
-            let mut shards = self.shards.write().unwrap_or_else(PoisonError::into_inner);
-            for meta in shards.values_mut() {
-                meta.namespaces.retain(|name| removed.contains(name));
+        let mut removed: Vec<&str> = Vec::new();
+        {
+            let mut map = self
+                .namespaces
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            for name in emptied {
+                if name.starts_with(CONFIG_PREFIX) {
+                    continue;
+                }
+                // Only drop a namespace nobody else is holding: a writer that
+                // already took an `Arc` would otherwise record its sighting into
+                // an orphaned namespace and lose it. A write between the sweep
+                // and here leaves it non-empty again, so check that too.
+                let gone = map.get(name).is_some_and(|namespace| {
+                    Arc::strong_count(namespace) == 1 && namespace.is_empty()
+                });
+                if gone {
+                    map.remove(name);
+                    removed.push(name);
+                }
             }
         }
-        before - removed.len()
+
+        if !removed.is_empty() {
+            let mut shards = self.shards.write().unwrap_or_else(PoisonError::into_inner);
+            for name in &removed {
+                if let Some(meta) = shards.get_mut(crate::persistence::shard_of(name)) {
+                    meta.namespaces.remove(*name);
+                }
+            }
+        }
+        removed.len()
     }
 
     /// Fetch a namespace, paging its shard in from disk if it has been evicted.
@@ -988,6 +1243,25 @@ impl Database {
     fn namespace_or_create(&self, name: &str) -> Arc<Namespace> {
         if let Some(namespace) = self.namespace(name) {
             return namespace;
+        }
+
+        // The shard may exist on disk with other namespaces in it. Registering
+        // a namespace marks its shard resident, so the rest of the shard has to
+        // be back in memory first: otherwise everything else in it would read
+        // as missing, and the next snapshot would write the shard out without
+        // it. Only a namespace that is genuinely new gets here — an existing
+        // one was paged in by `namespace` above.
+        let shard = crate::persistence::shard_of(name);
+        let evicted = self
+            .shards
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(shard)
+            .is_some_and(|meta| !meta.resident);
+        if evicted && let Err(e) = self.page_in(shard) {
+            // Nothing here can recover it; refusing to create the namespace
+            // would only lose the write as well.
+            log::error!("Could not load shard '{shard}' before extending it: {e:#}");
         }
 
         let namespace = self
@@ -1302,6 +1576,155 @@ mod tests {
         assert!(db.namespace_exists("b/ns"));
         // b/ns still holds the value, so consensus drops to one rather than zero.
         assert_eq!(db.count(ALL_NAMESPACE, "v"), 1);
+    }
+
+    /// A namespace made in advance holds nothing, and holding nothing is not a
+    /// reason to reclaim it: it is a folder someone created, not litter.
+    #[test]
+    fn a_created_namespace_is_empty_and_survives_a_sweep() {
+        let db = Database::default();
+
+        assert!(db.create_namespace("feeds/domains"));
+        // Already there, so making it again changes nothing.
+        assert!(!db.create_namespace("feeds/domains"));
+
+        assert!(db.namespace_exists("feeds/domains"));
+        assert_eq!(
+            db.value_page("feeds/domains", "", 0, 10, false)
+                .unwrap()
+                .total,
+            0
+        );
+
+        assert_eq!(db.sweep(Utc::now()), SweepReport::default());
+        assert!(db.namespace_exists("feeds/domains"));
+    }
+
+    /// Namespaces are flat paths; the tree is grouped out of them by segment.
+    #[test]
+    fn the_tree_groups_namespaces_by_segment() {
+        let db = Database::default();
+        for namespace in ["feeds", "feeds/misp/ips", "feeds/misp/domains", "other/x"] {
+            db.write(namespace, "v", at(100), WriteOpts::default());
+        }
+
+        let root = db.namespace_children("", "", 0, 10, |_| true);
+        assert_eq!(root.total, 2);
+        // `feeds` holds values of its own *and* has namespaces under it.
+        assert_eq!(root.items[0].name, "feeds");
+        assert_eq!(root.items[0].path, "feeds");
+        assert!(root.items[0].namespace);
+        assert_eq!(root.items[0].descendants, 2);
+        assert_eq!(root.items[1].name, "other");
+        assert!(!root.items[1].namespace);
+
+        // A level in, `misp` is a folder holding two namespaces.
+        let feeds = db.namespace_children("feeds", "", 0, 10, |_| true);
+        assert_eq!(feeds.total, 1);
+        assert_eq!(feeds.items[0].path, "feeds/misp");
+        assert!(!feeds.items[0].namespace);
+        assert_eq!(feeds.items[0].descendants, 2);
+
+        let misp = db.namespace_children("feeds/misp", "", 0, 10, |_| true);
+        assert_eq!(
+            misp.items
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["domains", "ips"]
+        );
+        // A leaf has nothing under it.
+        assert_eq!(
+            db.namespace_children("other/x", "", 0, 10, |_| true).total,
+            0
+        );
+    }
+
+    #[test]
+    fn the_tree_filters_pages_and_respects_permission() {
+        let db = Database::default();
+        for namespace in ["a/one", "a/two", "b/three"] {
+            db.write(namespace, "v", at(100), consensus());
+        }
+
+        // Bookkeeping namespaces are left out, as they are of the flat listing.
+        assert!(db.namespace_exists(ALL_NAMESPACE));
+        let root = db.namespace_children("", "", 0, 10, |_| true);
+        assert_eq!(
+            root.items
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+
+        let page = db.namespace_children("a", "", 1, 1, |_| true);
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items[0].name, "two");
+
+        let filtered = db.namespace_children("a", "ON", 0, 10, |_| true);
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].name, "one");
+
+        // A folder whose whole contents are out of reach is not listed at all.
+        let scoped = db.namespace_children("", "", 0, 10, |name| name.starts_with("a"));
+        assert_eq!(scoped.total, 1);
+        assert_eq!(scoped.items[0].name, "a");
+    }
+
+    #[test]
+    fn a_value_reports_every_namespace_holding_it() {
+        let db = Database::default();
+        for namespace in ["feeds/misp/ips", "feeds/otx/ips", "internal/allowlist"] {
+            db.write(namespace, "1.2.3.4", at(100), consensus());
+        }
+        db.write("feeds/misp/ips", "1.2.3.4", at(200), consensus());
+        db.write("feeds/misp/ips", "9.9.9.9", at(100), consensus());
+
+        let found = db.sightings_of("1.2.3.4", 100, |_| true);
+        assert_eq!(
+            found
+                .items
+                .iter()
+                .map(|s| s.namespace.as_str())
+                .collect::<Vec<_>>(),
+            ["feeds/misp/ips", "feeds/otx/ips", "internal/allowlist"]
+        );
+        // The count is per namespace, which is what sizes a node.
+        assert_eq!(found.items[0].count, 2);
+        assert_eq!(found.items[0].shard, "feeds");
+        assert_eq!(found.items[1].count, 1);
+        assert!(!found.truncated);
+        assert!(!found.paged_in);
+
+        // A value nobody has seen relates to nothing.
+        assert!(db.sightings_of("nope", 100, |_| true).items.is_empty());
+    }
+
+    /// The same rule as browsing: a scoped key is told about its own subtree
+    /// and nothing else.
+    #[test]
+    fn sightings_leave_out_namespaces_the_caller_cannot_read() {
+        let db = Database::default();
+        for namespace in ["feeds/ips", "private/ips"] {
+            db.write(namespace, "1.2.3.4", at(100), consensus());
+        }
+
+        let found = db.sightings_of("1.2.3.4", 100, |name| name.starts_with("feeds"));
+        assert_eq!(found.items.len(), 1);
+        assert_eq!(found.items[0].namespace, "feeds/ips");
+    }
+
+    #[test]
+    fn a_value_in_too_many_namespaces_is_cut_off() {
+        let db = Database::default();
+        for i in 0..5 {
+            db.write(&format!("feeds/{i}"), "1.2.3.4", at(100), consensus());
+        }
+
+        let found = db.sightings_of("1.2.3.4", 2, |_| true);
+        assert_eq!(found.items.len(), 2);
+        assert!(found.truncated);
     }
 
     #[test]
@@ -1627,6 +2050,47 @@ mod tests {
             2,
             "the earlier sighting was lost"
         );
+    }
+
+    /// A new namespace in an evicted shard must not make the shard look
+    /// resident while the rest of it is still on disk: everything else in it
+    /// would read as missing, and the next snapshot would write the shard back
+    /// without it.
+    #[test]
+    fn creating_a_namespace_in_an_evicted_shard_brings_the_shard_back() {
+        let dir = Scratch::new("createevicted");
+        let db = tiered(&dir.0, crate::tier::Tier::Cold);
+        db.write("myorg/ns", "v", at(1000), consensus());
+        db.evict_idle(now_secs());
+        assert!(!db.is_shard_resident("myorg"));
+
+        assert!(db.create_namespace("myorg/second"));
+
+        assert_eq!(
+            db.count("myorg/ns", "v"),
+            1,
+            "the evicted namespace was lost"
+        );
+        assert!(db.namespace_exists("myorg/second"));
+    }
+
+    /// The same hazard reached through an ordinary write rather than through
+    /// the management interface.
+    #[test]
+    fn writing_a_new_namespace_into_an_evicted_shard_keeps_the_rest_of_it() {
+        let dir = Scratch::new("writeevicted");
+        let db = tiered(&dir.0, crate::tier::Tier::Cold);
+        db.write("myorg/ns", "v", at(1000), consensus());
+        db.evict_idle(now_secs());
+
+        db.write("myorg/second", "v", at(2000), consensus());
+
+        assert_eq!(
+            db.count("myorg/ns", "v"),
+            1,
+            "the evicted namespace was lost"
+        );
+        assert_eq!(db.count("myorg/second", "v"), 1);
     }
 
     #[test]

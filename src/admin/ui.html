@@ -38,12 +38,18 @@
   .muted { color: var(--muted); }
   .err { color: var(--danger); }
   .crumbs { font-family: var(--mono); font-size: .9rem; }
+  .crumbs a { text-decoration: none; }
+  .crumbs a:hover { text-decoration: underline; }
+  textarea { font: inherit; padding: .35rem .6rem; border: 1px solid var(--line);
+             border-radius: 6px; background: var(--bg); color: var(--fg); }
+  .kind { color: var(--muted); font-size: .85rem; }
   .cards { display: grid; gap: .6rem; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
   .card { border: 1px solid var(--line); border-radius: 8px; padding: .6rem .8rem; background: var(--panel); }
   .card h3 { margin: 0 0 .3rem; font-size: .8rem; text-transform: uppercase;
              letter-spacing: .04em; color: var(--muted); }
   .card p { margin: 0; font-family: var(--mono); word-break: break-all; }
   #chart { width: 100%; height: 320px; }
+  #graph { width: 100%; height: 420px; }
   .scroll { overflow-x: auto; }
   dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
            color: var(--fg); padding: 1.2rem; max-width: 420px; }
@@ -82,32 +88,42 @@
 <main>
   <div id="error" class="err"></div>
 
-  <!-- Namespace list -->
+  <!-- One level of the namespace tree -->
   <section id="view-namespaces">
     <div class="row">
-      <input id="ns-filter" placeholder="Filter namespaces" size="30">
+      <button id="ns-up" title="Up one level">↑ Up</button>
+      <input id="ns-filter" placeholder="Filter this level" size="24">
+      <label class="muted" style="display:flex;gap:.3rem;align-items:center">
+        <input type="checkbox" id="ns-deep"> search everywhere
+      </label>
       <span class="muted" id="ns-count"></span>
       <span class="spacer"></span>
+      <button id="ns-new">New namespace</button>
+      <button id="ns-add">Add values</button>
       <button id="ns-prev">Previous</button>
       <button id="ns-next">Next</button>
     </div>
     <div class="scroll"><table>
       <thead><tr>
-        <th>Namespace</th><th>In memory</th><th>Tier</th>
+        <th>Name</th><th>Holds</th><th>In memory</th><th>Tier</th>
       </tr></thead>
       <tbody id="ns-rows"></tbody>
     </table></div>
-    <p class="muted">A tier applies to the whole top-level namespace, so changing
-       it for <code>myorg/one</code> changes <code>myorg</code> and everything
-       under it. <b>hot</b> stays in memory; <b>warm</b> is dropped once
-       untouched for the configured window; <b>cold</b> is dropped at the next
-       sweep. Evicted data is read back automatically when it is next used.</p>
+    <p class="muted" id="ns-empty"></p>
+    <p class="muted">A namespace is a path, so <code>feeds/misp/ips</code> browses
+       like folders: <b>folder</b> means other namespaces sit underneath it,
+       <b>namespace</b> means it holds values of its own, and a path can be both.
+       A tier applies to the whole top-level namespace, so changing it for
+       <code>myorg/one</code> changes <code>myorg</code> and everything under it.
+       <b>hot</b> stays in memory; <b>warm</b> is dropped once untouched for the
+       configured window; <b>cold</b> is dropped at the next sweep. Evicted data
+       is read back automatically when it is next used.</p>
   </section>
 
-  <!-- Values within one namespace -->
+  <!-- Values held by the namespace being browsed -->
   <section id="view-values" class="hidden">
+    <h3 id="v-title">Values</h3>
     <div class="row">
-      <button id="v-back">← Namespaces</button>
       <input id="v-filter" placeholder="Filter values" size="30">
       <span class="muted" id="v-count"></span>
       <span class="spacer"></span>
@@ -121,6 +137,7 @@
       </tr></thead>
       <tbody id="v-rows"></tbody>
     </table></div>
+    <p class="muted" id="v-empty"></p>
   </section>
 
   <!-- API keys -->
@@ -149,13 +166,21 @@
   <!-- One value, with its histogram -->
   <section id="view-value" class="hidden">
     <div class="row">
-      <button id="d-back">← Values</button>
+      <button id="d-back">← Back</button>
       <strong class="crumbs" id="d-value"></strong>
     </div>
     <div class="cards" id="d-cards"></div>
     <h3>Sightings over time</h3>
     <p class="muted" id="d-nostats"></p>
     <div id="chart"></div>
+    <h3>Where else this value has been seen</h3>
+    <p class="muted" id="d-relations"></p>
+    <div id="graph"></div>
+    <p class="muted">Each namespace holding this value is joined to it; the
+       folders above them are drawn too, so namespaces sharing a path sit
+       together. Colour is the top-level namespace, ◆ is the value itself,
+       ▭ a folder and ● a namespace. Drag a node to pull the graph about,
+       scroll to zoom, and click a namespace to browse it.</p>
   </section>
 </main>
 
@@ -167,6 +192,56 @@
     <p><input id="key" type="password" placeholder="API key" size="32" autofocus></p>
     <p class="err" id="login-error"></p>
     <button type="submit">Sign in</button>
+  </form>
+</dialog>
+
+<dialog id="ns-editor">
+  <form method="dialog" id="ns-form">
+    <h2 style="margin-top:0;font-size:1.05rem">New namespace</h2>
+    <p class="muted" id="nn-where"></p>
+    <p><input id="nn-name" type="text" placeholder="name" size="32" autofocus></p>
+    <p class="muted">Use <code>/</code> for subfolders: <code>misp/ips</code>
+       creates the whole path at once. It starts out empty; add values to it
+       whenever you like.</p>
+    <p class="crumbs" id="nn-preview"></p>
+    <p class="err" id="nn-error"></p>
+    <div class="row">
+      <button type="submit">Create</button>
+      <button type="button" id="nn-cancel">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="value-editor" class="wide">
+  <form method="dialog" id="value-form">
+    <h2 style="margin-top:0;font-size:1.05rem">Add values</h2>
+
+    <p><label class="muted">Namespace<br>
+      <input id="av-namespace" type="text" size="42" placeholder="feeds/misp/ips">
+    </label></p>
+
+    <p><label class="muted">Values, one per line<br>
+      <textarea id="av-values" rows="8" style="width:100%;font-family:var(--mono)"
+                placeholder="8.8.8.8&#10;1.1.1.1"></textarea>
+    </label></p>
+
+    <div class="row">
+      <label class="muted">TTL in seconds
+        <input id="av-ttl" type="number" min="0" step="1" size="8" placeholder="none">
+      </label>
+      <label class="muted">Seen at
+        <input id="av-when" type="datetime-local">
+      </label>
+    </div>
+    <p class="muted">Leave the TTL blank to keep whatever expiry a value already
+       had, or set 0 to clear it. Leave the time blank to record the values as
+       seen now. Writing a namespace that does not exist creates it.</p>
+
+    <p class="err" id="av-error"></p>
+    <div class="row">
+      <button type="submit" id="av-save">Add</button>
+      <button type="button" id="av-cancel">Cancel</button>
+    </div>
   </form>
 </dialog>
 
@@ -214,18 +289,19 @@
 const PAGE = 50;
 const state = {
   key: sessionStorage.getItem("sightingdb.key") || "",
+  // The path being browsed. It is a folder and a namespace at the same time:
+  // `feeds` may hold values of its own and still have `feeds/ips` under it.
   namespace: null,
   keys: [], editing: null,
   nsOffset: 0, nsTotal: 0,
   vOffset: 0, vTotal: 0,
-  chart: null,
+  chart: null, graph: null,
 };
 
+const VIEWS = ["view-namespaces", "view-values", "view-value", "view-keys", "view-config"];
 const $ = (id) => document.getElementById(id);
-const show = (id) => {
-  for (const v of ["view-namespaces", "view-values", "view-value", "view-keys", "view-config"]) {
-    $(v).classList.toggle("hidden", v !== id);
-  }
+const show = (...ids) => {
+  for (const v of VIEWS) $(v).classList.toggle("hidden", !ids.includes(v));
 };
 const fmtTime = (unix) =>
   !unix ? "—" : new Date(unix * 1000).toISOString().replace("T", " ").replace(".000Z", "Z");
@@ -246,7 +322,12 @@ async function api(path, method = "GET", body) {
   }
   if (!res.ok) {
     const failure = await res.json().catch(() => ({}));
-    throw new Error(failure.message || `${res.status} ${res.statusText}`);
+    // The status is carried along: a namespace that holds no values of its own
+    // answers 404, which is a fact about the path rather than an error to show.
+    const error = new Error(failure.message || `${res.status} ${res.statusText}`);
+    error.status = res.status;
+    error.body = failure;
+    throw error;
   }
   return res.json();
 }
@@ -261,8 +342,11 @@ function namespaceFromPath() {
 }
 
 function go(namespace, push = true) {
-  state.namespace = namespace;
+  state.namespace = namespace || null;
   state.vOffset = 0;
+  state.nsOffset = 0;
+  $("ns-filter").value = "";
+  $("v-filter").value = "";
   if (push) {
     const url = namespace ? `/_management/${namespace}` : "/_management/";
     history.pushState({ namespace }, "", url);
@@ -277,60 +361,150 @@ window.addEventListener("popstate", () => {
 
 function render() {
   setError("");
-  $("crumbs").textContent = state.namespace ? `/${state.namespace}` : "";
-  if (state.namespace) { loadValues(); } else { loadNamespaces(); }
+  drawCrumbs();
+  $("ns-up").disabled = !state.namespace;
+  // A path shows what is under it and what it holds at once, so both tables
+  // are on screen together; the root has no values of its own to show.
+  show(...(state.namespace ? ["view-namespaces", "view-values"] : ["view-namespaces"]));
+  loadListing();
+  if (state.namespace) loadValues();
+}
+
+/** Each segment of the path is a link back to that level. */
+function drawCrumbs() {
+  const crumbs = $("crumbs");
+  crumbs.replaceChildren();
+
+  const root = document.createElement("a");
+  root.href = "/_management/";
+  root.textContent = "/";
+  root.onclick = (e) => { e.preventDefault(); go(null); };
+  crumbs.append(root);
+
+  if (!state.namespace) return;
+  const segments = state.namespace.split("/").filter(Boolean);
+  segments.forEach((segment, i) => {
+    const path = segments.slice(0, i + 1).join("/");
+    const a = document.createElement("a");
+    a.href = `/_management/${path}`;
+    a.textContent = segment;
+    a.onclick = (e) => { e.preventDefault(); go(path); };
+    crumbs.append(a, i < segments.length - 1 ? "/" : "");
+  });
+}
+
+/** The parent path, or null at the top. */
+function parentOf(namespace) {
+  const segments = (namespace || "").split("/").filter(Boolean);
+  segments.pop();
+  return segments.length ? segments.join("/") : null;
 }
 
 // --- namespaces ------------------------------------------------------------
 
-async function loadNamespaces() {
-  show("view-namespaces");
+/** Browsing walks one level at a time; searching everywhere is a flat list. */
+function searching() {
+  return $("ns-deep").checked && $("ns-filter").value.trim() !== "";
+}
+
+function loadListing() {
+  return searching() ? loadSearch() : loadTree();
+}
+
+async function loadTree() {
   try {
+    const path = encodeURIComponent(state.namespace || "");
     const q = encodeURIComponent($("ns-filter").value.trim());
-    const page = await api(`/_management/api/namespaces?q=${q}&offset=${state.nsOffset}&limit=${PAGE}`);
+    const page = await api(
+      `/_management/api/tree?path=${path}&q=${q}&offset=${state.nsOffset}&limit=${PAGE}`);
     state.nsTotal = page.total;
 
     $("ns-rows").replaceChildren(...page.items.map((item) => {
-      const tr = document.createElement("tr");
-
-      const name = document.createElement("td");
-      name.className = "n";
-      const a = document.createElement("a");
-      a.href = `/_management/${item.namespace}`;
-      a.textContent = item.namespace;
-      a.onclick = (e) => { e.preventDefault(); go(item.namespace); };
-      name.append(a);
-
-      const resident = document.createElement("td");
-      resident.textContent = item.resident ? "yes" : "on disk";
-      if (!item.resident) resident.className = "muted";
-
-      // The tier belongs to the top-level namespace, so the control is
-      // labelled with the shard it will actually change.
-      const tier = document.createElement("td");
-      const select = document.createElement("select");
-      for (const option of ["hot", "warm", "cold"]) {
-        const o = document.createElement("option");
-        o.value = o.textContent = option;
-        o.selected = option === item.tier;
-        select.append(o);
-      }
-      select.title = `applies to ${item.shard}`;
-      select.onchange = () => setTier(item.shard, select.value, select);
-      const shard = document.createElement("span");
-      shard.className = "muted";
-      shard.textContent = ` ${item.shard}`;
-      tier.append(select, shard);
-
-      tr.append(name, resident, tier);
-      return tr;
+      // A folder is named by its segment; what it holds says whether there is
+      // anything under it, values in it, or both.
+      const holds = [];
+      if (item.namespace) holds.push("namespace");
+      if (item.descendants) holds.push(`${item.descendants} below`);
+      return namespaceRow(item, item.name + (item.descendants ? "/" : ""),
+                          holds.join(", ") || "folder", item.path);
     }));
 
-    const from = page.total ? page.offset + 1 : 0;
-    $("ns-count").textContent = `${from}–${page.offset + page.items.length} of ${page.total}`;
-    $("ns-prev").disabled = page.offset === 0;
-    $("ns-next").disabled = page.offset + page.items.length >= page.total;
+    $("ns-empty").textContent = page.total ? "" : (
+      $("ns-filter").value.trim()
+        ? "Nothing here matches that filter."
+        : state.namespace
+          ? "Nothing below this namespace."
+          : "No namespaces yet. Create one, or write a sighting to /w/<namespace>.");
+
+    paging("ns", page);
   } catch (e) { setError(e.message); }
+}
+
+/** The flat search: whole namespace names, wherever they are. */
+async function loadSearch() {
+  try {
+    const q = encodeURIComponent($("ns-filter").value.trim());
+    const page = await api(
+      `/_management/api/namespaces?q=${q}&offset=${state.nsOffset}&limit=${PAGE}`);
+    state.nsTotal = page.total;
+
+    $("ns-rows").replaceChildren(...page.items.map((item) =>
+      namespaceRow(item, item.namespace, "namespace", item.namespace)));
+
+    $("ns-empty").textContent = page.total ? "" : "No namespace matches that.";
+    paging("ns", page);
+  } catch (e) { setError(e.message); }
+}
+
+/**
+ * One row of the listing. The tier belongs to the top-level namespace, so the
+ * control is labelled with the shard it will actually change.
+ */
+function namespaceRow(item, label, holds, path) {
+  const tr = document.createElement("tr");
+
+  const name = document.createElement("td");
+  name.className = "n";
+  const a = document.createElement("a");
+  a.href = `/_management/${path}`;
+  a.textContent = label;
+  a.onclick = (e) => { e.preventDefault(); go(path); };
+  name.append(a);
+
+  const kind = document.createElement("td");
+  kind.className = "kind";
+  kind.textContent = holds;
+
+  const resident = document.createElement("td");
+  resident.textContent = item.resident ? "yes" : "on disk";
+  if (!item.resident) resident.className = "muted";
+
+  const tier = document.createElement("td");
+  const select = document.createElement("select");
+  for (const option of ["hot", "warm", "cold"]) {
+    const o = document.createElement("option");
+    o.value = o.textContent = option;
+    o.selected = option === item.tier;
+    select.append(o);
+  }
+  select.title = `applies to ${item.shard}`;
+  select.onchange = () => setTier(item.shard, select.value, select);
+  const shard = document.createElement("span");
+  shard.className = "muted";
+  shard.textContent = ` ${item.shard}`;
+  tier.append(select, shard);
+
+  tr.append(name, kind, resident, tier);
+  return tr;
+}
+
+/** Shared by both listings and by the value table. */
+function paging(prefix, page) {
+  const from = page.total ? page.offset + 1 : 0;
+  $(`${prefix}-count`).textContent =
+    `${from}\u2013${page.offset + page.items.length} of ${page.total}`;
+  $(`${prefix}-prev`).disabled = page.offset === 0;
+  $(`${prefix}-next`).disabled = page.offset + page.items.length >= page.total;
 }
 
 /**
@@ -341,18 +515,104 @@ async function setTier(shard, tier, control) {
   control.disabled = true;
   try {
     await api("/_management/api/tier", "POST", { shard, tier });
-    await loadNamespaces();
+    await loadListing();
   } catch (e) {
     setError(e.message);
     control.disabled = false;
-    loadNamespaces();
+    loadListing();
+  }
+}
+
+// --- creating namespaces and adding values ---------------------------------
+
+function openNamespaceEditor() {
+  $("nn-name").value = "";
+  $("nn-error").textContent = "";
+  $("nn-where").textContent = state.namespace
+    ? `Created under /${state.namespace}.`
+    : "Created at the top level.";
+  previewNamespace();
+  $("ns-editor").showModal();
+}
+
+/** Shows the full path as it is typed, so a slash is never a surprise. */
+function previewNamespace() {
+  const name = $("nn-name").value.trim().replace(/^\/+|\/+$/g, "");
+  const path = [state.namespace, name].filter(Boolean).join("/");
+  $("nn-preview").textContent = path ? `/${path}` : "";
+}
+
+async function createNamespace() {
+  const name = $("nn-name").value.trim();
+  const namespace = [state.namespace, name].filter(Boolean).join("/");
+  try {
+    const created = await api("/_management/api/namespaces", "POST", { namespace });
+    $("ns-editor").close();
+    // Straight into it, the way a file manager opens a folder it just made.
+    go(created.namespace);
+  } catch (e) {
+    // Kept open so a rejected name can be corrected rather than retyped.
+    $("nn-error").textContent = e.message;
+  }
+}
+
+function openValueEditor() {
+  $("av-namespace").value = state.namespace || "";
+  $("av-values").value = "";
+  $("av-ttl").value = "";
+  $("av-when").value = "";
+  $("av-error").textContent = "";
+  $("value-editor").showModal();
+}
+
+async function addValues() {
+  const namespace = $("av-namespace").value.trim();
+  const values = $("av-values").value.split(/\r?\n/);
+  const body = { namespace, values };
+
+  const ttl = $("av-ttl").value.trim();
+  if (ttl !== "") body.ttl = Number(ttl);
+  // The picker works in local time; the server counts in Unix seconds.
+  const when = $("av-when").value;
+  if (when) {
+    const parsed = Date.parse(when);
+    if (Number.isNaN(parsed)) {
+      $("av-error").textContent = "That is not a time I can read.";
+      return;
+    }
+    body.timestamp = Math.floor(parsed / 1000);
+  }
+
+  $("av-save").disabled = true;
+  try {
+    const report = await api("/_management/api/values", "POST", body);
+    $("value-editor").close();
+    if (report.namespace === state.namespace) {
+      state.vOffset = 0;
+      loadValues();
+      loadListing();
+    } else {
+      go(report.namespace);
+    }
+    // A partial success is worth saying out loud: the rest did land.
+    setError(report.errors && report.errors.length
+      ? `Added ${report.written}; ${report.errors.length} rejected — ` +
+        report.errors.slice(0, 3).map((e) => `"${e.value}": ${e.error}`).join("; ")
+      : "");
+  } catch (e) {
+    const rejected = (e.body && e.body.errors) || [];
+    $("av-error").textContent = rejected.length
+      ? rejected.slice(0, 3).map((r) => `"${r.value}": ${r.error}`).join("; ")
+      : e.message;
+  } finally {
+    $("av-save").disabled = false;
   }
 }
 
 // --- values ----------------------------------------------------------------
 
 async function loadValues() {
-  show("view-values");
+  $("v-title").textContent = `Values in /${state.namespace}`;
   try {
     const ns = encodeURIComponent(state.namespace);
     const q = encodeURIComponent($("v-filter").value.trim());
@@ -387,17 +647,30 @@ async function loadValues() {
       return tr;
     }));
 
-    const from = page.total ? page.offset + 1 : 0;
-    $("v-count").textContent = `${from}–${page.offset + page.items.length} of ${page.total}`;
-    $("v-prev").disabled = page.offset === 0;
-    $("v-next").disabled = page.offset + page.items.length >= page.total;
-  } catch (e) { setError(e.message); }
+    $("v-empty").textContent = page.total ? "" : (
+      $("v-filter").value.trim() ? "No value here matches that filter."
+                                 : "This namespace holds no values yet.");
+    paging("v", page);
+  } catch (e) {
+    // 404 means the path is a folder above other namespaces without being one
+    // itself, which is a normal thing to be, not a failure.
+    if (e.status === 404) {
+      $("v-rows").replaceChildren();
+      $("v-count").textContent = "";
+      $("v-empty").textContent =
+        "Nothing is stored at this path itself — it only holds other namespaces.";
+      $("v-prev").disabled = $("v-next").disabled = true;
+      return;
+    }
+    setError(e.message);
+  }
 }
 
 // --- one value, with the histogram ----------------------------------------
 
 async function loadValue(value) {
   show("view-value");
+  setError("");
   $("d-value").textContent = value;
   try {
     const ns = encodeURIComponent(state.namespace);
@@ -424,8 +697,174 @@ async function loadValue(value) {
     }));
 
     drawHistogram(item.stats || {});
+    loadRelations(value);
   } catch (e) { setError(e.message); }
 }
+
+/**
+ * A value usually lives in more than one namespace — that is what consensus
+ * counts — and which ones they are says more than the number does.
+ */
+async function loadRelations(value) {
+  try {
+    const found = await api(`/_management/api/sightings?value=${encodeURIComponent(value)}`);
+
+    const shown = found.items.length;
+    const notes = [`Seen in ${shown} namespace(s)`];
+    // Consensus counts every namespace, including ones this key cannot read,
+    // so the difference is worth naming rather than quietly dropping.
+    if (found.consensus > shown) {
+      notes.push(`${found.consensus - shown} more hold it that this key cannot read`);
+    }
+    if (found.truncated) notes.push("more were found than are drawn");
+    $("d-relations").textContent = notes.join(" — ") + ".";
+
+    drawRelations(value, found.items);
+  } catch (e) { setError(e.message); }
+}
+
+/**
+ * The graph is the value in the middle, every namespace holding it around the
+ * outside, and the folders in between, so `feeds/misp/ips` and
+ * `feeds/misp/domains` visibly hang off the same branch. Colour is the
+ * top-level namespace and shape is what a node is.
+ */
+function drawRelations(value, items) {
+  if (!state.graph) state.graph = echarts.init($("graph"), null, { renderer: "canvas" });
+  if (!items.length) { state.graph.clear(); return; }
+
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const fg = dark ? "#e6e9ec" : "#1b1f24";
+  const accent = dark ? "#6f9dff" : "#0b5fff";
+
+  // One category per top-level namespace, which is what gives each branch its
+  // colour and the legend its entries.
+  const categories = [{ name: "this value" }];
+  const categoryOf = new Map();
+  for (const item of items) {
+    if (!categoryOf.has(item.shard)) {
+      categoryOf.set(item.shard, categories.length);
+      categories.push({ name: item.shard });
+    }
+  }
+
+  const nodes = new Map();
+  const links = [];
+  const node = (id, extra) => {
+    if (!nodes.has(id)) nodes.set(id, { id, ...extra });
+    return nodes.get(id);
+  };
+
+  node("\u0000value", {
+    name: value.length > 40 ? `${value.slice(0, 39)}…` : value,
+    category: 0,
+    symbol: "diamond",
+    symbolSize: 46,
+    label: { fontWeight: "bold" },
+    kind: "value",
+  });
+
+  const counts = items.map((item) => item.count);
+  const busiest = Math.max(...counts, 1);
+  for (const item of items) {
+    const segments = item.namespace.split("/").filter(Boolean);
+    const category = categoryOf.get(item.shard);
+
+    // The folders on the way down, each linked to the one above it.
+    let parent = null;
+    for (let i = 0; i < segments.length; i++) {
+      const path = segments.slice(0, i + 1).join("/");
+      const leaf = i === segments.length - 1;
+      const existing = nodes.get(path);
+      if (!existing || (leaf && existing.kind === "folder")) {
+        // Sized by how often the value was seen there, so a busy namespace
+        // stands out; folders stay small.
+        const size = leaf ? 18 + 26 * (item.count / busiest) : 14;
+        nodes.set(path, {
+          id: path,
+          name: segments[i],
+          category,
+          symbol: leaf ? "circle" : "roundRect",
+          symbolSize: size,
+          kind: leaf ? "namespace" : "folder",
+          path,
+          count: leaf ? item.count : undefined,
+          first_seen: leaf ? item.first_seen : undefined,
+          last_seen: leaf ? item.last_seen : undefined,
+          // The namespace we came from is worth spotting in the crowd.
+          itemStyle: leaf && path === state.namespace
+            ? { borderColor: accent, borderWidth: 3 }
+            : undefined,
+        });
+      }
+      if (parent) links.push({ source: parent, target: path, kind: "path" });
+      parent = path;
+    }
+
+    // And the value itself, joined to the namespace holding it.
+    links.push({
+      source: "\u0000value",
+      target: item.namespace,
+      kind: "sighting",
+      lineStyle: { type: "dashed", opacity: 0.65 },
+    });
+  }
+
+  // Two branches can end in the same segment — `feeds/misp/ips` and
+  // `feeds/otx/ips` are both "ips" — so those are labelled with the whole path
+  // rather than left ambiguous.
+  const seenNames = new Map();
+  for (const n of nodes.values()) {
+    seenNames.set(n.name, (seenNames.get(n.name) || 0) + 1);
+  }
+  for (const n of nodes.values()) {
+    if (n.path && seenNames.get(n.name) > 1) n.name = n.path;
+  }
+
+  state.graph.setOption({
+    backgroundColor: "transparent",
+    textStyle: { color: fg },
+    legend: [{ data: categories.map((c) => c.name), textStyle: { color: fg }, top: 0 }],
+    tooltip: {
+      formatter: (p) => {
+        if (p.dataType === "edge") return "";
+        const d = p.data;
+        if (d.kind === "value") return `<b>${escapeHtml(value)}</b>`;
+        if (d.kind === "folder") return `${escapeHtml(d.path)}<br>folder`;
+        return `${escapeHtml(d.path)}<br><b>${d.count}</b> sighting(s)<br>` +
+               `first ${fmtTime(d.first_seen)}<br>last ${fmtTime(d.last_seen)}`;
+      },
+    },
+    series: [{
+      type: "graph",
+      layout: "force",
+      roam: true,
+      draggable: true,
+      categories,
+      data: [...nodes.values()],
+      links,
+      // Long enough that labels do not collide, tight enough that a branch
+      // still reads as one cluster.
+      force: { repulsion: 320, edgeLength: [70, 160], gravity: 0.08, friction: 0.2 },
+      emphasis: { focus: "adjacency", scale: 1.1, label: { fontWeight: "bold" } },
+      label: { show: true, position: "right", color: fg, formatter: (p) => p.data.name },
+      labelLayout: { hideOverlap: true },
+      lineStyle: { color: "source", width: 1.5, curveness: 0.05, opacity: 0.8 },
+      scaleLimit: { min: 0.4, max: 4 },
+    }],
+  }, true);
+  state.graph.resize();
+
+  state.graph.off("click");
+  state.graph.on("click", (p) => {
+    // Folders and namespaces are both places to browse to; the value is not.
+    if (p.dataType === "node" && p.data.path) go(p.data.path);
+  });
+}
+
+const escapeHtml = (text) =>
+  String(text).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 
 /**
  * The server buckets sightings by hour, so the histogram is those buckets
@@ -480,7 +919,10 @@ function drawHistogram(stats) {
   state.chart.resize();
 }
 
-addEventListener("resize", () => state.chart && state.chart.resize());
+addEventListener("resize", () => {
+  if (state.chart) state.chart.resize();
+  if (state.graph) state.graph.resize();
+});
 
 // --- keys ------------------------------------------------------------------
 
@@ -512,7 +954,6 @@ function chips(prefixes) {
 }
 
 async function loadKeys() {
-  show("view-keys");
   try {
     const keys = await api("/_management/api/keys");
     state.keys = keys;
@@ -698,9 +1139,17 @@ $("login-form").addEventListener("submit", async () => {
 });
 
 $("signout").onclick = () => signOut("");
-$("nav-browse").onclick = () => go(null);
-$("nav-keys").onclick = () => { setError(""); loadKeys(); };
+$("nav-browse").onclick = () => render();
+$("nav-keys").onclick = () => { setError(""); show("view-keys"); loadKeys(); };
 $("nav-config").onclick = showConfig;
+$("ns-up").onclick = () => go(parentOf(state.namespace));
+$("ns-new").onclick = openNamespaceEditor;
+$("ns-add").onclick = openValueEditor;
+$("nn-cancel").onclick = () => $("ns-editor").close();
+$("nn-name").addEventListener("input", previewNamespace);
+$("ns-form").addEventListener("submit", (e) => { e.preventDefault(); createNamespace(); });
+$("av-cancel").onclick = () => $("value-editor").close();
+$("value-form").addEventListener("submit", (e) => { e.preventDefault(); addValues(); });
 $("k-new").onclick = () => openKeyEditor(null);
 $("ke-add").onclick = () => addGrantRow();
 $("ke-cancel").onclick = () => $("key-editor").close();
@@ -711,10 +1160,9 @@ $("ke-generate").onclick = async () => {
     $("ke-key").value = key;
   } catch (e) { $("ke-error").textContent = e.message; }
 };
-$("v-back").onclick = () => go(null);
-$("d-back").onclick = () => { show("view-values"); };
-$("ns-prev").onclick = () => { state.nsOffset = Math.max(0, state.nsOffset - PAGE); loadNamespaces(); };
-$("ns-next").onclick = () => { state.nsOffset += PAGE; loadNamespaces(); };
+$("d-back").onclick = () => render();
+$("ns-prev").onclick = () => { state.nsOffset = Math.max(0, state.nsOffset - PAGE); loadListing(); };
+$("ns-next").onclick = () => { state.nsOffset += PAGE; loadListing(); };
 $("v-prev").onclick = () => { state.vOffset = Math.max(0, state.vOffset - PAGE); loadValues(); };
 $("v-next").onclick = () => { state.vOffset += PAGE; loadValues(); };
 
@@ -723,7 +1171,8 @@ const refilter = (fn, reset) => () => {
   clearTimeout(debounce);
   debounce = setTimeout(() => { reset(); fn(); }, 200);
 };
-$("ns-filter").addEventListener("input", refilter(loadNamespaces, () => state.nsOffset = 0));
+$("ns-filter").addEventListener("input", refilter(loadListing, () => state.nsOffset = 0));
+$("ns-deep").addEventListener("change", () => { state.nsOffset = 0; loadListing(); });
 $("v-filter").addEventListener("input", refilter(loadValues, () => state.vOffset = 0));
 
 if (state.key) { start(); } else { $("login").showModal(); }

@@ -1,7 +1,10 @@
 //! The admin interface served at `/_management/`.
 //!
-//! This is a read-only browser over the database plus a view of what the
-//! server is configured to do.
+//! This is a browser over the database — namespaces as folders, the values
+//! inside them, and what each value has been seen doing — plus a view of what
+//! the server is configured to do. Namespaces can be created and values added
+//! from it; the configuration itself is read-only, since it comes from a file
+//! read at startup.
 //!
 //! It is deliberately *not* served under `_config`, even though there would be
 //! no routing conflict: `_config` already names the database namespace holding
@@ -66,6 +69,64 @@ impl ValuesQuery {
     }
 }
 
+/// One level of the namespace tree, as the browser walks it.
+#[derive(Debug, Deserialize)]
+pub struct TreeQuery {
+    /// The folder being opened. Empty is the root.
+    #[serde(default)]
+    path: String,
+    /// Substring filter over the child names at this level, case-insensitive.
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+impl TreeQuery {
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+    }
+}
+
+/// A namespace to create, which may name a whole path at once.
+#[derive(Debug, Deserialize)]
+pub struct NewNamespace {
+    namespace: String,
+}
+
+/// Values to record, one namespace at a time.
+///
+/// A single value and a bulk paste are the same request with a list of one:
+/// the interface has one code path, and so does this.
+#[derive(Debug, Deserialize)]
+pub struct NewValues {
+    namespace: String,
+    values: Vec<String>,
+    /// Unix seconds. Absent means "now", as on the write API.
+    #[serde(default)]
+    timestamp: Option<i64>,
+    /// Absent leaves whatever TTL an existing value had; 0 clears it.
+    #[serde(default)]
+    ttl: Option<u64>,
+}
+
+/// What a create or an add did, per value, so a paste of a thousand lines can
+/// report the eight that were rejected without losing the rest.
+#[derive(Debug, Serialize)]
+pub struct WriteReport {
+    namespace: String,
+    written: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<ValueError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValueError {
+    value: String,
+    error: String,
+}
+
 /// A tier change from the interface.
 #[derive(Debug, Deserialize)]
 pub struct TierChange {
@@ -78,6 +139,21 @@ pub struct TierChange {
 pub struct ValueQuery {
     namespace: String,
     value: String,
+}
+
+/// Where one value has been seen, for the relationship graph.
+#[derive(Debug, Deserialize)]
+pub struct SightingsQuery {
+    value: String,
+    limit: Option<usize>,
+}
+
+impl SightingsQuery {
+    /// A graph is read by eye, so the cap is what stays legible rather than
+    /// what the server could serialize.
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(200).clamp(1, MAX_LIMIT)
+    }
 }
 
 /// What the server is doing, for the configuration view.
@@ -233,6 +309,47 @@ fn require_read(state: &SharedState, key: &str, namespace: &str) -> Result<(), H
     }
 }
 
+/// The same rule as [`require_read`], for the paths that change data: an
+/// `admin, r:feeds` key browses `feeds/*` but does not add to it.
+///
+/// Unlike the sighting API this does not care whether `authenticate` is off.
+/// That setting is about the sighting API; the management interface has always
+/// demanded a key, and a key that says what it may write is the only thing
+/// that makes an admin grant safe to hand out.
+fn require_write(state: &SharedState, key: &str, namespace: &str) -> Result<(), HttpResponse> {
+    if state.acl().can_write(key, namespace) {
+        Ok(())
+    } else {
+        Err(HttpResponse::Forbidden().json(Message::new(format!(
+            "That key is not permitted to write to '{namespace}'."
+        ))))
+    }
+}
+
+/// Tidy a namespace typed by a person into the name the database will store.
+///
+/// Browsing is by path segment, so stray or doubled slashes would otherwise
+/// create a namespace that looks like a folder someone already made but sorts
+/// and links as something else.
+fn clean_namespace(namespace: &str) -> Result<String, HttpResponse> {
+    let cleaned = namespace
+        .split('/')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    if cleaned.is_empty() {
+        return Err(HttpResponse::BadRequest().json(Message::new("A namespace needs a name.")));
+    }
+    // The same rules as an ACL prefix, so that anything created here can also
+    // be granted to a key later.
+    if let Err(e) = validate_namespace(&cleaned) {
+        return Err(HttpResponse::BadRequest().json(Message::new(e.to_string())));
+    }
+    Ok(cleaned)
+}
+
 pub async fn index() -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
@@ -309,6 +426,136 @@ pub async fn values(
     }
 }
 
+/// One level of the namespace tree, so the interface can browse namespaces the
+/// way a file manager browses directories.
+pub async fn tree(state: State, query: web::Query<TreeQuery>, req: HttpRequest) -> HttpResponse {
+    let key = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    let acl = state.acl();
+    let page =
+        state
+            .db
+            .namespace_children(&query.path, &query.q, query.offset, query.limit(), |name| {
+                acl.can_read(&key, name)
+            });
+    drop(acl);
+    HttpResponse::Ok().json(page)
+}
+
+/// Create a namespace that holds nothing yet.
+///
+/// Nothing else in SightingDB needs this — writing a value brings its namespace
+/// into being — but a browser wants somewhere to put things before it has them,
+/// and a folder made in advance is how anyone expects that to work.
+pub async fn create_namespace(
+    state: State,
+    body: web::Json<NewNamespace>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    let namespace = match clean_namespace(&body.namespace) {
+        Ok(namespace) => namespace,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_write(&state, &caller, &namespace) {
+        return resp;
+    }
+
+    if !state.db.create_namespace(&namespace) {
+        return HttpResponse::Conflict()
+            .json(Message::new(format!("'{namespace}' already exists.")));
+    }
+
+    log::info!("Namespace '{namespace}' created by '{caller}'");
+    HttpResponse::Ok().json(serde_json::json!({ "namespace": namespace }))
+}
+
+/// Record one value or a pasted list of them, in one namespace.
+///
+/// The namespace does not have to exist: writing is what creates it, here as
+/// everywhere else. Values are counted towards consensus exactly as a `/w/`
+/// write would be, so nothing added here is a second class of sighting.
+pub async fn add_values(
+    state: State,
+    body: web::Json<NewValues>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    let body = body.into_inner();
+    let namespace = match clean_namespace(&body.namespace) {
+        Ok(namespace) => namespace,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_write(&state, &caller, &namespace) {
+        return resp;
+    }
+
+    let when = match body
+        .timestamp
+        .map(crate::sighting_writer::timestamp_to_instant)
+    {
+        Some(Ok(when)) => Some(when),
+        Some(Err(e)) => return HttpResponse::BadRequest().json(Message::new(e.to_string())),
+        None => None,
+    };
+
+    // Whitespace-only lines are what a paste ends with, not something someone
+    // meant to record.
+    let values: Vec<&str> = body
+        .values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if values.is_empty() {
+        return HttpResponse::BadRequest().json(Message::new("No values to add."));
+    }
+
+    let mut report = WriteReport {
+        namespace: namespace.clone(),
+        written: 0,
+        errors: Vec::new(),
+    };
+    for value in values {
+        match crate::sighting_writer::write(&state.db, &namespace, value, when, body.ttl) {
+            Ok(_) => report.written += 1,
+            Err(e) => report.errors.push(ValueError {
+                value: value.to_string(),
+                error: e.to_string(),
+            }),
+        }
+    }
+
+    log::info!(
+        "{} value(s) added to '{namespace}' by '{caller}'{}",
+        report.written,
+        if report.errors.is_empty() {
+            String::new()
+        } else {
+            format!(", {} rejected", report.errors.len())
+        }
+    );
+
+    // Every value failing is a client error; a mix still reports what landed,
+    // the same way `/wb` does.
+    if report.written == 0 {
+        HttpResponse::BadRequest().json(report)
+    } else {
+        HttpResponse::Ok().json(report)
+    }
+}
+
 /// One value with its hourly statistics, which is what the histogram draws.
 pub async fn value(state: State, query: web::Query<ValueQuery>, req: HttpRequest) -> HttpResponse {
     let key = match require_admin(&state, &req) {
@@ -327,6 +574,40 @@ pub async fn value(state: State, query: web::Query<ValueQuery>, req: HttpRequest
         Some(view) => HttpResponse::Ok().json(view),
         None => HttpResponse::NotFound().json(Message::new("No such value.")),
     }
+}
+
+/// Every namespace one value appears in, which is what the graph draws.
+///
+/// Only namespaces this key may read are returned. The count in `_all` — shown
+/// beside the graph as consensus — still reflects every namespace, so a scoped
+/// key can tell that it is not seeing all of them without being told their
+/// names.
+pub async fn sightings(
+    state: State,
+    query: web::Query<SightingsQuery>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let key = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+    if query.value.is_empty() {
+        return HttpResponse::BadRequest().json(Message::new("No value to look for."));
+    }
+
+    let acl = state.acl();
+    let found = state
+        .db
+        .sightings_of(&query.value, query.limit(), |name| acl.can_read(&key, name));
+    drop(acl);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "value": query.value,
+        "consensus": state.db.count(crate::db::ALL_NAMESPACE, &query.value),
+        "items": found.items,
+        "truncated": found.truncated,
+        "paged_in": found.paged_in,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -509,8 +790,15 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/_management/api/session", web::get().to(session))
         .route("/_management/api/info", web::get().to(info))
         .route("/_management/api/namespaces", web::get().to(namespaces))
+        .route(
+            "/_management/api/namespaces",
+            web::post().to(create_namespace),
+        )
+        .route("/_management/api/tree", web::get().to(tree))
         .route("/_management/api/values", web::get().to(values))
+        .route("/_management/api/values", web::post().to(add_values))
         .route("/_management/api/value", web::get().to(value))
+        .route("/_management/api/sightings", web::get().to(sightings))
         .route("/_management/api/keys", web::get().to(list_keys))
         .route("/_management/api/keys", web::post().to(save_key))
         .route(
@@ -1088,6 +1376,364 @@ mod tests {
         assert!(
             body["message"].as_str().unwrap().contains("tiers_file"),
             "{body}"
+        );
+    }
+
+    // -- browsing, creating and adding ------------------------------------
+
+    macro_rules! post_json {
+        ($app:expr, $uri:expr, $body:expr, $key:expr) => {
+            test::call_service(
+                &$app,
+                test::TestRequest::post()
+                    .uri($uri)
+                    .insert_header(("Authorization", $key))
+                    .set_json($body)
+                    .to_request(),
+            )
+            .await
+        };
+    }
+
+    #[actix_web::test]
+    async fn the_tree_walks_one_level_at_a_time() {
+        let st = state();
+        let app = app!(st);
+
+        // At the root, `feeds` is a folder: it holds `feeds/ips` but nothing
+        // of its own.
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tree", Some(ADMIN))).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["name"], "feeds");
+        assert_eq!(body["items"][0]["path"], "feeds");
+        assert_eq!(body["items"][0]["namespace"], false);
+        assert_eq!(body["items"][0]["descendants"], 1);
+
+        // A level down, `ips` is the namespace holding the values.
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tree?path=feeds", Some(ADMIN))).await;
+        assert_eq!(body["items"][0]["name"], "ips");
+        assert_eq!(body["items"][0]["path"], "feeds/ips");
+        assert_eq!(body["items"][0]["namespace"], true);
+        assert_eq!(body["items"][0]["descendants"], 0);
+
+        // And nothing below that.
+        let body: Json = test::read_body_json(get!(
+            app,
+            "/_management/api/tree?path=feeds/ips",
+            Some(ADMIN)
+        ))
+        .await;
+        assert_eq!(body["total"], 0);
+    }
+
+    /// A key scoped to one subtree must not learn the names of the others,
+    /// which for the tree means not even seeing the folder above them.
+    #[actix_web::test]
+    async fn the_tree_only_shows_what_the_key_may_read() {
+        let mut inner = SharedState::new(false);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("scoped", parse_grants("admin, r:feeds").unwrap());
+        for namespace in ["feeds/ips", "private/ips"] {
+            inner
+                .db
+                .write(namespace, "1.2.3.4", Utc::now(), WriteOpts::default());
+        }
+        let st = web::Data::new(inner);
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tree", Some("scoped"))).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["name"], "feeds");
+    }
+
+    #[actix_web::test]
+    async fn a_created_namespace_is_empty_and_browsable() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = post_json!(
+            app,
+            "/_management/api/namespaces",
+            json!({"namespace": "feeds/domains"}),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // It exists as a folder under `feeds`...
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tree?path=feeds", Some(ADMIN))).await;
+        let names: Vec<&str> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["domains", "ips"]);
+
+        // ...and as a namespace holding nothing yet, rather than a 404.
+        let body: Json = test::read_body_json(get!(
+            app,
+            "/_management/api/values?namespace=feeds/domains",
+            Some(ADMIN)
+        ))
+        .await;
+        assert_eq!(body["total"], 0);
+    }
+
+    #[actix_web::test]
+    async fn creating_a_namespace_twice_is_refused() {
+        let st = state();
+        let app = app!(st);
+
+        let body = json!({"namespace": "feeds/ips"});
+        let resp = post_json!(app, "/_management/api/namespaces", body, ADMIN);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    /// Slashes are how the interface nests folders, so a name doubling or
+    /// trailing them must not create a second namespace beside the first.
+    #[actix_web::test]
+    async fn a_namespace_name_is_tidied_before_it_is_stored() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = post_json!(
+            app,
+            "/_management/api/namespaces",
+            json!({"namespace": "/feeds//domains/ "}),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Json = test::read_body_json(resp).await;
+        assert_eq!(body["namespace"], "feeds/domains");
+        assert!(st.db.namespace_exists("feeds/domains"));
+    }
+
+    #[actix_web::test]
+    async fn internal_and_empty_namespaces_are_refused() {
+        let st = state();
+        let app = app!(st);
+
+        for name in ["_config/acl/apikeys/mine", "  ", "/", "with space"] {
+            let resp = post_json!(
+                app,
+                "/_management/api/namespaces",
+                json!({ "namespace": name }),
+                ADMIN
+            );
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{name}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn values_can_be_added_one_at_a_time_or_in_bulk() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = post_json!(
+            app,
+            "/_management/api/values",
+            json!({"namespace": "feeds/domains", "values": ["example.com"]}),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Json = test::read_body_json(resp).await;
+        assert_eq!(body["written"], 1);
+        // Writing is what creates a namespace, here as everywhere else.
+        assert!(st.db.namespace_exists("feeds/domains"));
+
+        // A pasted list, blank lines and all, lands as the values in it.
+        let resp = post_json!(
+            app,
+            "/_management/api/values",
+            json!({"namespace": "feeds/domains", "values": ["a.example", "", "  ", "b.example"]}),
+            ADMIN
+        );
+        let body: Json = test::read_body_json(resp).await;
+        assert_eq!(body["written"], 2);
+        assert!(body["errors"].is_null(), "{body}");
+
+        let page = st.db.value_page("feeds/domains", "", 0, 10, false).unwrap();
+        assert_eq!(page.total, 3);
+        // Counted towards consensus, exactly as a `/w/` write would be.
+        assert_eq!(st.db.count(crate::db::ALL_NAMESPACE, "example.com"), 1);
+    }
+
+    #[actix_web::test]
+    async fn added_values_take_a_ttl_and_a_time() {
+        let st = state();
+        let app = app!(st);
+
+        // An hour ago with an hour to live: recorded then, and still here now.
+        let seen = Utc::now().timestamp() - 60;
+        let resp = post_json!(
+            app,
+            "/_management/api/values",
+            json!({
+                "namespace": "feeds/domains",
+                "values": ["example.com"],
+                "ttl": 3600,
+                "timestamp": seen,
+            }),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let view = st
+            .db
+            .view("feeds/domains", "example.com", 0, false)
+            .unwrap();
+        assert_eq!(view.first_seen, seen);
+        assert_eq!(view.ttl, 3600);
+
+        // A time the calendar cannot hold is a client error, not a panic.
+        let resp = post_json!(
+            app,
+            "/_management/api/values",
+            json!({"namespace": "feeds/domains", "values": ["x"], "timestamp": i64::MAX}),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn a_request_with_nothing_to_add_is_a_bad_request() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = post_json!(
+            app,
+            "/_management/api/values",
+            json!({"namespace": "feeds/ips", "values": ["", " "]}),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Reaching the interface is not the same as being allowed to change the
+    /// data in it: an `admin, r:feeds` key browses but does not write.
+    #[actix_web::test]
+    async fn writing_needs_a_write_grant_over_the_namespace() {
+        let mut inner = SharedState::new(false);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("reader", parse_grants("admin, r").unwrap());
+        let st = web::Data::new(inner);
+        let app = app!(st);
+
+        for (uri, body) in [
+            (
+                "/_management/api/namespaces",
+                json!({"namespace": "feeds/domains"}),
+            ),
+            (
+                "/_management/api/values",
+                json!({"namespace": "feeds/domains", "values": ["example.com"]}),
+            ),
+        ] {
+            assert_eq!(
+                post_json!(app, uri, body.clone(), "reader").status(),
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+            // A key that is not an admin key at all does not get further.
+            assert_eq!(
+                post_json!(app, uri, body, "nobody").status(),
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+        }
+        assert!(!st.db.namespace_exists("feeds/domains"));
+    }
+
+    // -- the relationship graph -------------------------------------------
+
+    #[actix_web::test]
+    async fn a_value_reports_where_else_it_has_been_seen() {
+        let mut inner = SharedState::new(false);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("scoped", parse_grants("admin, r:feeds").unwrap());
+        for namespace in ["feeds/misp/ips", "feeds/otx/ips", "private/ips"] {
+            inner.db.write(
+                namespace,
+                "1.2.3.4",
+                Utc::now(),
+                WriteOpts {
+                    consensus: true,
+                    ttl: None,
+                },
+            );
+        }
+        let st = web::Data::new(inner);
+        let app = app!(st);
+
+        let body: Json = test::read_body_json(get!(
+            app,
+            "/_management/api/sightings?value=1.2.3.4",
+            Some(ADMIN)
+        ))
+        .await;
+        let namespaces: Vec<&str> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["namespace"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            namespaces,
+            ["feeds/misp/ips", "feeds/otx/ips", "private/ips"]
+        );
+        assert_eq!(body["items"][0]["shard"], "feeds");
+        assert_eq!(body["consensus"], 3);
+        assert_eq!(body["truncated"], false);
+
+        // A scoped key sees its own subtree; consensus still says how many
+        // namespaces hold the value, so it can tell the graph is not all of it.
+        let body: Json = test::read_body_json(get!(
+            app,
+            "/_management/api/sightings?value=1.2.3.4",
+            Some("scoped")
+        ))
+        .await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 2);
+        assert_eq!(body["consensus"], 3);
+    }
+
+    #[actix_web::test]
+    async fn the_graph_needs_an_admin_key_and_a_value() {
+        let st = state();
+        let app = app!(st);
+
+        assert_eq!(
+            get!(app, "/_management/api/sightings?value=1.2.3.4", NO_KEY).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get!(
+                app,
+                "/_management/api/sightings?value=1.2.3.4",
+                Some("plain")
+            )
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get!(app, "/_management/api/sightings?value=", Some(ADMIN)).status(),
+            StatusCode::BAD_REQUEST
         );
     }
 

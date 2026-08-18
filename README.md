@@ -263,17 +263,48 @@ Point a browser at `/_management/` and sign in with an API key holding the
 	changeme   = "rw, admin"
 	feeds-only = "admin, r:feeds"
 
-It lists namespaces, browses the values inside one namespace (paged and
-filterable, since a namespace can hold a great many), and draws a histogram of
-when a value was seen from the hourly statistics the database already keeps.
+A namespace is a path, so the interface browses one the way a file manager
+browses directories: `feeds` holds `feeds/misp/ips`, and a path can be a folder
+and a namespace at once — holding values of its own while other namespaces sit
+underneath it. Each level lists what is below it and the values stored at that
+path, paged and filterable since a namespace can hold a great many.
 `/_management/feeds/ips/` is a direct link to that namespace, so views are
-bookmarkable.
+bookmarkable. Ticking **search everywhere** looks through whole namespace names
+instead of walking a level at a time.
+
+**New namespace** creates one before it holds anything, nesting as deep as you
+like: `misp/ips` under `feeds` creates the whole path. An empty namespace is a
+real namespace — it is snapshotted, it survives a restart, and sweeps do not
+reclaim it, since only namespaces a sweep *empties* are litter.
+
+**Add values** records one value or a pasted list of them, optionally with a TTL
+and the time they were seen. They are counted towards consensus exactly as a
+`/w/` write would be; nothing added here is a second class of sighting. Writing
+to a namespace that does not exist creates it, as it does everywhere else.
+
+Clicking a value shows what the database knows about it: a histogram of when it
+was seen, built from the hourly statistics already kept, and a force-directed
+graph of **every namespace holding that value** — the point of consensus made
+visible. Colour is the top-level namespace, shape says whether a node is the
+value, a folder or a namespace, and size is how often the value was seen there.
+Folders on the way down are drawn too, so namespaces sharing a path cluster
+together. Click a node to browse to it.
+
+Finding those namespaces is arranged to be cheap: `_all` already knows how many
+namespaces hold the value, which gives the search something to stop at,
+namespaces already in memory are searched first, and evicted shards are read
+back only if that target has not been reached by then.
 
 **Access is two-layered.** The `admin` grant is what reaches the interface at
-all; ordinary read grants then decide which namespaces are visible inside it. In
-the example above, `feeds-only` signs in but sees only `feeds/*` — everything
-else answers `404`, the same as a namespace that does not exist, so browsing
-cannot be used to enumerate what is out of reach.
+all; ordinary read grants then decide which namespaces are visible inside it,
+and write grants decide what may be created or added to. In the example above,
+`feeds-only` signs in but sees only `feeds/*` — everything else answers `404`,
+the same as a namespace that does not exist, so browsing cannot be used to
+enumerate what is out of reach — and, having no write grant, it cannot create a
+namespace or add a value anywhere. The relationship graph obeys the same rule:
+it draws only namespaces the key may read, while the consensus figure beside it
+still counts every namespace, so a scoped key can tell it is not seeing all of
+them without being told their names.
 
 An admin key is required **even when `authenticate = false`**. Turning
 authentication off is a decision about the sighting API; it should not hand the
