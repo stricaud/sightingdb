@@ -18,6 +18,7 @@ categories = ["database-implementations", "command-line-utilities"]
 # exist. docker/ is likewise a deployment concern, not part of the library.
 exclude = [
     "rust-toolchain.toml",
+    ".cargo/*",
     ".idea/*",
     ".github/*",
     "tests/*",

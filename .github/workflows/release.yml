@@ -154,7 +154,12 @@ jobs:
           RUSTFLAGS: ""
 
       - name: Audit dependencies
+        # Exceptions, with the reason each one exists, live in
+        # .cargo/audit.toml, which cargo-audit reads from the working directory.
         run: cargo audit
+
+      - name: Check the audit exceptions are still needed
+        run: python3 .github/check-audit-ignores.py
 
   # ---------------------------------------------------------------------------
   # Prebuilt binaries, one native runner per target so nothing is cross-compiled.
