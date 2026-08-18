@@ -1,0 +1,21 @@
+# Configuration for `cargo audit`, read by CI and by a local run alike.
+
+[advisories]
+# RUSTSEC-2026-0258 — h2 0.3.27, "unbounded empty DATA frames" (low severity
+# denial of service: empty DATA frames are queued without limit).
+#
+# There is nothing to upgrade to. The fix landed in h2 0.4.16 and no 0.3.x
+# carries it, because h2 0.4 is built on `http` 1.x while actix-http 3.x is
+# built on `http` 0.2 — so the move waits on an actix-web major release.
+# actix-web 4.14.1, the newest, still pins `h2 ^0.3.27`.
+#
+# Nor can the dependency be dropped: in actix-web 4 the `openssl` feature
+# implies `http2`, so serving HTTPS at all pulls h2 in. Turning default
+# features off changes nothing.
+#
+# Until then, a deployment exposed to untrusted clients is best fronted by a
+# reverse proxy terminating HTTP/2, which is the usual arrangement anyway.
+#
+# Remove this entry as soon as actix-web ships against h2 0.4, and check
+# whether it can go at every dependency bump.
+ignore = ["RUSTSEC-2026-0258"]
