@@ -179,9 +179,13 @@ pub fn record(
         None => first,
     };
 
+    // Tags go on with the first write; the rest only move `last_seen`, and
+    // merging the same set again would be work for nothing.
+    let tags = sighting.tags.join(",");
     for n in 0..sighting.count.max(1) {
         let when = if n == 0 { first } else { last };
-        sighting_writer::write(db, &sighting.namespace, &sighting.value, when, ttl)?;
+        let tags = if n == 0 { tags.as_str() } else { "" };
+        sighting_writer::write_tagged(db, &sighting.namespace, &sighting.value, when, ttl, tags)?;
     }
     Ok(())
 }

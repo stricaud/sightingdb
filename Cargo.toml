@@ -54,6 +54,9 @@ serde_json = "1.0"
 # paged back in sits on.
 zstd = "0.13"
 toml = "1.1"
+# Already in the tree via zeromq; used for the deterministic (v5) ids the STIX
+# export mints.
+uuid = { version = "1.24", features = ["v5"] }
 # Format-preserving TOML, so the management interface can rewrite a config
 # without discarding its comments. This is what cargo uses on Cargo.toml.
 toml_edit = "0.25"

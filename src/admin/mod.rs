@@ -109,6 +109,10 @@ pub struct NewValues {
     /// Absent leaves whatever TTL an existing value had; 0 clears it.
     #[serde(default)]
     ttl: Option<u64>,
+    /// Comma-separated tags applied to every value in this request, merged
+    /// with whatever each already carried.
+    #[serde(default)]
+    tags: String,
 }
 
 /// What a create or an add did, per value, so a paste of a thousand lines can
@@ -125,6 +129,15 @@ pub struct WriteReport {
 pub struct ValueError {
     value: String,
     error: String,
+}
+
+/// A value's tags, replaced outright.
+#[derive(Debug, Deserialize)]
+pub struct TagChange {
+    namespace: String,
+    value: String,
+    /// The whole set, comma-separated. Empty clears it.
+    tags: String,
 }
 
 /// A tier change from the interface.
@@ -528,7 +541,9 @@ pub async fn add_values(
         errors: Vec::new(),
     };
     for value in values {
-        match crate::sighting_writer::write(&state.db, &namespace, value, when, body.ttl) {
+        match crate::sighting_writer::write_tagged(
+            &state.db, &namespace, value, when, body.ttl, &body.tags,
+        ) {
             Ok(_) => report.written += 1,
             Err(e) => report.errors.push(ValueError {
                 value: value.to_string(),
@@ -608,6 +623,41 @@ pub async fn sightings(
         "truncated": found.truncated,
         "paged_in": found.paged_in,
     }))
+}
+
+/// Replace one value's tags.
+///
+/// Adding tags is a write like any other and goes through `/w`; this exists for
+/// the other direction, since a wrong tag can only come off by replacing the
+/// set. It is not a sighting: nothing is counted and no timestamp moves.
+pub async fn set_tags(state: State, body: web::Json<TagChange>, req: HttpRequest) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    let change = body.into_inner();
+    let namespace = match clean_namespace(&change.namespace) {
+        Ok(namespace) => namespace,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_write(&state, &caller, &namespace) {
+        return resp;
+    }
+
+    if !state.db.set_tags(&namespace, &change.value, &change.tags) {
+        return HttpResponse::NotFound().json(Message::new("No such value."));
+    }
+
+    log::info!(
+        "Tags of '{}' in '{namespace}' set by '{caller}'",
+        change.value
+    );
+    let consensus = state.db.count(crate::db::ALL_NAMESPACE, &change.value);
+    match state.db.view(&namespace, &change.value, consensus, false) {
+        Some(view) => HttpResponse::Ok().json(view),
+        None => HttpResponse::Ok().json(Message::new("ok")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -797,6 +847,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/_management/api/tree", web::get().to(tree))
         .route("/_management/api/values", web::get().to(values))
         .route("/_management/api/values", web::post().to(add_values))
+        .route("/_management/api/tags", web::post().to(set_tags))
         .route("/_management/api/value", web::get().to(value))
         .route("/_management/api/sightings", web::get().to(sightings))
         .route("/_management/api/keys", web::get().to(list_keys))
@@ -1734,6 +1785,89 @@ mod tests {
         assert_eq!(
             get!(app, "/_management/api/sightings?value=", Some(ADMIN)).status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    // -- tags and the STIX export -------------------------------------------
+
+    #[actix_web::test]
+    async fn values_can_be_added_with_tags_and_retagged_afterwards() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = post_json!(
+            app,
+            "/_management/api/values",
+            json!({
+                "namespace": "feeds/ips",
+                "values": ["8.8.8.8"],
+                "tags": "stix-type:ipv4-addr, tlp:green",
+            }),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            st.db.view("feeds/ips", "8.8.8.8", 0, false).unwrap().tags,
+            "stix-type:ipv4-addr,tlp:green"
+        );
+
+        // Replacing is how a wrong tag comes off, and it is not a sighting:
+        // the count stays where it was.
+        let before = st.db.view("feeds/ips", "8.8.8.8", 0, false).unwrap().count;
+        let resp = post_json!(
+            app,
+            "/_management/api/tags",
+            json!({"namespace": "feeds/ips", "value": "8.8.8.8", "tags": "stix-type:ipv4-addr"}),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view = st.db.view("feeds/ips", "8.8.8.8", 0, false).unwrap();
+        assert_eq!(view.tags, "stix-type:ipv4-addr");
+        assert_eq!(view.count, before);
+    }
+
+    #[actix_web::test]
+    async fn retagging_a_value_that_is_not_there_is_a_not_found() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = post_json!(
+            app,
+            "/_management/api/tags",
+            json!({"namespace": "feeds/ips", "value": "203.0.113.9", "tags": "tlp:red"}),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn tagging_needs_a_write_grant() {
+        let mut inner = SharedState::new(false);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("reader", parse_grants("admin, r").unwrap());
+        inner
+            .db
+            .write("feeds/ips", "1.2.3.4", Utc::now(), WriteOpts::default());
+        let st = web::Data::new(inner);
+        let app = app!(st);
+
+        let resp = post_json!(
+            app,
+            "/_management/api/tags",
+            json!({"namespace": "feeds/ips", "value": "1.2.3.4", "tags": "tlp:red"}),
+            "reader"
+        );
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            st.db
+                .view("feeds/ips", "1.2.3.4", 0, false)
+                .unwrap()
+                .tags
+                .is_empty()
         );
     }
 

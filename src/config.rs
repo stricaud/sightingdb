@@ -88,6 +88,36 @@ pub struct DnsSettings {
 pub struct StixSettings {
     pub mapping: StixMapping,
     pub ttl: u64,
+    /// Who the STIX export publishes as.
+    pub export: crate::stix::Settings,
+}
+
+impl StixSettings {
+    /// The observable type a namespace holds, from the import mapping read
+    /// backwards: a namespace configured to receive `ipv4-addr` holds ipv4
+    /// addresses however the data actually arrived.
+    ///
+    /// The longest matching prefix wins, so `ipv4-addr = "feeds"` still says
+    /// something useful about `feeds/misp/ips` while a mapping for that exact
+    /// namespace overrides it.
+    pub fn type_of_namespace(&self, namespace: &str) -> Option<&str> {
+        self.mapping
+            .types
+            .iter()
+            .filter(|(_, mapped)| covers(mapped, namespace))
+            .max_by_key(|(_, mapped)| mapped.len())
+            .map(|(stix_type, _)| stix_type.as_str())
+    }
+}
+
+/// Whether `mapped` is `namespace` or a parent of it, matching whole segments
+/// so `feeds/misp` does not cover `feeds/misp-internal`.
+fn covers(mapped: &str, namespace: &str) -> bool {
+    let mapped = mapped.trim_matches('/');
+    namespace == mapped
+        || namespace
+            .strip_prefix(mapped)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 impl Settings {
@@ -235,6 +265,10 @@ struct RawStix {
     ttl: u64,
     #[serde(default)]
     types: Option<toml::Value>,
+    /// Name the STIX export publishes under. Defaults to "SightingDB".
+    identity: Option<String>,
+    /// STIX identity class for that name: `organization`, `system`, ...
+    identity_class: Option<String>,
 }
 
 fn yes() -> bool {
@@ -488,12 +522,25 @@ impl RawZmq {
 
 impl RawStix {
     fn into_settings(self, path: &Path) -> Result<StixSettings> {
+        let default_export = crate::stix::Settings::default();
         Ok(StixSettings {
             mapping: StixMapping {
                 types: type_map(self.types.as_ref(), "stix.types", path)?,
                 default_namespace: namespace_option(self.default_namespace, "stix")?,
             },
             ttl: self.ttl,
+            export: crate::stix::Settings {
+                identity: self
+                    .identity
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| default_export.identity.clone()),
+                identity_class: self
+                    .identity_class
+                    .map(|class| class.trim().to_string())
+                    .filter(|class| !class.is_empty())
+                    .unwrap_or(default_export.identity_class),
+            },
         })
     }
 }
@@ -932,6 +979,63 @@ ipv4-addr = "stix/ips"
         .unwrap();
 
         assert_eq!(settings.stix.mapping.types["file.MD5"], "stix/hashes");
+    }
+
+    #[test]
+    fn the_export_identity_defaults_and_can_be_configured() {
+        let dir = TempDir::new("stixidentity");
+
+        let settings = Settings::load(&dir.write("d.toml", "[daemon]\nssl = false\n")).unwrap();
+        assert_eq!(settings.stix.export, crate::stix::Settings::default());
+
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            r#"
+[daemon]
+ssl = false
+
+[stix]
+identity = "Alpha Threat Analysis Org."
+identity_class = "organization"
+"#,
+        ))
+        .unwrap();
+
+        assert_eq!(settings.stix.export.identity, "Alpha Threat Analysis Org.");
+        assert_eq!(settings.stix.export.identity_class, "organization");
+    }
+
+    /// The import mapping read backwards tells the export what a namespace
+    /// holds, so values written by other means still get the right pattern.
+    #[test]
+    fn a_namespace_inherits_the_type_it_was_mapped_to() {
+        let dir = TempDir::new("stixinverse");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            r#"
+[daemon]
+ssl = false
+
+[stix.types]
+ipv4-addr = "feeds"
+domain-name = "feeds/domains"
+"#,
+        ))
+        .unwrap();
+
+        // The most specific mapping wins.
+        assert_eq!(
+            settings.stix.type_of_namespace("feeds/domains"),
+            Some("domain-name")
+        );
+        assert_eq!(
+            settings.stix.type_of_namespace("feeds/misp/ips"),
+            Some("ipv4-addr")
+        );
+        assert_eq!(settings.stix.type_of_namespace("feeds"), Some("ipv4-addr"));
+        // Whole segments only, and nothing to say about an unrelated tree.
+        assert_eq!(settings.stix.type_of_namespace("feeds-internal"), None);
+        assert_eq!(settings.stix.type_of_namespace("other"), None);
     }
 
     /// The INI version of this mistake silently mapped nothing. TOML turns it

@@ -14,6 +14,12 @@
 //! second. Anything we do not understand is skipped rather than failing the
 //! import: bundles routinely carry objects that have nothing to do with
 //! observations.
+//!
+//! What the bundle says *about* a value — its observable type, the indicator it
+//! came from, markings, confidence, who published it — is kept as tags on the
+//! sighting. That is what lets [`crate::stix`] export the value again as STIX
+//! without inventing the parts a bare `<namespace, value, count>` cannot hold.
+//! The vocabulary is documented in the README.
 
 use std::collections::HashMap;
 
@@ -22,7 +28,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::sync::OnceLock;
 
-use crate::ingest::misp::Sighting;
+use crate::ingest::misp::{Sighting, sanitize_tag};
 
 /// Which STIX observable types are ingested, and where they land.
 ///
@@ -70,12 +76,27 @@ pub fn parse_bundle(json: &str, mapping: &Mapping) -> Result<Vec<Sighting>, serd
         .filter_map(|object| Some((object.get("id")?.as_str()?, object)))
         .collect();
 
+    // An indicator a sighting already points at must not be counted twice: the
+    // sighting says how often the value was seen, and reading the indicator
+    // again on its own would add one more. This matters for our own exports,
+    // which pair every indicator with a sighting.
+    let sighted: Vec<&str> = objects
+        .iter()
+        .filter(|object| object.get("type").and_then(Value::as_str) == Some("sighting"))
+        .filter_map(|object| object.get("sighting_of_ref").and_then(Value::as_str))
+        .collect();
+
     let mut sightings = Vec::new();
     for object in &objects {
         match object.get("type").and_then(Value::as_str) {
             Some("sighting") => from_sighting(object, &by_id, mapping, &mut sightings),
             Some("observed-data") => from_observed_data(object, &by_id, mapping, &mut sightings),
-            Some("indicator") => from_indicator(object, mapping, &mut sightings),
+            Some("indicator") => {
+                let id = object.get("id").and_then(Value::as_str).unwrap_or_default();
+                if !sighted.contains(&id) {
+                    from_indicator(object, &by_id, mapping, &mut sightings);
+                }
+            }
             _ => {}
         }
     }
@@ -100,6 +121,17 @@ fn from_sighting(
     let last = timestamp(sighting.get("last_seen"));
 
     let mut observables = Vec::new();
+    let mut tags = describe(sighting, by_id);
+
+    // Who saw it, which is the one thing a sighting knows that its target does
+    // not. Exporting turns these back into `where_sighted_refs`.
+    if let Some(Value::Array(refs)) = sighting.get("where_sighted_refs") {
+        for id in refs.iter().filter_map(Value::as_str) {
+            if let Some(name) = by_id.get(id).and_then(|object| identity_name(object)) {
+                tags.push(format!("identity:{name}"));
+            }
+        }
+    }
 
     // What was seen: usually an indicator, sometimes an observable directly.
     if let Some(target) = sighting
@@ -112,6 +144,7 @@ fn from_sighting(
                 if let Some(pattern) = target.get("pattern").and_then(Value::as_str) {
                     observables.extend(from_pattern(pattern));
                 }
+                tags.extend(describe_indicator(target, by_id));
             }
             _ => collect_observable(target, &mut observables),
         }
@@ -126,7 +159,8 @@ fn from_sighting(
         }
     }
 
-    emit(observables, mapping, first, last, count, out);
+    dedupe(&mut tags);
+    emit(observables, mapping, first, last, count, &tags, out);
 }
 
 fn from_observed_data(
@@ -143,23 +177,125 @@ fn from_observed_data(
     let first = timestamp(observed.get("first_observed"));
     let last = timestamp(observed.get("last_observed"));
 
+    let mut tags = describe(observed, by_id);
+    dedupe(&mut tags);
     emit(
         observables_of(observed, by_id),
         mapping,
         first,
         last,
         count,
+        &tags,
         out,
     );
 }
 
 /// An indicator on its own is one observation, timed by `valid_from`.
-fn from_indicator(indicator: &Value, mapping: &Mapping, out: &mut Vec<Sighting>) {
+fn from_indicator(
+    indicator: &Value,
+    by_id: &HashMap<&str, &Value>,
+    mapping: &Mapping,
+    out: &mut Vec<Sighting>,
+) {
     let Some(pattern) = indicator.get("pattern").and_then(Value::as_str) else {
         return;
     };
     let seen = timestamp(indicator.get("valid_from"));
-    emit(from_pattern(pattern), mapping, seen, None, 1, out);
+
+    let mut tags = describe(indicator, by_id);
+    tags.extend(describe_indicator(indicator, by_id));
+    dedupe(&mut tags);
+    emit(from_pattern(pattern), mapping, seen, None, 1, &tags, out);
+}
+
+/// The properties any STIX object may carry that are worth keeping: who made
+/// it, how sure they were, and how it may be shared.
+fn describe(object: &Value, by_id: &HashMap<&str, &Value>) -> Vec<String> {
+    let mut tags = Vec::new();
+
+    if let Some(name) = object
+        .get("created_by_ref")
+        .and_then(Value::as_str)
+        .and_then(|id| by_id.get(id))
+        .and_then(|creator| identity_name(creator))
+    {
+        tags.push(format!("identity:{name}"));
+    }
+    if let Some(confidence) = object.get("confidence").and_then(Value::as_u64) {
+        tags.push(format!("confidence:{confidence}"));
+    }
+    if let Some(Value::Array(refs)) = object.get("object_marking_refs") {
+        for id in refs.iter().filter_map(Value::as_str) {
+            if let Some(level) = tlp_level(id, by_id) {
+                tags.push(format!("tlp:{level}"));
+            }
+        }
+    }
+
+    tags
+}
+
+/// What an indicator says about the values in its pattern.
+fn describe_indicator(indicator: &Value, by_id: &HashMap<&str, &Value>) -> Vec<String> {
+    let mut tags = describe(indicator, by_id);
+
+    // Keeping the id means a re-export can reuse it rather than minting a
+    // second indicator for a value the sender already had one for.
+    if let Some(id) = indicator.get("id").and_then(Value::as_str) {
+        tags.push(format!("stix-id:{id}"));
+    }
+    if let Some(Value::Array(kinds)) = indicator.get("indicator_types") {
+        for kind in kinds.iter().filter_map(Value::as_str) {
+            tags.push(format!("indicator-type:{}", sanitize_tag(kind)));
+        }
+    }
+    if let Some(name) = indicator
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+    {
+        tags.push(format!("name:{}", sanitize_tag(name)));
+    }
+    if let Some(until) = indicator.get("valid_until").and_then(Value::as_str) {
+        tags.push(format!("valid-until:{}", sanitize_tag(until)));
+    }
+
+    tags
+}
+
+fn identity_name(object: &Value) -> Option<String> {
+    (object.get("type").and_then(Value::as_str) == Some("identity"))
+        .then(|| object.get("name").and_then(Value::as_str))
+        .flatten()
+        .map(sanitize_tag)
+}
+
+/// The four TLP marking definitions have fixed ids in the STIX specification,
+/// so a bundle that references one without including it is still readable.
+fn tlp_level(id: &str, by_id: &HashMap<&str, &Value>) -> Option<String> {
+    if let Some(level) = crate::stix::tlp_of_id(id) {
+        return Some(level.to_string());
+    }
+
+    let marking = by_id.get(id)?;
+    if marking.get("definition_type").and_then(Value::as_str) != Some("tlp") {
+        return None;
+    }
+    let level = marking
+        .get("definition")
+        .and_then(|definition| definition.get("tlp"))
+        .and_then(Value::as_str)?;
+    Some(level.to_ascii_lowercase())
+}
+
+fn dedupe(tags: &mut Vec<String>) {
+    let mut seen: Vec<String> = Vec::with_capacity(tags.len());
+    for tag in std::mem::take(tags) {
+        if !seen.contains(&tag) {
+            seen.push(tag);
+        }
+    }
+    *tags = seen;
 }
 
 /// The observables an `observed-data` points at, whether by reference or
@@ -267,18 +403,24 @@ fn emit(
     first: Option<i64>,
     last: Option<i64>,
     count: u64,
+    tags: &[String],
     out: &mut Vec<Sighting>,
 ) {
     for observable in observables {
         let Some(namespace) = mapping.namespace_for(&observable.stix_type) else {
             continue;
         };
+        // The observable type leads, since it is the one tag the export cannot
+        // work without: it is what the pattern is built from.
+        let mut all = vec![format!("stix-type:{}", observable.stix_type)];
+        all.extend(tags.iter().cloned());
         out.push(Sighting {
             namespace: namespace.to_string(),
             value: observable.value,
             timestamp: first.or(last),
             last_timestamp: last,
             count,
+            tags: all,
         });
     }
 }
@@ -371,6 +513,152 @@ mod tests {
         values.sort();
         assert_eq!(values.len(), 2);
         assert!(values[0].starts_with("d41d8cd9") || values[1].starts_with("d41d8cd9"));
+    }
+
+    // -- what the bundle says about a value --------------------------------
+
+    /// Everything the STIX export needs that a bare `<namespace, value>` cannot
+    /// hold, kept as tags on the way in.
+    #[test]
+    fn a_sighting_keeps_what_the_bundle_said_about_it() {
+        let body = bundle(
+            r#"
+            {"type":"identity","id":"identity--a","name":"Alpha Threat Analysis Org.",
+             "identity_class":"organization"},
+            {"type":"identity","id":"identity--b","name":"Beta Cyber Intelligence Company",
+             "identity_class":"organization"},
+            {"type":"marking-definition","id":"marking-definition--m","definition_type":"tlp",
+             "definition":{"tlp":"amber"}},
+            {"type":"indicator","id":"indicator--9299f726-ce06-492e-8472-2b52ccb53191",
+             "created_by_ref":"identity--a","name":"Malicious URL","confidence":80,
+             "indicator_types":["malicious-activity"],"valid_from":"2020-09-13T12:26:40Z",
+             "valid_until":"2021-09-13T12:26:40Z","object_marking_refs":["marking-definition--m"],
+             "pattern_type":"stix","pattern":"[ipv4-addr:value = '1.2.3.4']"},
+            {"type":"sighting","id":"sighting--1","count":3,
+             "first_seen":"2020-09-13T12:26:40Z","last_seen":"2020-09-13T13:26:40Z",
+             "sighting_of_ref":"indicator--9299f726-ce06-492e-8472-2b52ccb53191",
+             "where_sighted_refs":["identity--b"]}"#,
+        );
+
+        let sightings = parse_bundle(&body, &mapping()).unwrap();
+        // The indicator is also read on its own, so the value arrives twice:
+        // once from the sighting and once from the indicator itself.
+        let from_sighting = sightings
+            .iter()
+            .find(|sighting| sighting.count == 3)
+            .expect("the sighting SRO");
+
+        assert_eq!(from_sighting.namespace, "stix/ips");
+        assert_eq!(from_sighting.value, "1.2.3.4");
+        assert_eq!(
+            from_sighting.tags,
+            [
+                "stix-type:ipv4-addr",
+                "identity:Beta Cyber Intelligence Company",
+                "identity:Alpha Threat Analysis Org.",
+                "confidence:80",
+                "tlp:amber",
+                "stix-id:indicator--9299f726-ce06-492e-8472-2b52ccb53191",
+                "indicator-type:malicious-activity",
+                "name:Malicious URL",
+                "valid-until:2021-09-13T12:26:40Z",
+            ]
+        );
+    }
+
+    /// The four TLP markings have fixed ids, so a bundle can reference one
+    /// without carrying the object.
+    #[test]
+    fn a_well_known_tlp_reference_is_understood_without_the_object() {
+        let body = bundle(
+            r#"{"type":"indicator","id":"indicator--1","valid_from":"2020-09-13T12:26:40Z",
+             "object_marking_refs":["marking-definition--5e57c739-391a-4eb3-b6be-7d15ca92d5ed"],
+             "pattern":"[ipv4-addr:value = '1.2.3.4']"}"#,
+        );
+
+        let sightings = parse_bundle(&body, &mapping()).unwrap();
+        assert!(
+            sightings[0].tags.contains(&"tlp:red".to_string()),
+            "{:?}",
+            sightings[0].tags
+        );
+    }
+
+    /// A bundle pairing an indicator with a sighting of it — which is what this
+    /// database exports — must not count the value twice.
+    #[test]
+    fn an_indicator_a_sighting_points_at_is_not_counted_again() {
+        let body = bundle(
+            r#"
+            {"type":"indicator","id":"indicator--1","valid_from":"2020-09-13T12:26:40Z",
+             "pattern":"[ipv4-addr:value = '1.2.3.4']"},
+            {"type":"sighting","id":"sighting--1","count":7,
+             "first_seen":"2020-09-13T12:26:40Z","last_seen":"2020-09-13T13:26:40Z",
+             "sighting_of_ref":"indicator--1"}"#,
+        );
+
+        let sightings = parse_bundle(&body, &mapping()).unwrap();
+        assert_eq!(sightings.len(), 1, "{sightings:?}");
+        assert_eq!(sightings[0].count, 7);
+
+        // An indicator nothing points at is still an observation of its own.
+        let body = bundle(
+            r#"{"type":"indicator","id":"indicator--2","valid_from":"2020-09-13T12:26:40Z",
+             "pattern":"[ipv4-addr:value = '5.6.7.8']"}"#,
+        );
+        assert_eq!(parse_bundle(&body, &mapping()).unwrap().len(), 1);
+    }
+
+    /// Round trip: what comes out of the exporter is what went into the
+    /// importer, for the parts STIX and this database both understand.
+    #[test]
+    fn a_bundle_survives_being_imported_and_exported_again() {
+        let body = bundle(
+            r#"
+            {"type":"marking-definition","id":"marking-definition--m","definition_type":"tlp",
+             "definition":{"tlp":"green"}},
+            {"type":"indicator","id":"indicator--9299f726-ce06-492e-8472-2b52ccb53191",
+             "indicator_types":["malicious-activity"],"valid_from":"2020-09-13T12:26:40Z",
+             "object_marking_refs":["marking-definition--m"],
+             "pattern":"[ipv4-addr:value = '1.2.3.4']"}"#,
+        );
+        let sighting = &parse_bundle(&body, &mapping()).unwrap()[0];
+
+        let view = crate::attribute::AttributeView {
+            value: sighting.value.clone(),
+            first_seen: sighting.timestamp.unwrap(),
+            last_seen: sighting.timestamp.unwrap(),
+            count: sighting.count,
+            tags: sighting.tags.join(","),
+            ttl: 0,
+            consensus: 1,
+            stats: None,
+        };
+        let export = crate::stix::bundle(
+            &sighting.namespace,
+            &[view],
+            None,
+            &crate::stix::Settings::default(),
+        );
+
+        let objects = export.bundle["objects"].as_array().unwrap();
+        let indicator = objects
+            .iter()
+            .find(|object| object["type"] == "indicator")
+            .unwrap();
+        assert_eq!(
+            indicator["id"],
+            "indicator--9299f726-ce06-492e-8472-2b52ccb53191"
+        );
+        assert_eq!(indicator["pattern"], "[ipv4-addr:value = '1.2.3.4']");
+        assert_eq!(
+            indicator["indicator_types"],
+            serde_json::json!(["malicious-activity"])
+        );
+        assert_eq!(
+            indicator["object_marking_refs"],
+            serde_json::json!(["marking-definition--34098fce-860f-48ae-8e50-ebd3cc5e41da"])
+        );
     }
 
     // -- indicators --------------------------------------------------------

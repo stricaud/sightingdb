@@ -45,6 +45,32 @@ pub struct AttributeView {
     pub stats: Option<BTreeMap<i64, u64>>,
 }
 
+/// Tags are a comma-separated set: either a bare label (`malicious-activity`)
+/// or `key:value` (`stix-type:ipv4-addr`).
+///
+/// Comma is the separator because the interesting values — an identity name, a
+/// description — contain spaces, and a set that cannot hold them would push
+/// that information somewhere else. A value therefore cannot contain a comma,
+/// which is the one thing this asks of a caller.
+pub fn split_tags(tags: &str) -> impl Iterator<Item = &str> {
+    tags.split(',').map(str::trim).filter(|tag| !tag.is_empty())
+}
+
+/// The value of the first `key:value` tag with this key, if there is one.
+pub fn tag_value<'a>(tags: &'a str, key: &'a str) -> Option<&'a str> {
+    tag_values(tags, key).next()
+}
+
+/// Every value carried under one key. Keys repeat: an indicator can be both
+/// `indicator-type:malicious-activity` and `indicator-type:anomalous-activity`.
+pub fn tag_values<'a>(tags: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> {
+    split_tags(tags).filter_map(move |tag| {
+        let (name, value) = tag.split_once(':')?;
+        // Trimmed because `key: value` is what a person types.
+        (name.trim().eq_ignore_ascii_case(key) && !value.trim().is_empty()).then(|| value.trim())
+    })
+}
+
 impl Attribute {
     pub fn new(value: &str) -> Attribute {
         Attribute {
@@ -96,6 +122,40 @@ impl Attribute {
 
     pub fn set_ttl(&mut self, ttl: u64) {
         self.ttl = ttl;
+    }
+
+    /// Merge `tags` into the set already held, dropping repeats.
+    ///
+    /// Merging rather than replacing is what makes tags useful across sources:
+    /// one feed contributes `stix-type:ipv4-addr`, another `tlp:amber`, and the
+    /// value ends up knowing both. Replacing is a deliberate act, and goes
+    /// through [`Attribute::set_tags`].
+    pub fn add_tags(&mut self, tags: &str) {
+        let mut merged: Vec<&str> = split_tags(&self.tags).collect();
+        let mut changed = false;
+        for tag in split_tags(tags) {
+            if !merged.contains(&tag) {
+                merged.push(tag);
+                changed = true;
+            }
+        }
+        if changed {
+            self.tags = merged.join(",");
+        }
+    }
+
+    /// Replace the whole set, which is the only way a wrong tag comes off.
+    pub fn set_tags(&mut self, tags: &str) {
+        let cleaned: Vec<&str> = {
+            let mut seen: Vec<&str> = Vec::new();
+            for tag in split_tags(tags) {
+                if !seen.contains(&tag) {
+                    seen.push(tag);
+                }
+            }
+            seen
+        };
+        self.tags = cleaned.join(",");
     }
 
     /// When this attribute stops being visible, or `None` if it never does.
@@ -169,6 +229,51 @@ mod tests {
 
     fn at(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(secs, 0).expect("timestamp in range")
+    }
+
+    #[test]
+    fn tags_are_a_set_that_merges_rather_than_replaces() {
+        let mut attribute = Attribute::new("1.2.3.4");
+        assert_eq!(attribute.tags, "");
+
+        attribute.add_tags("stix-type:ipv4-addr, tlp:amber");
+        // Another source knows one of the same things and one new one.
+        attribute.add_tags("tlp:amber,confidence:80");
+
+        assert_eq!(
+            attribute.tags,
+            "stix-type:ipv4-addr,tlp:amber,confidence:80"
+        );
+
+        // Replacing is the only way something comes off again.
+        attribute.set_tags("tlp:red,,  tlp:red ,identity:Beta Cyber Intelligence Company");
+        assert_eq!(
+            attribute.tags,
+            "tlp:red,identity:Beta Cyber Intelligence Company"
+        );
+    }
+
+    #[test]
+    fn a_tag_key_can_be_looked_up_and_can_repeat() {
+        let tags = "stix-type:ipv4-addr, indicator-type:malicious-activity, \
+                    indicator-type:anomalous-activity, bare-label, empty:";
+
+        assert_eq!(tag_value(tags, "stix-type"), Some("ipv4-addr"));
+        assert_eq!(
+            tag_values(tags, "indicator-type").collect::<Vec<_>>(),
+            ["malicious-activity", "anomalous-activity"]
+        );
+        // A label with no value is not a key, and a key with no value is not
+        // an answer.
+        assert_eq!(tag_value(tags, "bare-label"), None);
+        assert_eq!(tag_value(tags, "empty"), None);
+        assert_eq!(tag_value(tags, "absent"), None);
+
+        // A value may hold anything but a comma — colons included, which is
+        // what a URL or a timestamp needs.
+        let tags = "name:Seen: on the proxy, valid-until:2021-09-13T12:26:40Z";
+        assert_eq!(tag_value(tags, "name"), Some("Seen: on the proxy"));
+        assert_eq!(tag_value(tags, "valid-until"), Some("2021-09-13T12:26:40Z"));
     }
 
     /// The last second of year 9999 — far future, but still representable.

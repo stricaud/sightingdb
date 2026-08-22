@@ -14,6 +14,7 @@ mod persistence;
 mod setup;
 mod sighting_reader;
 mod sighting_writer;
+mod stix;
 mod tier;
 mod tls;
 
@@ -187,6 +188,7 @@ fn main() -> Result<()> {
         info,
         acl_file: settings.acl_file.clone(),
         tiers_file: settings.tiers_file.clone(),
+        stix: settings.stix.clone(),
     });
 
     let shutdown = Shutdown::new();

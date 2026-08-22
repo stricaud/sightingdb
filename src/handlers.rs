@@ -24,6 +24,9 @@ pub struct SharedState {
     pub acl_file: Option<std::path::PathBuf>,
     /// Where tiers are written back. `None` makes them read-only.
     pub tiers_file: Option<std::path::PathBuf>,
+    /// What the STIX export needs: who we publish as, and which observable
+    /// type each namespace is configured to hold.
+    pub stix: crate::config::StixSettings,
 }
 
 impl SharedState {
@@ -41,6 +44,7 @@ impl SharedState {
             info: crate::admin::ServerInfo::default(),
             acl_file: None,
             tiers_file: None,
+            stix: crate::config::StixSettings::default(),
         }
     }
 }
@@ -80,6 +84,58 @@ pub struct WriteQuery {
     /// Seconds from the last sighting until the value expires. Absent leaves
     /// whatever TTL the attribute already had; 0 clears it.
     ttl: Option<u64>,
+    /// Comma-separated tags, merged with whatever the value already carried.
+    tags: Option<String>,
+}
+
+/// An export asked for by an automation rather than by hand.
+///
+/// POST because a namespace is a path — putting `feeds/misp/ips` in a query
+/// string means encoding it — and because asking for several at once is the
+/// normal thing to want.
+#[derive(Debug, Deserialize)]
+pub struct ExportRequest {
+    /// One namespace, or several to gather into one bundle.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Shorthand for a single namespace, so a one-liner stays a one-liner.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Substring filter over values, as when browsing.
+    #[serde(default)]
+    pub q: String,
+    pub limit: Option<usize>,
+}
+
+impl ExportRequest {
+    fn wanted(&self) -> Vec<String> {
+        let mut wanted: Vec<String> = Vec::new();
+        for namespace in self.namespace.iter().chain(self.namespaces.iter()) {
+            let namespace = namespace.trim().trim_matches('/').to_string();
+            if !namespace.is_empty() && !wanted.contains(&namespace) {
+                wanted.push(namespace);
+            }
+        }
+        wanted
+    }
+
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(10_000).clamp(1, 100_000)
+    }
+}
+
+/// How much of a namespace one export may carry.
+#[derive(Debug, Deserialize)]
+pub struct ExportQuery {
+    limit: Option<usize>,
+}
+
+impl ExportQuery {
+    /// Two objects per value plus the identities: a bundle is read by a
+    /// machine, but it is still one response held in memory.
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(10_000).clamp(1, 100_000)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +151,9 @@ pub struct BulkSighting {
     pub timestamp: Option<i64>,
     #[serde(default)]
     pub ttl: Option<u64>,
+    /// Comma-separated, merged with whatever the value already carried.
+    #[serde(default)]
+    pub tags: String,
     #[serde(default)]
     pub noshadow: bool,
 }
@@ -213,6 +272,8 @@ pub async fn help() -> impl Responder {
             "\t/rb: read in bulk mode (POST)\n",
             "\t/rbs: read with statistics in bulk mode (POST)\n",
             "\t/d: delete (GET)\n",
+            "\t/stix: export a namespace as a STIX 2.1 bundle (GET)\n",
+            "\t/_api/stix: export one or more namespaces as STIX 2.1 (POST)\n",
             "\t/c: configure (GET)\n",
             "\t/i: info (GET)\n",
         ))
@@ -302,13 +363,97 @@ pub async fn write(
         Err(e) => return error_response(&e),
     };
 
-    match sighting_writer::write(&state.db, &namespace, value, when, query.ttl) {
+    let tags = query.tags.as_deref().unwrap_or_default();
+    match sighting_writer::write_tagged(&state.db, &namespace, value, when, query.ttl, tags) {
         Ok(count) => HttpResponse::Ok().json(WriteResponse {
             message: "ok",
             count,
         }),
         Err(e) => error_response(&e),
     }
+}
+
+/// Export a namespace as a STIX 2.1 bundle.
+///
+/// A read of the whole namespace in another shape, so it needs read access and
+/// nothing more. What each value becomes, and how tags fill in what a value on
+/// its own cannot say, is in [`crate::stix`].
+pub async fn export_stix(
+    state: State,
+    path: web::Path<String>,
+    query: web::Query<ExportQuery>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let namespace = path.into_inner();
+    if let Err(resp) = authorize(&state, &req, &namespace, Access::Read) {
+        return resp;
+    }
+
+    if namespace.starts_with(CONFIG_PREFIX) {
+        return error_response(&ApiError::ConfigNamespace);
+    }
+
+    let Some(export) =
+        crate::stix::export_namespace(&state.db, &state.stix, &namespace, query.limit())
+    else {
+        return error_response(&ApiError::NotFound(NotFound::namespace(&namespace, "")));
+    };
+
+    stix_response(export)
+}
+
+/// The same export, for automation: `POST /_api/stix`.
+///
+/// Every namespace asked for is authorized on its own, exactly as a bulk read
+/// is, so a key scoped to one subtree cannot widen its reach by naming another
+/// in the same request.
+pub async fn export_stix_api(
+    state: State,
+    body: web::Json<ExportRequest>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let body = body.into_inner();
+    let wanted = body.wanted();
+    if wanted.is_empty() {
+        return HttpResponse::BadRequest()
+            .json(Message::new("Name at least one namespace to export."));
+    }
+
+    for namespace in &wanted {
+        if namespace.starts_with(CONFIG_PREFIX) {
+            return error_response(&ApiError::ConfigNamespace);
+        }
+        if let Err(resp) = authorize(&state, &req, namespace, Access::Read) {
+            return resp;
+        }
+    }
+
+    let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    let export =
+        crate::stix::export_namespaces(&state.db, &state.stix, &names, &body.q, body.limit());
+
+    // Nothing asked for exists: that is a mistake worth reporting rather than
+    // an empty bundle to be puzzled over.
+    if export.missing.len() == wanted.len() {
+        return error_response(&ApiError::NotFound(NotFound::namespace(&wanted[0], "")));
+    }
+
+    stix_response(export)
+}
+
+/// A bundle, with what it could not carry reported in headers: the body has to
+/// be a STIX bundle and nothing else.
+fn stix_response(export: crate::stix::Export) -> HttpResponse {
+    let mut response = HttpResponse::Ok();
+    response
+        .insert_header(("X-SightingDB-Exported", export.exported.to_string()))
+        .insert_header(("X-SightingDB-Skipped", export.skipped.len().to_string()))
+        .insert_header(("X-SightingDB-Truncated", export.truncated.to_string()))
+        .content_type("application/stix+json;version=2.1");
+    if !export.missing.is_empty() {
+        response.insert_header(("X-SightingDB-Missing", export.missing.join(",")));
+    }
+    response.json(export.bundle)
 }
 
 pub async fn delete(state: State, path: web::Path<String>, req: HttpRequest) -> HttpResponse {
@@ -388,10 +533,15 @@ pub async fn write_bulk(
         }
 
         let outcome = match item.timestamp.map(timestamp_to_instant).transpose() {
-            Ok(when) => {
-                sighting_writer::write(&state.db, &item.namespace, &item.value, when, item.ttl)
-                    .map(|_| ())
-            }
+            Ok(when) => sighting_writer::write_tagged(
+                &state.db,
+                &item.namespace,
+                &item.value,
+                when,
+                item.ttl,
+                &item.tags,
+            )
+            .map(|_| ()),
             Err(e) => Err(e),
         };
 
@@ -441,6 +591,8 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/w/{namespace:.*}", web::get().to(write))
         .route("/wb", web::post().to(write_bulk))
         .route("/d/{namespace:.*}", web::get().to(delete))
+        .route("/stix/{namespace:.*}", web::get().to(export_stix))
+        .route("/_api/stix", web::post().to(export_stix_api))
         .route("/c/{namespace:.*}", web::get().to(configure_endpoint))
         .route("/i", web::get().to(info))
         .default_service(web::to(help));
@@ -1036,6 +1188,333 @@ mod tests {
         assert!(!st.db.namespace_exists("_config/acl/apikeys/mine"));
         assert!(st.db.legacy_apikeys().is_empty());
         assert!(st.acl().can_write(KEY, "any/namespace"));
+    }
+
+    // -- tags and STIX -------------------------------------------------------
+
+    /// Requests in this section are plain GETs; a helper keeps them readable.
+    macro_rules! visit {
+        ($app:expr, $uri:expr) => {
+            test::call_service(&$app, test::TestRequest::get().uri($uri).to_request()).await
+        };
+        ($app:expr, $uri:expr, $key:expr) => {
+            test::call_service(
+                &$app,
+                test::TestRequest::get()
+                    .uri($uri)
+                    .insert_header(("Authorization", $key))
+                    .to_request(),
+            )
+            .await
+        };
+    }
+
+    #[actix_web::test]
+    async fn a_write_can_carry_tags_and_they_accumulate() {
+        let st = state(false);
+        let app = app!(st);
+
+        visit!(
+            app,
+            "/w/feeds/ips?val=1.2.3.4&tags=stix-type:ipv4-addr,tlp:amber"
+        );
+        // A second source knows something else about the same value.
+        visit!(app, "/w/feeds/ips?val=1.2.3.4&tags=tlp:amber,confidence:80");
+
+        let view = st.db.view("feeds/ips", "1.2.3.4", 0, false).unwrap();
+        assert_eq!(view.tags, "stix-type:ipv4-addr,tlp:amber,confidence:80");
+        assert_eq!(view.count, 2, "tagging is still a sighting");
+    }
+
+    #[actix_web::test]
+    async fn bulk_writes_carry_tags_per_item() {
+        let st = state(false);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .set_json(json!({"items": [
+                    {"namespace": "feeds/ips", "value": "1.2.3.4", "tags": "stix-type:ipv4-addr"},
+                    {"namespace": "feeds/domains", "value": "evil.example", "tags": "tlp:green"},
+                ]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(
+            st.db.view("feeds/ips", "1.2.3.4", 0, false).unwrap().tags,
+            "stix-type:ipv4-addr"
+        );
+        assert_eq!(
+            st.db
+                .view("feeds/domains", "evil.example", 0, false)
+                .unwrap()
+                .tags,
+            "tlp:green"
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_namespace_exports_as_a_stix_bundle() {
+        let st = state(false);
+        let app = app!(st);
+        visit!(
+            app,
+            "/w/feeds/ips?val=1.2.3.4&tags=stix-type:ipv4-addr,tlp:green"
+        );
+
+        let resp = visit!(app, "/stix/feeds/ips");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/stix+json;version=2.1"
+        );
+        assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "1");
+        assert_eq!(resp.headers().get("X-SightingDB-Skipped").unwrap(), "0");
+
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["type"], "bundle");
+        let kinds: Vec<&str> = body["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["type"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"indicator"), "{kinds:?}");
+        assert!(kinds.contains(&"sighting"), "{kinds:?}");
+        assert!(kinds.contains(&"identity"), "{kinds:?}");
+        assert!(kinds.contains(&"marking-definition"), "{kinds:?}");
+    }
+
+    #[actix_web::test]
+    async fn exporting_needs_read_access_and_a_namespace_that_exists() {
+        let st = state(true);
+        let app = app!(st);
+        visit!(app, "/w/feeds/ips?val=1.2.3.4", KEY);
+
+        // The export is a read, so it answers to the same rules as `/r`.
+        assert_eq!(
+            visit!(app, "/stix/feeds/ips").status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(visit!(app, "/stix/feeds/ips", KEY).status(), StatusCode::OK);
+        assert_eq!(
+            visit!(app, "/stix/nope", KEY).status(),
+            StatusCode::NOT_FOUND
+        );
+        // The ACL refuses `_config` before the handler gets a say.
+        assert_eq!(
+            visit!(app, "/stix/_config/acl", KEY).status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// With authentication off there is no ACL to refuse it, so the handler's
+    /// own guard is what keeps the key store out of an export.
+    #[actix_web::test]
+    async fn an_export_never_reaches_the_config_namespace() {
+        let st = state(false);
+        let app = app!(st);
+
+        assert_eq!(
+            visit!(app, "/stix/_config/acl/apikeys").status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_api_endpoint_exports_several_namespaces_at_once() {
+        let st = state(false);
+        let app = app!(st);
+        visit!(
+            app,
+            "/w/feeds/misp/ips?val=1.2.3.4&tags=stix-type:ipv4-addr"
+        );
+        visit!(app, "/w/feeds/otx/ips?val=1.2.3.4&tags=stix-type:ipv4-addr");
+        visit!(app, "/w/feeds/otx/ips?val=5.6.7.8&tags=stix-type:ipv4-addr");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespaces": ["feeds/misp/ips", "feeds/otx/ips"]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "3");
+
+        let body: Value = test::read_body_json(resp).await;
+        let objects = body["objects"].as_array().unwrap();
+        let of_type =
+            |kind: &str| -> Vec<&Value> { objects.iter().filter(|o| o["type"] == kind).collect() };
+
+        // 1.2.3.4 was seen in both namespaces: one indicator, two sightings.
+        assert_eq!(of_type("indicator").len(), 2);
+        assert_eq!(of_type("sighting").len(), 3);
+        let shared: Vec<&Value> = of_type("sighting")
+            .into_iter()
+            .filter(|sighting| {
+                sighting["sighting_of_ref"]
+                    == of_type("indicator")
+                        .iter()
+                        .find(|indicator| indicator["pattern"] == "[ipv4-addr:value = '1.2.3.4']")
+                        .unwrap()["id"]
+            })
+            .collect();
+        assert_eq!(shared.len(), 2);
+        let namespaces: Vec<&str> = shared
+            .iter()
+            .map(|sighting| sighting["x_sightingdb_namespace"].as_str().unwrap())
+            .collect();
+        assert!(namespaces.contains(&"feeds/misp/ips"), "{namespaces:?}");
+        assert!(namespaces.contains(&"feeds/otx/ips"), "{namespaces:?}");
+    }
+
+    #[actix_web::test]
+    async fn the_api_endpoint_authorizes_every_namespace_it_is_given() {
+        let st = state(true);
+        st.acl
+            .write()
+            .unwrap()
+            .set("scoped", parse_grants("rw:feeds").unwrap());
+        let app = app!(st);
+        visit!(app, "/w/feeds/ips?val=1.2.3.4", KEY);
+        visit!(app, "/w/private/ips?val=1.2.3.4", KEY);
+
+        let ask = |namespaces: Value, key: Option<&'static str>| {
+            let mut req = test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({ "namespaces": namespaces }));
+            if let Some(key) = key {
+                req = req.insert_header(("Authorization", key));
+            }
+            req.to_request()
+        };
+
+        assert_eq!(
+            test::call_service(&app, ask(json!(["feeds/ips"]), None))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            test::call_service(&app, ask(json!(["feeds/ips"]), Some("scoped")))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        // Naming a namespace it may not read refuses the whole request rather
+        // than quietly returning the half it is allowed.
+        assert_eq!(
+            test::call_service(
+                &app,
+                ask(json!(["feeds/ips", "private/ips"]), Some("scoped"))
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[actix_web::test]
+    async fn an_api_export_reports_namespaces_that_are_not_there() {
+        let st = state(false);
+        let app = app!(st);
+        visit!(app, "/w/feeds/ips?val=1.2.3.4&tags=stix-type:ipv4-addr");
+
+        // One real, one not: the real one still comes back.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespaces": ["feeds/ips", "feeds/nope"]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "1");
+        assert_eq!(
+            resp.headers().get("X-SightingDB-Missing").unwrap(),
+            "feeds/nope"
+        );
+
+        // None of them real is a mistake worth reporting.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespace": "feeds/nope"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // As is asking for nothing at all.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespaces": []}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn an_api_export_can_filter_and_cap_what_it_reads() {
+        let st = state(false);
+        let app = app!(st);
+        for value in ["10.0.0.1", "10.0.0.2", "192.0.2.1"] {
+            visit!(
+                app,
+                &format!("/w/feeds/ips?val={value}&tags=stix-type:ipv4-addr")
+            );
+        }
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespace": "feeds/ips", "q": "10.0.0."}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "2");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespace": "feeds/ips", "limit": 1}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "1");
+        assert_eq!(
+            resp.headers().get("X-SightingDB-Truncated").unwrap(),
+            "true"
+        );
+    }
+
+    #[actix_web::test]
+    async fn an_api_export_refuses_the_config_namespace() {
+        let st = state(false);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespace": "_config/acl/apikeys"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // -- bulk --------------------------------------------------------------

@@ -26,6 +26,11 @@ pub struct Sighting {
     /// How many observations this represents. STIX carries a count; MISP
     /// attributes are one apiece.
     pub count: u64,
+    /// What the source said about the value beyond the value itself — its
+    /// observable type, markings, who published it. Written as tags on the
+    /// attribute, which is what the STIX export reads back. See the tag
+    /// vocabulary in the README.
+    pub tags: Vec<String>,
 }
 
 impl Sighting {
@@ -41,8 +46,23 @@ impl Sighting {
             timestamp,
             last_timestamp: None,
             count: 1,
+            tags: Vec::new(),
         }
     }
+
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
+    }
+}
+
+/// Make one tag safe to put in a comma-separated set.
+///
+/// A comma inside a tag would split it in two, so it becomes a semicolon —
+/// keeping the information rather than dropping the tag, which is what matters
+/// for a name or a description coming from someone else's feed.
+pub fn sanitize_tag(tag: &str) -> String {
+    tag.trim().replace(',', ";")
 }
 
 /// Which MISP attribute types are ingested, and where they land.
@@ -167,7 +187,80 @@ fn attribute_to_sighting(attribute: &Value, mapping: &Mapping) -> Option<Sightin
         return None;
     }
 
-    Some(Sighting::once(namespace, value, timestamp_of(attribute)))
+    Some(
+        Sighting::once(namespace, value, timestamp_of(attribute))
+            .with_tags(tags_of(attribute, misp_type)),
+    )
+}
+
+/// What MISP knows about an attribute, as tags.
+///
+/// The MISP type is kept as it was published *and* translated to the STIX
+/// observable type where there is one, so the STIX export can build a pattern
+/// without having to know anything about MISP.
+fn tags_of(attribute: &Value, misp_type: &str) -> Vec<String> {
+    let mut tags = vec![format!("misp-type:{misp_type}")];
+
+    if let Some(stix_type) = stix_type_for_misp(misp_type) {
+        tags.push(format!("stix-type:{stix_type}"));
+    }
+    if let Some(category) = attribute.get("category").and_then(Value::as_str) {
+        tags.push(format!("misp-category:{}", sanitize_tag(category)));
+    }
+    if let Some(event) = attribute.get("event_id").and_then(id_like) {
+        tags.push(format!("misp-event:{event}"));
+    }
+    if let Some(comment) = attribute
+        .get("comment")
+        .and_then(Value::as_str)
+        .filter(|comment| !comment.trim().is_empty())
+    {
+        tags.push(format!("description:{}", sanitize_tag(comment)));
+    }
+
+    // MISP's own tags are already `namespace:predicate` shaped — `tlp:amber`,
+    // `misp-galaxy:threat-actor="..."` — so they are carried across as they
+    // are, which is what makes `tlp:` work end to end.
+    if let Some(Value::Array(misp_tags)) = attribute.get("Tag") {
+        for name in misp_tags
+            .iter()
+            .filter_map(|tag| tag.get("name").and_then(Value::as_str))
+        {
+            tags.push(sanitize_tag(name));
+        }
+    }
+
+    tags
+}
+
+/// MISP attribute types to STIX observable types, for the ones that map one to
+/// one. Anything absent keeps only its `misp-type:` tag, and the export falls
+/// back to recognising the value by its shape.
+fn stix_type_for_misp(misp_type: &str) -> Option<&'static str> {
+    Some(match misp_type {
+        "ip-src" | "ip-dst" | "ip-src|port" | "ip-dst|port" => "ipv4-addr",
+        "domain" | "hostname" | "domain|ip" => "domain-name",
+        "url" | "uri" => "url",
+        "email" | "email-src" | "email-dst" | "email-reply-to" => "email-addr",
+        "md5" | "filename|md5" => "file.MD5",
+        "sha1" | "filename|sha1" => "file.SHA-1",
+        "sha256" | "filename|sha256" => "file.SHA-256",
+        "filename" => "file",
+        "mutex" => "mutex",
+        "regkey" => "windows-registry-key",
+        "mac-address" => "mac-addr",
+        "AS" => "autonomous-system",
+        _ => return None,
+    })
+}
+
+/// MISP ids arrive as numbers or as strings of digits.
+fn id_like(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
 }
 
 /// MISP sends timestamps as strings of Unix seconds, but not always.
@@ -235,8 +328,54 @@ mod tests {
 
         assert_eq!(
             parse(body, &mapping()).unwrap(),
-            vec![Sighting::once("misp/ips", "1.2.3.4", Some(1_600_000_000))]
+            vec![
+                Sighting::once("misp/ips", "1.2.3.4", Some(1_600_000_000)).with_tags(vec![
+                    "misp-type:ip-src".to_string(),
+                    "stix-type:ipv4-addr".to_string(),
+                ])
+            ]
         );
+    }
+
+    /// What MISP knows beyond the value is kept as tags, which is what the
+    /// STIX export reads back when it has to build an indicator.
+    #[test]
+    fn an_attribute_carries_what_misp_said_about_it() {
+        let body = r#"{"Attribute": {"type": "md5", "value": "d41d8cd98f00b204e9800998ecf8427e",
+                       "category": "Payload delivery", "event_id": 42,
+                       "comment": "dropper, second stage",
+                       "Tag": [{"name": "tlp:amber"}, {"name": "malware:emotet"}]}}"#;
+
+        let tags = &parse(body, &mapping()).unwrap()[0].tags;
+
+        assert_eq!(
+            tags,
+            &[
+                "misp-type:md5",
+                "stix-type:file.MD5",
+                "misp-category:Payload delivery",
+                "misp-event:42",
+                // The comma would have split one tag into two, so it is not
+                // left in place.
+                "description:dropper; second stage",
+                "tlp:amber",
+                "malware:emotet",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unmapped_misp_type_still_says_what_misp_called_it() {
+        let body = r#"{"Attribute": {"type": "domain", "value": "evil.com"}}"#;
+        let mut mapping = mapping();
+        mapping.types.insert("btc".into(), "misp/wallets".into());
+
+        let tags = &parse(body, &mapping).unwrap()[0].tags;
+        assert_eq!(tags, &["misp-type:domain", "stix-type:domain-name"]);
+
+        let body = r#"{"Attribute": {"type": "btc", "value": "1BvBMSEY"}}"#;
+        let tags = &parse(body, &mapping).unwrap()[0].tags;
+        assert_eq!(tags, &["misp-type:btc"], "no STIX type to claim");
     }
 
     #[test]

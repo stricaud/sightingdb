@@ -8,12 +8,29 @@ use crate::error::ApiError;
 /// `when` is `None` for "right now", which is what a write without an explicit
 /// `timestamp=` argument means. `ttl` is `None` to leave whatever expiry the
 /// attribute already had.
+#[cfg(test)]
 pub fn write(
     db: &Database,
     namespace: &str,
     value: &str,
     when: Option<DateTime<Utc>>,
     ttl: Option<u64>,
+) -> Result<u64, ApiError> {
+    write_tagged(db, namespace, value, when, ttl, "")
+}
+
+/// The same, carrying what is known about the value alongside the sighting.
+///
+/// Tags are merged with whatever the value already had — see
+/// [`crate::attribute::split_tags`] for the format and the README for the
+/// vocabulary the STIX export understands.
+pub fn write_tagged(
+    db: &Database,
+    namespace: &str,
+    value: &str,
+    when: Option<DateTime<Utc>>,
+    ttl: Option<u64>,
+    tags: &str,
 ) -> Result<u64, ApiError> {
     if value.is_empty() {
         return Err(ApiError::EmptyValue);
@@ -24,7 +41,7 @@ pub fn write(
         return Err(ApiError::ConfigNamespace);
     }
 
-    Ok(db.write(
+    Ok(db.write_tagged(
         namespace,
         value,
         when.unwrap_or_else(Utc::now),
@@ -32,6 +49,7 @@ pub fn write(
             consensus: true,
             ttl,
         },
+        tags,
     ))
 }
 

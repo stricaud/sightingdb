@@ -194,6 +194,7 @@ impl Namespace {
         when: DateTime<Utc>,
         ttl: Option<u64>,
         retention: usize,
+        tags: &str,
     ) -> (u64, bool, AttributeView) {
         if ttl.is_some_and(|ttl| ttl > 0) {
             self.has_ttl.store(true, Ordering::Relaxed);
@@ -207,6 +208,9 @@ impl Namespace {
                 let mut attr = cell.lock().unwrap_or_else(PoisonError::into_inner);
                 if let Some(ttl) = ttl {
                     attr.set_ttl(ttl);
+                }
+                if !tags.is_empty() {
+                    attr.add_tags(tags);
                 }
                 attr.increment(when, retention);
                 return (attr.count(), false, attr.view(0, false));
@@ -225,6 +229,9 @@ impl Namespace {
         let attr = cell.get_mut().unwrap_or_else(PoisonError::into_inner);
         if let Some(ttl) = ttl {
             attr.set_ttl(ttl);
+        }
+        if !tags.is_empty() {
+            attr.add_tags(tags);
         }
         attr.increment(when, retention);
         (attr.count(), is_new, attr.view(0, false))
@@ -304,6 +311,20 @@ impl Namespace {
             !expired
         });
         removed
+    }
+
+    /// Replace one value's tag set, reporting whether the value was there.
+    fn retag(&self, value: &str, tags: &str, now: DateTime<Utc>) -> bool {
+        let values = self.values.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(cell) = values.get(value) else {
+            return false;
+        };
+        let mut attr = cell.lock().unwrap_or_else(PoisonError::into_inner);
+        if attr.is_expired(now) {
+            return false;
+        }
+        attr.set_tags(tags);
+        true
     }
 
     /// Give back one consensus count, dropping the entry when it reaches zero.
@@ -456,6 +477,24 @@ impl Database {
     /// namespace, since consensus means "how many namespaces have seen this
     /// value", not "how many times was it written".
     pub fn write(&self, path: &str, value: &str, when: DateTime<Utc>, opts: WriteOpts) -> u64 {
+        self.write_tagged(path, value, when, opts, "")
+    }
+
+    /// A sighting that also carries what is known about the value.
+    ///
+    /// Tags are merged into whatever the value already had, in the same lock as
+    /// the sighting itself: an importer contributing `stix-type:ipv4-addr` and
+    /// a writer contributing `tlp:amber` both end up on the value, and neither
+    /// write can be lost to the other. See [`crate::attribute::split_tags`] for
+    /// the format.
+    pub fn write_tagged(
+        &self,
+        path: &str,
+        value: &str,
+        when: DateTime<Utc>,
+        opts: WriteOpts,
+        tags: &str,
+    ) -> u64 {
         // Shadow sightings get their retention from policy rather than from the
         // caller, which is what bounds `_shadow/*` growth.
         let ttl = match opts.ttl {
@@ -468,7 +507,7 @@ impl Database {
 
         let namespace = self.namespace_or_create(path);
         let (count, is_new, mut view) =
-            namespace.record(value, when, ttl, self.policy.stats_retention);
+            namespace.record(value, when, ttl, self.policy.stats_retention, tags);
 
         // The namespace's locks are released by now, so reaching into `_all`
         // here respects the ordering rule above.
@@ -481,6 +520,21 @@ impl Database {
         self.mark_dirty(path);
 
         count
+    }
+
+    /// Replace a value's tags outright, which is how a wrong one comes off.
+    ///
+    /// This is not a sighting: nothing is counted, and `first_seen` and
+    /// `last_seen` do not move. Returns false if the value is not there.
+    pub fn set_tags(&self, path: &str, value: &str, tags: &str) -> bool {
+        let Some(namespace) = self.namespace(path) else {
+            return false;
+        };
+        let changed = namespace.retag(value, tags, Utc::now());
+        if changed {
+            self.mark_dirty(path);
+        }
+        changed
     }
 
     pub fn view(

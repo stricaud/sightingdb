@@ -100,6 +100,7 @@
       <span class="spacer"></span>
       <button id="ns-new">New namespace</button>
       <button id="ns-add">Add values</button>
+      <button id="ns-export" title="Download this namespace as a STIX 2.1 bundle">Export STIX</button>
       <button id="ns-prev">Previous</button>
       <button id="ns-next">Next</button>
     </div>
@@ -170,6 +171,16 @@
       <strong class="crumbs" id="d-value"></strong>
     </div>
     <div class="cards" id="d-cards"></div>
+    <div class="row" style="margin-top:.8rem">
+      <label class="muted" style="flex:1">Tags<br>
+        <input id="d-tags" type="text" style="width:100%"
+               placeholder="stix-type:ipv4-addr, tlp:amber">
+      </label>
+      <button id="d-save-tags" style="align-self:flex-end">Save tags</button>
+    </div>
+    <p class="muted">Comma separated, and replacing rather than merging: this is
+       where a wrong tag comes off. What each one means to the STIX export is in
+       the README.</p>
     <h3>Sightings over time</h3>
     <p class="muted" id="d-nostats"></p>
     <div id="chart"></div>
@@ -225,6 +236,11 @@
                 placeholder="8.8.8.8&#10;1.1.1.1"></textarea>
     </label></p>
 
+    <p><label class="muted">Tags, comma separated<br>
+      <input id="av-tags" type="text" size="42"
+             placeholder="stix-type:ipv4-addr, tlp:amber, confidence:80">
+    </label></p>
+
     <div class="row">
       <label class="muted">TTL in seconds
         <input id="av-ttl" type="number" min="0" step="1" size="8" placeholder="none">
@@ -235,7 +251,10 @@
     </div>
     <p class="muted">Leave the TTL blank to keep whatever expiry a value already
        had, or set 0 to clear it. Leave the time blank to record the values as
-       seen now. Writing a namespace that does not exist creates it.</p>
+       seen now. Writing a namespace that does not exist creates it. Tags are
+       merged with whatever each value already carried, and are what the STIX
+       export uses to say what a value <em>is</em> — see the tag vocabulary in
+       the README.</p>
 
     <p class="err" id="av-error"></p>
     <div class="row">
@@ -296,6 +315,8 @@ const state = {
   nsOffset: 0, nsTotal: 0,
   vOffset: 0, vTotal: 0,
   chart: null, graph: null,
+  // The value the detail view is showing, so its tags can be saved back.
+  value: null,
 };
 
 const VIEWS = ["view-namespaces", "view-values", "view-value", "view-keys", "view-config"];
@@ -559,6 +580,7 @@ async function createNamespace() {
 function openValueEditor() {
   $("av-namespace").value = state.namespace || "";
   $("av-values").value = "";
+  $("av-tags").value = "";
   $("av-ttl").value = "";
   $("av-when").value = "";
   $("av-error").textContent = "";
@@ -568,7 +590,7 @@ function openValueEditor() {
 async function addValues() {
   const namespace = $("av-namespace").value.trim();
   const values = $("av-values").value.split(/\r?\n/);
-  const body = { namespace, values };
+  const body = { namespace, values, tags: $("av-tags").value.trim() };
 
   const ttl = $("av-ttl").value.trim();
   if (ttl !== "") body.ttl = Number(ttl);
@@ -677,13 +699,16 @@ async function loadValue(value) {
     const item = await api(
       `/_management/api/value?namespace=${ns}&value=${encodeURIComponent(value)}`);
 
+    state.value = item.value;
+    $("d-tags").value = item.tags || "";
+
     const cards = [
       ["Count", item.count],
       ["First seen", fmtTime(item.first_seen)],
       ["Last seen", fmtTime(item.last_seen)],
       ["Consensus", `${item.consensus} namespace(s)`],
       ["TTL", item.ttl ? `${item.ttl}s` : "none"],
-      ["Tags", item.tags || "—"],
+      ["Observable", stixTypeOf(item) || "not recognised"],
     ];
     $("d-cards").replaceChildren(...cards.map(([label, text]) => {
       const div = document.createElement("div");
@@ -865,6 +890,112 @@ function drawRelations(value, items) {
 const escapeHtml = (text) =>
   String(text).replace(/[&<>"]/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+/**
+ * What the export will call this value: what its tags say, else what it looks
+ * like. Kept in step with `infer_type` on the server, which is the one that
+ * actually decides — this is only so the page can say what will happen.
+ */
+function stixTypeOf(item) {
+  const tagged = tagValue(item.tags, "stix-type");
+  if (tagged) return tagged;
+
+  const value = (item.value || "").trim();
+  if (value.includes("://")) return "url";
+  if (/^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(value)) return "ipv4-addr";
+  if (value.includes(":") && /^[0-9a-f:]+(\/\d{1,3})?$/i.test(value)) return "ipv6-addr";
+  if (/^[^@\s]+@[^@\s]+$/.test(value)) return "email-addr";
+  const hash = { 32: "file.MD5", 40: "file.SHA-1", 64: "file.SHA-256", 128: "file.SHA-512" };
+  if (/^[0-9a-f]+$/i.test(value) && hash[value.length]) return hash[value.length];
+  if (/^[^\s]+\.[a-z]{2,}$/i.test(value)) return "domain-name";
+  return null;
+}
+
+/** The first `key:value` tag with this key. */
+function tagValue(tags, key) {
+  for (const tag of (tags || "").split(",")) {
+    const at = tag.indexOf(":");
+    if (at > 0 && tag.slice(0, at).trim().toLowerCase() === key) {
+      return tag.slice(at + 1).trim();
+    }
+  }
+  return null;
+}
+
+/** Replace the tags on the value being shown. */
+async function saveTags() {
+  if (!state.namespace || !state.value) return;
+  $("d-save-tags").disabled = true;
+  try {
+    const item = await api("/_management/api/tags", "POST", {
+      namespace: state.namespace,
+      value: state.value,
+      tags: $("d-tags").value,
+    });
+    setError("");
+    // Redrawn so the observable type card agrees with the tags just saved.
+    loadValue(item.value || state.value);
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    $("d-save-tags").disabled = false;
+  }
+}
+
+/**
+ * Download the namespace as a STIX 2.1 bundle.
+ *
+ * The same `POST /_api/stix` an automation would call, so the button and a
+ * script cannot drift apart. Fetched rather than linked because the export
+ * needs the API key, which a plain link cannot carry.
+ */
+async function exportStix() {
+  if (!state.namespace) {
+    setError("Open a namespace first; the export is per namespace.");
+    return;
+  }
+  const button = $("ns-export");
+  button.disabled = true;
+  try {
+    const res = await fetch("/_api/stix", {
+      method: "POST",
+      headers: { Authorization: state.key, "Content-Type": "application/json" },
+      body: JSON.stringify({ namespace: state.namespace }),
+    });
+    if (res.status === 401 || res.status === 403) {
+      signOut("That key was not accepted.");
+      return;
+    }
+    if (!res.ok) {
+      const failure = await res.json().catch(() => ({}));
+      throw new Error(failure.message || `${res.status} ${res.statusText}`);
+    }
+
+    const exported = res.headers.get("X-SightingDB-Exported");
+    const skipped = Number(res.headers.get("X-SightingDB-Skipped") || 0);
+    const truncated = res.headers.get("X-SightingDB-Truncated") === "true";
+
+    const blob = new Blob([await res.text()], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${state.namespace.replace(/\//g, "-")}-stix.json`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+
+    // Anything the bundle could not carry is worth saying out loud rather than
+    // leaving to be noticed in the file.
+    const notes = [`Exported ${exported} value(s).`];
+    if (skipped) {
+      notes.push(`${skipped} skipped: no observable type, so no pattern — tag them with stix-type:`);
+    }
+    if (truncated) notes.push("the namespace holds more than one export can carry.");
+    setError(notes.length > 1 ? notes.join(" ") : "");
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    button.disabled = false;
+  }
+}
 
 /**
  * The server buckets sightings by hour, so the histogram is those buckets
@@ -1145,6 +1276,8 @@ $("nav-config").onclick = showConfig;
 $("ns-up").onclick = () => go(parentOf(state.namespace));
 $("ns-new").onclick = openNamespaceEditor;
 $("ns-add").onclick = openValueEditor;
+$("ns-export").onclick = exportStix;
+$("d-save-tags").onclick = saveTags;
 $("nn-cancel").onclick = () => $("ns-editor").close();
 $("nn-name").addEventListener("input", previewNamespace);
 $("ns-form").addEventListener("submit", (e) => { e.preventDefault(); createNamespace(); });

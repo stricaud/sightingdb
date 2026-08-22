@@ -118,6 +118,13 @@ Pass `timestamp=<unix seconds>` to record a sighting at a specific time; without
 
 Pass `ttl=<seconds>` to expire the value that long after it was last seen. Writing the value again pushes the deadline out; writing without `ttl=` leaves the existing one alone, and `ttl=0` clears it. Expired values read as `404` immediately and are reclaimed by the next sweep, which also gives back the consensus they were holding.
 
+Pass `tags=<comma,separated>` to record what is known about the value beyond the fact that it was seen:
+
+	$ curl -k 'https://localhost:9999/w/my/namespace/?val=127.0.0.1&tags=stix-type:ipv4-addr,tlp:amber'
+	{"message":"ok","count":1}
+
+Tags are *merged*, so one feed contributing `stix-type:ipv4-addr` and another contributing `tlp:amber` leave the value knowing both. See [Tags](#tags).
+
 Reading
 -------
 	$ curl -k https://localhost:9999/r/my/namespace/?val=127.0.0.1
@@ -142,7 +149,7 @@ Bulk
 	    -d '{"items":[{"namespace":"my/namespace","value":"127.0.0.1"}]}'
 	{"message":"ok","written":1}
 
-`timestamp`, `ttl` and `noshadow` are optional on each item.
+`timestamp`, `ttl`, `tags` and `noshadow` are optional on each item.
 
 Authentication
 --------------
@@ -160,6 +167,8 @@ REST Endpoints
 	/rb: read in bulk mode (POST)
 	/rbs: read with statistics in bulk mode (POST)
 	/d: delete (GET)
+	/stix: export a namespace as a STIX 2.1 bundle (GET)
+	/_api/stix: export one or more namespaces as STIX 2.1 (POST)
 	/c: configure (GET, not implemented)
 	/i: info (GET)
 
@@ -277,14 +286,18 @@ like: `misp/ips` under `feeds` creates the whole path. An empty namespace is a
 real namespace — it is snapshotted, it survives a restart, and sweeps do not
 reclaim it, since only namespaces a sweep *empties* are litter.
 
-**Add values** records one value or a pasted list of them, optionally with a TTL
-and the time they were seen. They are counted towards consensus exactly as a
+**Add values** records one value or a pasted list of them, optionally with
+[tags](#tags), a TTL and the time they were seen. They are counted towards consensus exactly as a
 `/w/` write would be; nothing added here is a second class of sighting. Writing
 to a namespace that does not exist creates it, as it does everywhere else.
 
-Clicking a value shows what the database knows about it: a histogram of when it
-was seen, built from the hourly statistics already kept, and a force-directed
-graph of **every namespace holding that value** — the point of consensus made
+**Export STIX** downloads the namespace being browsed as a STIX 2.1 bundle; see
+[Exporting](#exporting).
+
+Clicking a value shows what the database knows about it: its tags, which can be
+edited there and are what the STIX export reads; a histogram of when it was
+seen, built from the hourly statistics already kept; and a force-directed graph
+of **every namespace holding that value** — the point of consensus made
 visible. Colour is the top-level namespace, shape says whether a node is the
 value, a folder or a namespace, and size is how often the value was seen there.
 Folders on the way down are drawn too, so namespaces sharing a path cluster
@@ -338,6 +351,12 @@ usual source is MISP, whose publisher sends `<topic> <json>` frames:
 	domain = "misp/domains"
 	md5 = "misp/hashes"
 
+MISP's own tags come across as they are — `tlp:amber` means the same thing here
+— alongside `misp-type:`, `misp-category:` and `misp-event:`, and the MISP type
+is translated to a `stix-type:` where there is a one-to-one mapping, so the STIX
+export can build a pattern without knowing anything about MISP. See
+[Tags](#tags).
+
 Attributes are read from `misp_json_attribute`, and from whole events on
 `misp_json` including attributes nested inside objects. Only mapped types are
 ingested unless `default_namespace` is set, MISP's own timestamps are preserved,
@@ -371,6 +390,178 @@ Counts and windows survive the import: an observed-data seen 12 times between
 two instants becomes a value with `count=12` whose `first_seen` and `last_seen`
 bracket that window. A file object yields one sighting per hash. A bundle that
 fails to parse is reported and skipped so the rest of the import continues.
+
+What the bundle says *about* a value is kept as [tags](#tags): the observable
+type, the indicator's id and `indicator_types`, TLP markings (by reference to
+the well-known ids as well as by definition), `confidence`, the identity that
+published it and the identities in `where_sighted_refs`, the name, and
+`valid_until`. That is what lets [the export](#stix-21-1) put the value back on
+the wire as STIX without inventing the parts a bare value cannot hold.
+
+Tags
+====
+
+A sighting on its own is `<namespace, value, count, first_seen, last_seen>`.
+That is enough to answer "how often, and when" and nothing else — it does not
+say what the value *is*, who saw it, or how it may be shared. Tags carry that,
+and are what makes the STIX export able to produce something a consumer can act
+on.
+
+A tag set is a **comma-separated list**, each entry either a bare label or
+`key:value`:
+
+	stix-type:ipv4-addr, tlp:amber, confidence:80, identity:Beta Cyber Intelligence Company
+
+Comma is the separator because the interesting values contain spaces, so a
+value can contain anything *except* a comma — colons included, which is what a
+URL or an RFC 3339 timestamp needs. A key may repeat; `indicator-type` below
+does. Whitespace around entries is trimmed.
+
+Tags arrive three ways: the importers write what the source said (see
+[Importing](#importing)), `tags=` on a write adds to them, and the management
+interface edits them by hand. Writes **merge**, so two feeds each contribute
+what they know; only the management interface's tag box replaces a set, which
+is how a wrong tag comes off.
+
+Vocabulary
+----------
+
+These are the keys the STIX export understands. Anything else is kept and
+ignored, so your own conventions cost nothing.
+
+| Tag | What it does |
+| --- | --- |
+| `stix-type:<type>` | The observable type, and so the pattern: `ipv4-addr`, `domain-name`, `url`, `email-addr`, `mutex`, `windows-registry-key`, or `file.<ALGORITHM>` for a hash. Without it the type is taken from the `[stix.types]` mapping for the namespace, and failing that from the shape of the value. |
+| `stix-id:indicator--<uuid>` | Reuse this indicator id instead of minting one. Written by the STIX importer, so a value that arrived as STIX goes back out under the id its publisher gave it. |
+| `indicator-type:<value>` | Adds to `indicator_types`. Repeatable. The STIX vocabulary is `malicious-activity`, `anomalous-activity`, `benign`, `compromised`, `attribution`, `unknown`, ... |
+| `tlp:<white\|green\|amber\|red>` | Marks the indicator and the sighting with the matching TLP marking definition, which is included in the bundle. |
+| `confidence:<0-100>` | STIX `confidence` on both objects. Out-of-range values are ignored. |
+| `identity:<name>` | Who saw it: becomes an `identity` object referenced from `where_sighted_refs`. Repeatable. Without one, the sighting is attributed to the publishing identity. |
+| `name:<text>` | Indicator `name`. |
+| `description:<text>` | Indicator `description`. |
+| `valid-until:<rfc3339 or unix seconds>` | Indicator `valid_until`. Otherwise a TTL supplies one, counted from the last sighting exactly as the database counts it. |
+
+The importers also write tags that the export does not read but a person might
+want: `misp-type:`, `misp-category:`, `misp-event:`, and MISP's own tags as
+they were published.
+
+Tags are visible wherever a value is: in `/r` and `/rs` responses, in the DNS
+TXT answer, and in the management interface.
+
+Exporting
+=========
+
+STIX 2.1
+--------
+
+	$ curl -k -H 'Authorization: changeme' https://localhost:9999/stix/feeds/misp/ips
+
+One namespace becomes a STIX 2.1 bundle shaped after the OASIS ["Sighting of an
+Indicator"](https://oasis-open.github.io/cti-documentation/examples/sighting-of-an-indicator)
+example: for each value an `indicator` carrying the pattern and a `sighting`
+pointing at it with the count and the observation window, plus the `identity`
+objects they refer to and any TLP markings used.
+
+	{
+	  "type": "bundle",
+	  "id": "bundle--...",
+	  "objects": [
+	    {"type": "identity", "id": "identity--...", "name": "SightingDB",
+	     "identity_class": "system", ...},
+	    {"type": "indicator", "id": "indicator--...",
+	     "pattern": "[ipv4-addr:value = '198.51.100.7']", "pattern_type": "stix",
+	     "indicator_types": ["malicious-activity"], "confidence": 80,
+	     "valid_from": "2020-09-13T12:26:40.000Z", ...},
+	    {"type": "sighting", "id": "sighting--...", "count": 12,
+	     "first_seen": "2020-09-13T12:26:40.000Z",
+	     "last_seen": "2020-09-14T09:03:11.000Z",
+	     "sighting_of_ref": "indicator--...",
+	     "where_sighted_refs": ["identity--..."],
+	     "x_sightingdb_namespace": "feeds/misp/ips", ...}
+	  ]
+	}
+
+The export is a read, so it answers to the same key and the same permissions as
+`/r`. The management interface's **Export STIX** button downloads the bundle for
+the namespace being browsed, by calling the same automation endpoint below — so
+what the button gives you and what a script gets cannot drift apart.
+
+For automation
+--------------
+
+	$ curl -k -X POST https://localhost:9999/_api/stix \
+	    -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -d '{"namespaces": ["feeds/misp/ips", "feeds/otx/ips"], "q": "10.0.", "limit": 5000}'
+
+`POST /_api/stix` is the same export for a script: a namespace is a path, so
+POST saves encoding it into a URL, and several can be gathered into one bundle.
+
+| Field | |
+| --- | --- |
+| `namespaces` | The namespaces to export. |
+| `namespace` | Shorthand for one, so a one-liner stays a one-liner. |
+| `q` | Substring filter over values, as when browsing. |
+| `limit` | Values read per namespace: 10,000 by default, 100,000 at most. |
+
+**Every namespace is authorized on its own**, exactly as a bulk read is: naming
+one the key may not read refuses the whole request with `403` rather than
+quietly returning the half it is allowed. `_config` is refused outright. As
+everywhere else on the data API, `authenticate = false` means there is no ACL
+to consult — the switch that opens `/r` opens this too.
+
+Because ids are deterministic, gathering namespaces is worth doing: a value in
+two of them has **one** indicator between them and a sighting each.
+
+	X-SightingDB-Exported: 3
+	X-SightingDB-Skipped: 0
+	X-SightingDB-Truncated: false
+	X-SightingDB-Missing: feeds/nope
+
+A namespace that does not exist is named in `X-SightingDB-Missing` and the rest
+still come back; if none of them exist the answer is `404`.
+
+**Ids are deterministic.** Every id is a UUIDv5 derived from a SightingDB
+namespace UUID and the thing it names, which has two consequences worth
+relying on: exporting the same data twice produces the same bundle byte for
+byte, and the same value in two namespaces produces *one* indicator with a
+sighting each — so a consumer merging both bundles sees one indicator sighted
+twice rather than two indicators. A `stix-id:` tag overrides the minted id.
+
+Who the bundle is published as comes from the configuration:
+
+	[stix]
+	identity = "Alpha Threat Analysis Org."
+	identity_class = "organization"
+
+The default is `SightingDB` with class `system` — a database reporting what it
+saw. That identity is the `created_by_ref` of everything in the bundle, and the
+`where_sighted_refs` of any sighting whose value carries no `identity:` tag.
+
+**A value with no observable type is skipped**, because a STIX indicator is a
+pattern and there is no pattern without a type. The response says how many that
+was, rather than leaving it to be noticed:
+
+	X-SightingDB-Exported: 412
+	X-SightingDB-Skipped: 3
+	X-SightingDB-Truncated: false
+
+Tag those values with `stix-type:`, or map the namespace in `[stix.types]` so
+the whole namespace has a type. `limit=` caps how many values one export reads
+(10,000 by default, 100,000 at most); `X-SightingDB-Truncated` says when the
+namespace held more.
+
+Round trip
+----------
+
+Importing a bundle and exporting it again preserves what both formats can hold:
+the importer writes the observable type, the indicator id, its `indicator_types`,
+markings, confidence, the identities and the validity window as tags, and the
+exporter reads them back. See [Tags](#tags).
+
+Counts survive too. A bundle that pairs an indicator with a sighting of it —
+which is what this export produces — is read as *one* observation of the
+sighting's count, not as the sighting plus the indicator again. An indicator
+nothing points at is still an observation of its own.
 
 Access control
 ==============

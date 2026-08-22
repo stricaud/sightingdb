@@ -173,13 +173,27 @@ tiers_file = "tiers.toml"
 # sha256 = "misp/hashes"
 
 # ---------------------------------------------------------------------------
-# Importing STIX 2.1 bundles with --import-stix <file or directory>. Counts and
-# time windows come from the bundle: an observed-data seen 12 times between two
-# instants becomes 12 sightings spanning that window.
+# STIX 2.1, both ways.
+#
+# Importing with --import-stix <file or directory>: counts and time windows come
+# from the bundle, so an observed-data seen 12 times between two instants
+# becomes 12 sightings spanning that window. What the bundle says about a value
+# — its type, markings, confidence, who saw it — is kept as tags.
+#
+# Exporting with GET /stix/<namespace>, or the management interface's Export
+# STIX button: identity and identity_class say who the bundle is published as.
+# The default is "SightingDB" as a "system", which is a database reporting what
+# it saw rather than an organisation vouching for it.
+#
+# The types table below is read both ways: a namespace mapped for import is a
+# namespace whose values the export knows the type of, whichever way they
+# arrived.
 # ---------------------------------------------------------------------------
 # [stix]
 # default_namespace = ""
 # ttl = 0
+# identity = "Alpha Threat Analysis Org."
+# identity_class = "organization"
 #
 # Keys containing a dot must be QUOTED, or TOML reads them as a nested table.
 # [stix.types]
