@@ -110,6 +110,14 @@ existing Secret back. Set `acl.keys` and those are the keys, verbatim. A chart
 that shipped a known key would install a database anyone who has read the chart
 can write to, which is why there is no default key.
 
+**Changing keys after the first install** takes one more step, because the
+daemon reads the copy on the volume: the init container leaves that copy alone
+so keys made in the interface are not thrown away, and says so in its log when
+it differs from the Secret. To make the values authoritative again:
+
+    kubectl -n sightingdb delete secret sightingdb-acl      # only to force a new generated key
+    helm upgrade ... --set acl.overwriteOnStart=true
+
 Generation reads the cluster, so it only works when Helm can talk to one.
 `helm template`, or `--dry-run` without a server, has nothing to read and mints
 a fresh key each time; installing from such a rendering rather than with
@@ -119,6 +127,19 @@ explicitly if that is how you deploy.
 A Secret is base64, not encryption: anyone who can `get secrets` in the
 namespace can read the key, as can anyone who can read the release's own Secret.
 Treat it accordingly.
+
+**Why a file rather than an environment variable.** The daemon also accepts
+`SIGHTINGDB_APIKEY`, and the chart deliberately does not use it: an environment
+variable holds one key with unrestricted access, shows up in `kubectl describe
+pod`, and is readable from `/proc/<pid>/environ` by anything sharing the
+namespace. A mounted file carries every key with its own grants and is seen by
+the process that opens it. If you want the variable anyway — a single-key
+deployment, say — `extraEnv` will carry it:
+
+    extraEnv:
+      - name: SIGHTINGDB_APIKEY
+        valueFrom:
+          secretKeyRef: { name: my-secret, key: apikey }
 
 `acl.keys` is rendered into a Secret. The management interface rewrites
 `acl.toml` when a key is created or revoked, and a mounted Secret is read-only,

@@ -53,7 +53,8 @@ struct Cli {
     #[arg(short = 'l', long, value_name = "FILE")]
     logging_config: Option<PathBuf>,
 
-    /// Set the default API key, replacing the built-in one
+    /// Set the default API key, replacing the built-in one. Visible in `ps`:
+    /// prefer the SIGHTINGDB_APIKEY environment variable, or an acl_file
     #[arg(short = 'k', long, value_name = "APIKEY")]
     apikey: Option<String>,
 
@@ -141,7 +142,8 @@ fn main() -> Result<()> {
         );
     }
 
-    let acl = build_acl(&settings, &db, cli.apikey.as_deref());
+    let apikey = default_apikey(cli.apikey.clone(), std::env::var("SIGHTINGDB_APIKEY").ok());
+    let acl = build_acl(&settings, &db, apikey.as_deref());
 
     // A one-shot import: load, write, save, exit. No listeners start.
     if let Some(path) = &cli.import_stix {
@@ -419,6 +421,26 @@ fn stix_files(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// The default API key: the one given on the command line, or in the
+/// environment as `SIGHTINGDB_APIKEY`.
+///
+/// Both exist for the same case — a container or a first run, where writing an
+/// `acl_file` first is a chore — and they are not equally good. A key in
+/// `argv` is visible to every process on the host through `ps`; one in the
+/// environment is visible to whatever can read `/proc/<pid>/environ`, which is
+/// less, but neither is as good as a file the daemon reads and nobody else
+/// can. Hence the warning, and hence `acl_file` being what the Helm chart uses.
+fn default_apikey(from_cli: Option<String>, from_env: Option<String>) -> Option<String> {
+    if let Some(key) = from_cli.filter(|key| !key.is_empty()) {
+        log::warn!(
+            "An API key given on the command line is visible to every process on this host. \
+             Prefer SIGHTINGDB_APIKEY, or acl_file, which is visible to neither."
+        );
+        return Some(key);
+    }
+    from_env.filter(|key| !key.is_empty())
+}
+
 /// Decide which API keys exist and what each may reach.
 ///
 /// The `[acl]` section is authoritative when present. Without one we fall back
@@ -460,13 +482,13 @@ fn build_acl(settings: &Settings, db: &Database, cli_apikey: Option<&str>) -> Ac
     if let Some(apikey) = cli_apikey {
         acl.remove(DEFAULT_APIKEY);
         acl.grant_full(apikey);
-        log::info!("API key from -k granted full access");
+        log::info!("The API key given to this process was granted full access");
     }
 
     if acl.is_empty() {
         log::warn!(
             "No API keys configured; seeding '{DEFAULT_APIKEY}' with full access. Add an [acl] \
-             section or pass -k."
+             section, set SIGHTINGDB_APIKEY, or pass -k."
         );
         acl.grant_full(DEFAULT_APIKEY);
     }
@@ -736,6 +758,28 @@ fn create_home_config() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_api_key_comes_from_the_command_line_or_the_environment() {
+        // The command line wins, since it was typed for this run.
+        assert_eq!(
+            default_apikey(Some("from-cli".into()), Some("from-env".into())).as_deref(),
+            Some("from-cli")
+        );
+        assert_eq!(
+            default_apikey(None, Some("from-env".into())).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(default_apikey(None, None), None);
+        // An empty variable is how a shell says "unset"; it is not a key that
+        // would then be granted full access.
+        assert_eq!(default_apikey(Some(String::new()), None), None);
+        assert_eq!(default_apikey(None, Some(String::new())), None);
+        assert_eq!(
+            default_apikey(Some(String::new()), Some("from-env".into())).as_deref(),
+            Some("from-env")
+        );
+    }
 
     /// Regression: `--setup` exists for the case where nothing is installed,
     /// so a missing logging configuration must not stop it. It used to abort

@@ -27,10 +27,8 @@ if [ -n "${SIGHTINGDB_LOG_CONFIG:-}" ] && ! given -l --logging-config "$@"; then
     set -- -l "$SIGHTINGDB_LOG_CONFIG" "$@"
 fi
 
-# Kept for the docker-compose file and anyone who was using it: a key given
-# this way replaces the built-in one.
-if [ -n "${SIGHTINGDB_APIKEY:-}" ] && ! given -k --apikey "$@"; then
-    set -- -k "$SIGHTINGDB_APIKEY" "$@"
-fi
+# SIGHTINGDB_APIKEY is deliberately *not* turned into -k: the daemon reads the
+# variable itself, and a key on the command line would be visible to every
+# process on the host through ps.
 
 exec sightingdb "$@"

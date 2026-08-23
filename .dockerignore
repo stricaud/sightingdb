@@ -5,12 +5,12 @@ target/
 .github/
 .idea/
 helm/
-doc/
 log/
 tests/
 etc/ssl/
 *.pid
 
-# Note: docker/ is NOT excluded. The runtime stage copies the entrypoint and
-# the default configuration out of it, and an excluded file cannot be COPYed.
+# Note: docker/ and doc/ are NOT excluded. The runtime stage copies the
+# entrypoint and the default configuration out of docker/, and the binary
+# compiles the logo in from doc/ — an excluded file is not there to be found.
 docker/docker-compose.yml

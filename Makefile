@@ -50,7 +50,8 @@ HELM_INSTALL    := $(HELM) upgrade --install $(RELEASE) $(CHART) \
 .PHONY: help all sightingdb build release test fmt lint check clean \
         image image-push image-exists load deploy kind-up kind-down kind-load \
         install upgrade uninstall local-only \
-        status logs port-forward admin-key smoke chart-test wait dev teardown \
+        status logs port-forward admin-key acl rotate-key smoke chart-test wait \
+        refresh restart dev teardown \
         helm-lint helm-template helm-package sync-version
 
 ##@ Build
@@ -213,6 +214,24 @@ port-forward: ## Forward the API to localhost (see PORT below) until interrupted
 admin-key: ## Print the admin API key the release was installed with
 	@$(KUBE) get secret $(RELEASE)-acl -o jsonpath='{.data.admin-key}' | base64 -d; echo
 
+acl: ## Print every key the release was installed with, and what each may reach
+	@$(KUBE) get secret $(RELEASE)-acl -o jsonpath='{.data.acl\.toml}' | base64 -d
+	@echo
+	@echo "# Keys created in the management interface live on the volume, not here."
+
+rotate-key: local-only ## Replace the admin key with a freshly generated one
+	@echo "This forgets every key the release knows, including any made in the"
+	@echo "management interface, and generates one new admin key."
+	@printf "Continue? [y/N] "; read answer; [ "$$answer" = y ] || [ "$$answer" = Y ] || exit 1
+	@echo "old key: $$($(KUBE) get secret $(RELEASE)-acl -o jsonpath='{.data.admin-key}' | base64 -d)"
+	$(KUBE) delete secret $(RELEASE)-acl
+	$(HELM_INSTALL) --set acl.overwriteOnStart=true
+	@$(KUBE) rollout status statefulset/$(RELEASE) --timeout=300s
+	@echo "new key: $$($(KUBE) get secret $(RELEASE)-acl -o jsonpath='{.data.admin-key}' | base64 -d)"
+	@echo
+	@echo "Put acl.overwriteOnStart back to its default with 'make install', or"
+	@echo "keys made in the interface will be replaced at every restart."
+
 chart-test: local-only ## Run the chart's own test: write a sighting and read it back
 	$(HELM) test $(RELEASE) --kube-context $(CONTEXT) --namespace $(NAMESPACE) --logs
 
@@ -236,6 +255,12 @@ smoke: local-only ## Write and read a sighting, and export it as STIX, over a te
 	  -d '{"namespace":"smoke/test"}' http://localhost:$(PORT)/_api/stix | head -c 120)..."
 
 ##@ Everything at once
+
+refresh: image load restart wait ## Rebuild, load and restart the pod: the loop while changing code
+	@echo "$(RELEASE) is running the image you just built"
+
+restart: local-only ## Restart the pod without changing the release
+	$(KUBE) rollout restart statefulset/$(RELEASE)
 
 deploy: image load install wait smoke ## Build and install into the cluster you already have
 	@echo

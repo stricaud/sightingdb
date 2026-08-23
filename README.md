@@ -158,6 +158,16 @@ Authentication
 
 Authentication is on unless `authenticate=false` is set in the configuration. Keys and their permissions are declared in the `[acl]` section; see below.
 
+**Where to put the key.** Three ways, in the order you should prefer them:
+
+| | | |
+| --- | --- | --- |
+| `acl_file`, or `[acl]` | best | A file the daemon reads. Nothing else on the host sees it, permissions are the filesystem's, and it is the only one that can carry more than one key with different rights. What the Helm chart uses. |
+| `SIGHTINGDB_APIKEY` | acceptable | Replaces the built-in default key, for a container or a first run. Visible to whatever can read `/proc/<pid>/environ`, and to `kubectl describe pod` if set inline rather than from a Secret. |
+| `-k <key>` | avoid | The same thing on the command line, where `ps` shows it to every process on the host. The daemon warns when you use it. |
+
+The last two grant one key unrestricted access; scoped grants need the file.
+
 REST Endpoints
 ==============
 	/w: write (GET)
@@ -661,7 +671,13 @@ Docker
 ------
 
 	$ docker build -f docker/Dockerfile -t sightingdb:dev .
-	$ docker run --rm -p 9999:9999 -v sightingdb:/var/lib/sightingdb sightingdb:dev
+	$ docker run --rm -p 9999:9999 -v sightingdb:/var/lib/sightingdb \
+	    -e SIGHTINGDB_APIKEY=$(openssl rand -hex 20) sightingdb:dev
+
+`SIGHTINGDB_APIKEY` replaces the built-in default key. The daemon reads the
+variable itself rather than the entrypoint turning it into `-k`, so the key
+does not appear in `ps`. For more than one key, or for keys with scoped grants,
+mount an `acl_file` — see [Authentication](#authentication).
 
 The image builds this working tree — not a clone of the repository — in a
 builder stage and ships the binary on `debian-slim`. Mount a volume at

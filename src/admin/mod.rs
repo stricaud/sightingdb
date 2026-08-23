@@ -31,6 +31,10 @@ use crate::handlers::{SharedState, State};
 const UI: &str = include_str!("ui.html");
 /// Vendored so the interface works without internet access. See assets/README.md.
 const ECHARTS: &str = include_str!("../../assets/echarts.min.js");
+/// The logo, compiled in for the same reason: an interface that fetches its own
+/// branding from somewhere else does not work on an air-gapped host. 64px, for
+/// a header that shows it at about a third of that.
+const LOGO: &[u8] = include_bytes!("../../doc/sightingdb-logo3_64.png");
 
 /// Paging is capped so one request cannot ask the server to sort and serialize
 /// an entire large namespace.
@@ -367,6 +371,14 @@ pub async fn index() -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(UI)
+}
+
+pub async fn logo() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("image/png")
+        // Immutable: it only changes when the binary does.
+        .insert_header(("Cache-Control", "public, max-age=86400"))
+        .body(LOGO)
 }
 
 pub async fn echarts() -> impl Responder {
@@ -837,6 +849,7 @@ pub async fn set_tier(state: State, body: web::Json<TierChange>, req: HttpReques
 pub fn routes(cfg: &mut web::ServiceConfig) {
     // Order matters: the catch-all must come last or it would swallow the API.
     cfg.route("/_management/echarts.min.js", web::get().to(echarts))
+        .route("/_management/logo.png", web::get().to(logo))
         .route("/_management/api/session", web::get().to(session))
         .route("/_management/api/info", web::get().to(info))
         .route("/_management/api/namespaces", web::get().to(namespaces))
@@ -1869,6 +1882,20 @@ mod tests {
                 .tags
                 .is_empty()
         );
+    }
+
+    #[actix_web::test]
+    async fn the_logo_is_served_from_the_binary() {
+        let st = state();
+        let app = app!(st);
+
+        // No key: the page shows it before anyone has signed in.
+        let resp = get!(app, "/_management/logo.png", NO_KEY);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+
+        let body = test::read_body(resp).await;
+        assert!(body.starts_with(b"\x89PNG"), "not a PNG");
     }
 
     #[actix_web::test]

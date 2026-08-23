@@ -19,13 +19,15 @@ persistence:
 tls:
   mode: disabled
 
-# A known key, on purpose: this is a kind cluster on your own machine, and
-# copy-pasting the README's curl lines is the point of it. Anywhere else, leave
-# acl.keys empty and let the chart generate one.
-acl:
-  keys:
-    changeme: "rw, admin"
-    analyst: "r:feeds"
+# No acl.keys here on purpose, so a local install generates its own admin key
+# like any other install does — `make admin-key` prints it, and `make smoke`
+# and `helm test` read it from the Secret themselves. Add keys here to pin
+# them:
+#
+#   acl:
+#     keys:
+#       changeme: "rw, admin"
+#       analyst: "r:feeds"
 
 bootstrap:
   namespaces:

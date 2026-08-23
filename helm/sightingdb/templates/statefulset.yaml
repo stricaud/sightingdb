@@ -83,10 +83,20 @@ spec:
           args:
             - |
               set -eu
-              if [ -f "{{ include "sightingdb.aclFile" . }}" ] && [ "{{ .Values.acl.overwriteOnStart }}" != "true" ]; then
+              seed="{{ include "sightingdb.aclSeedFile" . }}"
+              live="{{ include "sightingdb.aclFile" . }}"
+              if [ -f "$live" ] && [ "{{ .Values.acl.overwriteOnStart }}" != "true" ]; then
                 echo "acl.toml is already on the volume, keeping it"
+                # Values that no longer match what is running is exactly the
+                # sort of thing to find out now rather than when a key does not
+                # work, so say so rather than leaving it silent.
+                if ! cmp -s "$seed" "$live"; then
+                  echo "NOTE: it differs from acl.keys in the release. Keys made in the"
+                  echo "      management interface live here and are kept; to replace them"
+                  echo "      with what the values say, set acl.overwriteOnStart=true."
+                fi
               else
-                cp "{{ include "sightingdb.aclSeedFile" . }}" "{{ include "sightingdb.aclFile" . }}"
+                cp "$seed" "$live"
                 echo "seeded acl.toml from the secret"
               fi
           volumeMounts:
