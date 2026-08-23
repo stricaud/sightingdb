@@ -341,6 +341,10 @@ pub struct ZmqInfo {
 /// can go on to check its rights over a particular namespace.
 fn require_admin<'a>(state: &SharedState, req: &'a HttpRequest) -> Result<&'a str, HttpResponse> {
     let Some(header) = req.headers().get("Authorization") else {
+        log::debug!(
+            "Refused {}: no API key, asked for the management interface",
+            crate::handlers::peer_of(req)
+        );
         return Err(
             HttpResponse::Unauthorized().json(Message::new("An admin API key is required."))
         );
@@ -352,6 +356,18 @@ fn require_admin<'a>(state: &SharedState, req: &'a HttpRequest) -> Result<&'a st
     if state.acl().is_admin(key) {
         Ok(key)
     } else {
+        // Louder than a data refusal: this is someone at the door of the
+        // interface that hands out keys.
+        log::warn!(
+            "{}",
+            crate::handlers::refusal(
+                &crate::handlers::peer_of(req),
+                key,
+                state.acl().contains(key),
+                "use",
+                "the management interface",
+            )
+        );
         Err(HttpResponse::Forbidden().json(Message::new("That key is not an admin key.")))
     }
 }
@@ -362,6 +378,10 @@ fn require_read(state: &SharedState, key: &str, namespace: &str) -> Result<(), H
     if state.acl().can_read(key, namespace) {
         Ok(())
     } else {
+        log::warn!(
+            "{}",
+            crate::handlers::refusal("an admin key", key, true, "read", namespace)
+        );
         // Same answer as a namespace that does not exist, so browsing cannot
         // be used to enumerate what is out of reach.
         Err(HttpResponse::NotFound().json(Message::new("No such namespace.")))
@@ -379,6 +399,10 @@ fn require_write(state: &SharedState, key: &str, namespace: &str) -> Result<(), 
     if state.acl().can_write(key, namespace) {
         Ok(())
     } else {
+        log::warn!(
+            "{}",
+            crate::handlers::refusal("an admin key", key, true, "write", namespace)
+        );
         Err(HttpResponse::Forbidden().json(Message::new(format!(
             "That key is not permitted to write to '{namespace}'."
         ))))

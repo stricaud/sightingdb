@@ -252,6 +252,10 @@ impl Plan {
 }
 
 const LAUNCHD_LABEL: &str = "com.github.stricaud.sightingdb";
+/// What installs before 0.5 called the launchd job. Still looked for, because
+/// one left behind holds the port and the new service then restarts forever —
+/// a puzzle worth naming rather than leaving to be worked out from a log.
+const LAUNCHD_LEGACY_LABEL: &str = "com.devo.sightingdb";
 const SERVICE_USER: &str = "sightingdb";
 /// Minimal logging configuration, so the service has one without hunting.
 const LOG_CONFIG: &str = "refresh_rate: 30 seconds\n\
@@ -282,11 +286,29 @@ struct Installed {
     private: bool,
     /// This installation's own file, rather than one it merely uses.
     ///
-    /// `--erase` removes only these. A logging configuration found in
-    /// `/etc` or a home directory may be shared with another instance — or be
-    /// the only one on the machine — and the binary belongs to whoever
-    /// installed it, so neither is this installation's to delete.
+    /// Erasing removes only these. A logging configuration found in `/etc` or
+    /// a home directory may be shared with another instance — or be the only
+    /// one on the machine — and the binary belongs to whoever installed it, so
+    /// neither is this installation's to delete.
     owned: bool,
+    kind: Kind,
+}
+
+/// What a file is, which is what decides whether erasing takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Sightings. Gone with `--erase`, since a database is the thing people
+    /// mean when they say start again.
+    Data,
+    /// The service unit, which has to go for `--setup` to install another.
+    Service,
+    /// Settings, keys and certificates: kept by `--erase`, so the same
+    /// installation can be rebuilt without answering every question again.
+    /// Only `--erase-hard` removes these.
+    Config,
+    /// Neither ours to remove nor ours to keep: the binary, a logging
+    /// configuration belonging to the machine.
+    Other,
 }
 
 /// Every file this installation uses, whether or not it exists yet.
@@ -301,11 +323,31 @@ pub fn installed_report(config_path: &Path, logging_config: Option<&Path>) -> Re
 
     // The question that follows "what is installed" is usually "how do I stop
     // it", and on both platforms the answer is not what people try first.
-    if let Some(service) = entries
+    let services: Vec<&Installed> = entries
         .iter()
-        .find(|entry| entry.what == "service" && entry.path.exists())
-    {
+        .filter(|entry| entry.what == "service" && entry.path.exists())
+        .collect();
+    if let Some(service) = services.first() {
         let _ = write!(out, "\n{}", stopping(&service.path));
+    }
+
+    // Two of them is the state that produces a daemon restarting every ten
+    // seconds: one wins the port, the supervisor keeps rebooting the other.
+    if services.len() > 1 {
+        let _ = writeln!(
+            out,
+            "\nWARNING: {} services are installed for this configuration:",
+            services.len()
+        );
+        for service in &services {
+            let _ = writeln!(out, "  {}", service.path.display());
+        }
+        let _ = writeln!(
+            out,
+            "Only one can hold the port. The other will fail to start and be restarted\n\
+             by its supervisor for as long as it is installed. Remove whichever is not\n\
+             wanted, then check with: sightingdb --installed"
+        );
     }
     Ok(out)
 }
@@ -339,6 +381,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
         note: String::new(),
         private: false,
         owned: true,
+        kind: Kind::Config,
     }];
 
     // The one named on the command line, else the one the daemon would find.
@@ -359,6 +402,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
             },
             private: false,
             owned: ours,
+            kind: Kind::Config,
         });
     }
 
@@ -369,6 +413,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
             note: "rewritten when a key is saved".to_string(),
             private: true,
             owned: true,
+            kind: Kind::Config,
         });
     } else {
         entries.push(Installed {
@@ -376,7 +421,10 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
             path: config_path.to_path_buf(),
             note: "no acl_file: the keys are in the [acl] section of it".to_string(),
             private: true,
+            // Already listed as the configuration; naming it twice as
+            // something to remove would be a way to remove it twice.
             owned: false,
+            kind: Kind::Config,
         });
     }
 
@@ -387,6 +435,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
             note: "written when a tier is changed".to_string(),
             private: false,
             owned: true,
+            kind: Kind::Config,
         });
     }
 
@@ -397,6 +446,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
             note: String::new(),
             private: false,
             owned: true,
+            kind: Kind::Config,
         });
         entries.push(Installed {
             what: "TLS key",
@@ -404,6 +454,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
             note: String::new(),
             private: true,
             owned: true,
+            kind: Kind::Config,
         });
     }
 
@@ -414,6 +465,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
             note: String::new(),
             private: false,
             owned: true,
+            kind: Kind::Data,
         });
     }
 
@@ -431,6 +483,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
                     note: String::new(),
                     private: false,
                     owned: true,
+                    kind: Kind::Data,
                 });
             }
         }
@@ -445,6 +498,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
             note: "left alone by --erase".to_string(),
             private: false,
             owned: false,
+            kind: Kind::Other,
         });
     }
 
@@ -467,6 +521,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
                 },
                 private: false,
                 owned: ours,
+                kind: Kind::Service,
             });
         }
     }
@@ -479,6 +534,7 @@ fn inventory(config_path: &Path, logging_config: Option<&Path>) -> Result<Vec<In
             note: "not installed; `--setup` can add one".to_string(),
             private: false,
             owned: false,
+            kind: Kind::Service,
         });
     }
 
@@ -530,11 +586,13 @@ fn service_candidates() -> Vec<PathBuf> {
             }
         }
         Ok(Platform::MacOs) => {
-            candidates.push(PathBuf::from(format!(
-                "/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist"
-            )));
-            if let Some(home) = dirs::home_dir() {
-                candidates.push(home.join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist")));
+            for label in [LAUNCHD_LABEL, LAUNCHD_LEGACY_LABEL] {
+                candidates.push(PathBuf::from(format!(
+                    "/Library/LaunchDaemons/{label}.plist"
+                )));
+                if let Some(home) = dirs::home_dir() {
+                    candidates.push(home.join(format!("Library/LaunchAgents/{label}.plist")));
+                }
             }
         }
         Err(_) => {}
@@ -668,6 +726,37 @@ fn human(bytes: u64) -> String {
 // Taking an installation away again
 // ---------------------------------------------------------------------------
 
+/// Stop before installing a second service beside an existing one.
+///
+/// The two would run the same binary against the same configuration; whichever
+/// starts second cannot bind the port, exits, and is restarted by its service
+/// manager on a timer — which reads as a daemon rebooting every few seconds and
+/// takes a while to trace back to here.
+fn refuse_if_a_service_exists() -> Result<()> {
+    let installed: Vec<PathBuf> = service_candidates()
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect();
+    if installed.is_empty() {
+        return Ok(());
+    }
+
+    let mut message = String::from("a SightingDB service is already installed:\n");
+    for path in &installed {
+        let _ = writeln!(message, "  {}", path.display());
+    }
+    let _ = write!(
+        message,
+        "\nInstalling another would leave two of them running the same configuration, and \
+         the one that loses the port would be restarted by its service manager forever.\n\n\
+         To replace this installation:  sightingdb --erase       (keeps your configuration)\n\
+         To remove it entirely:         sightingdb --erase-hard\n\
+         To change a setting instead:   edit the configuration and `sightingdb --restart`\n\
+         Or remove the service file by hand and run --setup again."
+    );
+    bail!(message)
+}
+
 /// The word that has to be typed. Not "y": this removes a database.
 const ERASE_WORD: &str = "erase";
 
@@ -691,7 +780,7 @@ pub fn ask_to_erase(summary: &str) -> Result<bool> {
     Ok(answer.trim() == ERASE_WORD)
 }
 
-/// Stop the daemon and remove everything this installation put on disk.
+/// Stop the daemon and remove what this installation put on disk.
 ///
 /// The counterpart of [`run`]. It stops the *service* rather than the process,
 /// because both service managers restart the daemon when it dies — which is
@@ -699,11 +788,19 @@ pub fn ask_to_erase(summary: &str) -> Result<bool> {
 /// configuration names, snapshot by snapshot, so a `dbdir` pointing somewhere
 /// shared cannot take the rest of that directory with it.
 ///
-/// The binary is left where it is: removing the program you are running, on
-/// the strength of a configuration file, is more than was asked for.
+/// `hard` decides how much goes:
+///
+/// * without it, the database and the service, keeping the configuration, the
+///   API keys and the certificate — enough to start again with the same
+///   settings, and enough for `--setup` to run;
+/// * with it, those as well, leaving nothing behind.
+///
+/// The binary is left either way: removing the program you are running, on the
+/// strength of a configuration file, is more than was asked for.
 pub fn erase(
     config_path: &Path,
     logging_config: Option<&Path>,
+    hard: bool,
     confirm: Confirm,
 ) -> Result<String> {
     let entries = inventory(config_path, logging_config)?;
@@ -712,25 +809,37 @@ pub fn erase(
         .find(|entry| entry.what == "service" && entry.owned && entry.path.exists())
         .map(|entry| entry.path.clone());
 
-    // This installation's own files, and only those.
-    let doomed: Vec<&Installed> = entries
+    let goes = |entry: &Installed| {
+        entry.owned
+            && entry.path.exists()
+            && match entry.kind {
+                Kind::Data | Kind::Service => true,
+                Kind::Config => hard,
+                Kind::Other => false,
+            }
+    };
+
+    let doomed: Vec<&Installed> = entries.iter().filter(|entry| goes(entry)).collect();
+    let kept: Vec<&Installed> = entries
         .iter()
-        .filter(|entry| entry.owned && entry.path.exists())
+        .filter(|entry| entry.path.exists() && !goes(entry))
         .collect();
 
     let mut summary = String::from("This removes:\n");
     for entry in &doomed {
         let _ = writeln!(summary, "  {:<16} {}", entry.what, entry.path.display());
     }
-    let kept: Vec<&Installed> = entries
-        .iter()
-        .filter(|entry| !entry.owned && entry.path.exists())
-        .collect();
     if !kept.is_empty() {
-        let _ = writeln!(summary, "\nLeft alone:");
-        for entry in kept {
+        let _ = writeln!(summary, "\nAnd leaves:");
+        for entry in &kept {
             let _ = writeln!(summary, "  {:<16} {}", entry.what, entry.path.display());
         }
+    }
+    if !hard && kept.iter().any(|entry| entry.kind == Kind::Config) {
+        let _ = writeln!(
+            summary,
+            "\n`--erase-hard` removes the configuration, the API keys and the certificate too."
+        );
     }
     let _ = write!(summary, "\nThe data cannot be recovered afterwards.");
 
@@ -776,7 +885,13 @@ pub fn erase(
 
     let _ = writeln!(
         out,
-        "\nDone. `sightingdb --setup` starts again from nothing."
+        "\nDone. {}",
+        if hard {
+            "`sightingdb --setup` starts again from nothing."
+        } else {
+            "The configuration is still there: `sightingdb --setup` will reinstall the \
+             service, and starting the daemon gives an empty database."
+        }
     );
     Ok(out)
 }
@@ -1127,6 +1242,11 @@ pub fn run() -> Result<()> {
 
     let platform = Platform::detect()?;
     let root = is_root();
+
+    // Installing a second service is the one mistake this cannot undo for you:
+    // both run the same binary, one wins the port, and the supervisor restarts
+    // the other for as long as it exists.
+    refuse_if_a_service_exists()?;
 
     println!("SightingDB setup\n");
     println!(
@@ -1726,7 +1846,7 @@ mod tests {
         let dir = TempDir::new("erasesaid no");
         let config = installation_in(&dir.0);
 
-        let report = erase(&config, None, &|_| Ok(false)).unwrap();
+        let report = erase(&config, None, true, &|_| Ok(false)).unwrap();
 
         assert!(report.contains("Nothing was removed"), "{report}");
         assert!(config.exists());
@@ -1734,12 +1854,12 @@ mod tests {
     }
 
     #[test]
-    fn erasing_removes_the_installation_and_says_what_went() {
+    fn erasing_hard_removes_the_installation_and_says_what_went() {
         let dir = TempDir::new("erase");
         let config = installation_in(&dir.0);
         let summary_shown = std::cell::RefCell::new(String::new());
 
-        let report = erase(&config, None, &|summary| {
+        let report = erase(&config, None, true, &|summary| {
             summary_shown.replace(summary.to_string());
             Ok(true)
         })
@@ -1752,7 +1872,7 @@ mod tests {
             "{summary_shown}"
         );
         // What it will not touch is stated too, the binary among it.
-        assert!(summary_shown.contains("Left alone:"), "{summary_shown}");
+        assert!(summary_shown.contains("And leaves:"), "{summary_shown}");
         assert!(summary_shown.contains("binary"), "{summary_shown}");
         for gone in [
             config.clone(),
@@ -1798,6 +1918,45 @@ mod tests {
         }
     }
 
+    /// The soft erase: the database and the service go, the settings stay, so
+    /// the same installation can be started again without answering `--setup`
+    /// all over.
+    #[test]
+    fn erasing_keeps_the_configuration_unless_told_otherwise() {
+        let dir = TempDir::new("erasesoft");
+        let config = installation_in(&dir.0);
+        let summary = std::cell::RefCell::new(String::new());
+
+        let report = erase(&config, None, false, &|shown| {
+            summary.replace(shown.to_string());
+            Ok(true)
+        })
+        .unwrap();
+
+        // The database is gone.
+        assert!(!dir.0.join("var/feeds-abc.json.zst").exists(), "{report}");
+        assert!(!dir.0.join("var").exists(), "{report}");
+
+        // The settings are not.
+        for kept in [
+            "etc/sightingdb.toml",
+            "etc/acl.toml",
+            "etc/ssl/cert.pem",
+            "etc/ssl/key.pem",
+        ] {
+            assert!(dir.0.join(kept).exists(), "{kept} went:\n{report}");
+        }
+
+        // And it said as much before doing anything.
+        let summary = summary.into_inner();
+        assert!(summary.contains("And leaves:"), "{summary}");
+        assert!(summary.contains("--erase-hard"), "{summary}");
+        assert!(
+            report.contains("The configuration is still there"),
+            "{report}"
+        );
+    }
+
     /// Regression: a logging configuration found in the usual places belongs
     /// to the machine, not to whichever installation happened to be erased.
     /// This removed one out of a home directory while erasing a temporary
@@ -1817,7 +1976,7 @@ mod tests {
         let listed = installed_report(&config, Some(&logging)).unwrap();
         assert!(listed.contains("not this installation's"), "{listed}");
 
-        let report = erase(&config, Some(&logging), &|_| Ok(true)).unwrap();
+        let report = erase(&config, Some(&logging), true, &|_| Ok(true)).unwrap();
 
         assert!(
             logging.exists(),
@@ -1851,7 +2010,7 @@ mod tests {
         let logging = dir.0.join("etc/log4rs.yml");
         fs::write(&logging, LOG_CONFIG).unwrap();
 
-        let report = erase(&config, Some(&logging), &|_| Ok(true)).unwrap();
+        let report = erase(&config, Some(&logging), true, &|_| Ok(true)).unwrap();
 
         assert!(!logging.exists(), "{report}");
     }
@@ -1866,7 +2025,7 @@ mod tests {
         let stranger = dir.0.join("var/notes.txt");
         fs::write(&stranger, "someone else's").unwrap();
 
-        let report = erase(&config, None, &|_| Ok(true)).unwrap();
+        let report = erase(&config, None, true, &|_| Ok(true)).unwrap();
 
         assert!(stranger.exists(), "{report}");
         assert!(!dir.0.join("var/feeds-abc.json.zst").exists(), "{report}");

@@ -101,7 +101,8 @@ Options
 	    --start                  Start the installed service
 	    --stop                   Stop it. 
 	    --restart                Restart it
-	    --erase                  Stop it and remove everything this installation put on disk
+	    --erase                  Stop it, remove its service and empty the database
+	    --erase-hard             The same, and the configuration, keys and certificate too
 	    --install-selfsigned-keys Write a self-signed cert and key, then exit
 	    --import-stix <PATH>     Import STIX 2.1 bundles, then exit
 	-l, --logging-config <FILE>  log4rs configuration file (default: etc/log4rs.yml)
@@ -152,24 +153,63 @@ differs by platform and by whether the service is the system's or your own:
 `systemctl restart` or launchd's `kickstart -k`, since launchd has no restart
 verb of its own.
 
+### It seems to restart every few seconds
+
+Then something else already has the port, and the supervisor is faithfully
+restarting the copy that lost:
+
+	INFO sightingdb - Starting Sighting Daemon
+	INFO sightingdb - Saving the database to /Users/you/.sightingdb/db
+	(ten seconds later, the same again)
+
+The reason is now logged where the rest of it is — `cannot listen on
+https://127.0.0.1:9999: something already has that address` — but the usual
+cause is **two services installed at once**: an install from before 0.5 used
+the launchd label `com.devo.sightingdb`, and `--setup` installs
+`com.github.stricaud.sightingdb`. Both run the same binary against the same
+configuration, one wins the port, and launchd restarts the other every ten
+seconds forever.
+
+`sightingdb --installed` lists every service it finds and says so outright when
+there is more than one. To remove an old launchd job:
+
+	launchctl bootout gui/$(id -u)/com.devo.sightingdb
+	rm ~/Library/LaunchAgents/com.devo.sightingdb.plist
+
 Removing it again
 -----------------
 
-	$ sightingdb --erase
+	$ sightingdb --erase        # the service and the database; keeps your settings
+	$ sightingdb --erase-hard   # those, and the configuration, keys and certificate
 
-The counterpart of `--setup`. It lists what will go, requires the word `erase`
-typed in full — not `y`, and there is no flag to skip it — then stops the
-service, stops any daemon still running with this configuration, and removes
-the files.
+Both list what will go and what will stay, then require the word `erase` typed
+in full — not `y`, and there is no flag to skip it. They stop the service, stop
+any daemon still running with this configuration, and then remove the files.
 
-It removes **only what this installation owns**: the configuration, the key
-file, the tiers file, the certificate and key, and the snapshots in `dbdir`. A
-logging configuration found in `/etc` or your home directory is the machine's
-rather than this install's, a service unit that runs a different configuration
-belongs to that one, and the binary is left where it is — all three are listed
-under "left alone" before you confirm. In `dbdir` it removes the snapshot files
-it recognises and then the directory if that is all it held; anything else it
-finds there stays, and it says so.
+| | `--erase` | `--erase-hard` |
+| --- | --- | --- |
+| snapshots in `dbdir` | removed | removed |
+| the service unit | removed | removed |
+| `sightingdb.toml` | kept | removed |
+| `acl_file`, `tiers_file` | kept | removed |
+| TLS certificate and key | kept | removed |
+| the binary | kept | kept |
+
+`--erase` is the one to reach for when something is wrong with an installation:
+it clears the way for `--setup` to run again, and you keep your API keys, your
+certificate and everything you configured. `--erase-hard` is the counterpart of
+`--setup` — afterwards nothing of the installation is left.
+
+Both remove **only what this installation owns**. A logging configuration found
+in `/etc` or your home directory is the machine's rather than this install's, a
+service unit that runs a different configuration belongs to that one, and the
+binary is left where it is — all of them named under "And leaves" before you
+confirm. In `dbdir` only the snapshot files are removed, and then the directory
+if that is all it held; anything else stays, and it says so.
+
+`--setup` refuses to run while a service is installed, for the reason above: two
+of them would fight over the port and one would be restarted forever. It says
+which flag to use.
 
 Client Demo
 ===========
@@ -255,6 +295,7 @@ REST Endpoints
 	/_api/openapi.yaml: this API as an OpenAPI 3 document (GET)
 
 OpenAPI
+=======OpenAPI
 =======
 
 [`doc/openapi.yaml`](doc/openapi.yaml) describes the whole HTTP API — data,
@@ -685,6 +726,20 @@ namespace. A key's grants are unioned, and anything not granted is denied.
 
 Prefixes match **whole path segments**, so `rw:feeds/misp` covers
 `feeds/misp` and `feeds/misp/ips` but not `feeds/misp-internal` or `feeds`.
+
+**A refusal is logged.** The client is told `403`; the server logs which
+address asked, what it asked to do, to which namespace, and a short fingerprint
+of the key — never the key itself, since a log is copied and read by more
+people than a credential should be. Unlike the answer to the client, the log
+distinguishes a key that does not exist from one that exists but is not allowed
+there: hiding that from a caller stops it probing, while telling the operator
+is the whole point.
+
+	WARN sightingdb::handlers - Refused 10.0.0.9:5000: no such key c211eb3e, asked to write 'feeds/ips'
+	WARN sightingdb::handlers - Refused 10.0.0.9:5000: key 4f2a91bd may not read 'private'
+
+A request with no key at all is logged at debug, since on an open port that is
+ordinary noise.
 
 A refusal is always `403` with the same body whether the key is unknown or
 merely out of scope, so that probing cannot tell valid keys from invalid ones.

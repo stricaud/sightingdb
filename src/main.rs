@@ -19,6 +19,7 @@ mod tier;
 mod tls;
 
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -89,10 +90,14 @@ struct Cli {
     #[arg(long)]
     restart: bool,
 
-    /// Stop the daemon and remove everything this installation put on disk.
-    /// Asks for confirmation, and cannot be told not to
+    /// Stop the daemon, remove its service and empty the database, keeping the
+    /// configuration. Asks for confirmation, and cannot be told not to
     #[arg(long)]
     erase: bool,
+
+    /// The same, and the configuration, API keys and certificate as well
+    #[arg(long)]
+    erase_hard: bool,
 
     /// Sets the level of verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -100,6 +105,20 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    let result = run();
+    if let Err(e) = &result {
+        // On a terminal the `Error:` line printed below is the whole story.
+        // Redirected — which is what a service manager does — stderr is a
+        // different file from the log everyone tails, and a daemon that cannot
+        // start then looks like it is starting over and over for no reason.
+        if !std::io::stderr().is_terminal() {
+            log::error!("{e:#}");
+        }
+    }
+    result
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Answered before logging starts, so the output is the answer rather than
@@ -112,6 +131,7 @@ fn main() -> Result<()> {
         (cli.stop, "stop"),
         (cli.restart, "restart"),
         (cli.erase, "erase"),
+        (cli.erase_hard, "erase-hard"),
     ]
     .into_iter()
     .filter(|(asked, _)| *asked)
@@ -129,7 +149,8 @@ fn main() -> Result<()> {
         let logging = cli.logging_config.as_deref();
         let report = match *action {
             "installed" => setup::installed_report(&config_path, logging)?,
-            "erase" => setup::erase(&config_path, logging, &setup::ask_to_erase)?,
+            "erase" => setup::erase(&config_path, logging, false, &setup::ask_to_erase)?,
+            "erase-hard" => setup::erase(&config_path, logging, true, &setup::ask_to_erase)?,
             other => setup::service_control(&config_path, logging, other)?,
         };
         print!("{report}");
@@ -730,6 +751,25 @@ fn spawn_dns(
     Ok(handles)
 }
 
+/// Why the listener could not be opened, in terms of what to do next.
+///
+/// A port already in use is nearly always a second copy of this daemon — a
+/// service installed twice, or one started by hand beside the one the service
+/// manager runs — and a supervisor will keep restarting the loser, which reads
+/// as a daemon booting every few seconds for no stated reason.
+fn bind_failed(error: std::io::Error, listen: &str, scheme: &str) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        return anyhow::anyhow!(
+            "cannot listen on {scheme}://{listen}: something already has that address.\n\
+             If it is another SightingDB, stop it with `sightingdb --stop`, and check for a \
+             second service with `sightingdb --installed`.\n\
+             To see what holds it: lsof -nP -iTCP:{} -sTCP:LISTEN",
+            listen.rsplit(':').next().unwrap_or(listen)
+        );
+    }
+    anyhow::Error::new(error).context(format!("binding {scheme}://{listen}"))
+}
+
 async fn serve(state: Arc<SharedState>, settings: &Settings) -> Result<()> {
     let state = web::Data::from(state);
     let post_limit = settings.post_limit;
@@ -748,11 +788,11 @@ async fn serve(state: Arc<SharedState>, settings: &Settings) -> Result<()> {
             let builder = tls::acceptor(tls)?;
             server
                 .bind_openssl(&settings.listen, builder)
-                .with_context(|| format!("binding https://{}", settings.listen))?
+                .map_err(|e| bind_failed(e, &settings.listen, "https"))?
         }
         None => server
             .bind(&settings.listen)
-            .with_context(|| format!("binding http://{}", settings.listen))?,
+            .map_err(|e| bind_failed(e, &settings.listen, "http"))?,
     };
 
     let scheme = if settings.tls.is_some() {
@@ -821,6 +861,33 @@ fn create_home_config() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The failure that reads as "the daemon keeps restarting": a supervisor
+    /// respawning the copy that lost the race for the port.
+    #[test]
+    fn a_taken_port_says_what_to_do_about_it() {
+        let taken = bind_failed(
+            std::io::Error::new(std::io::ErrorKind::AddrInUse, "in use"),
+            "127.0.0.1:9999",
+            "https",
+        );
+        let message = format!("{taken:#}");
+        assert!(message.contains("already has that address"), "{message}");
+        assert!(message.contains("--stop"), "{message}");
+        assert!(message.contains("--installed"), "{message}");
+        // The port on its own, for the lsof line to be copy-pasteable.
+        assert!(message.contains("iTCP:9999"), "{message}");
+
+        // Anything else keeps its own words rather than being guessed at.
+        let denied = bind_failed(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            "0.0.0.0:80",
+            "http",
+        );
+        let message = format!("{denied:#}");
+        assert!(message.contains("binding http://0.0.0.0:80"), "{message}");
+        assert!(!message.contains("--stop"), "{message}");
+    }
 
     #[test]
     fn the_api_key_comes_from_the_command_line_or_the_environment() {

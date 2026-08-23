@@ -253,11 +253,54 @@ enum Access {
     Write,
 }
 
+/// A stable handle for a key, so refusals can be followed through a log
+/// without the log becoming a list of credentials.
+///
+/// The first four bytes of its SHA-256: enough to tell one misconfigured
+/// client from another, and not enough to be worth stealing.
+fn fingerprint(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    format!(
+        "{:08x}",
+        u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+    )
+}
+
+/// What a refusal says in the log.
+///
+/// Unlike the answer to the client, this *does* distinguish a key that does not
+/// exist from one that exists but is not allowed here — the point of hiding
+/// that from a caller is to stop it probing, and the point of the log is to
+/// tell the person running the server which of the two they are looking at.
+pub(crate) fn refusal(peer: &str, key: &str, known: bool, verb: &str, namespace: &str) -> String {
+    let key = fingerprint(key);
+    if known {
+        format!("Refused {peer}: key {key} may not {verb} '{namespace}'")
+    } else {
+        format!("Refused {peer}: no such key {key}, asked to {verb} '{namespace}'")
+    }
+}
+
+/// The address the request actually came from.
+///
+/// The socket, not `X-Forwarded-For`: a header a client controls is no use for
+/// deciding who to complain about. Behind a proxy this is the proxy, which is
+/// the truth about what this process can see.
+pub(crate) fn peer_of(req: &HttpRequest) -> String {
+    req.peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "an unknown address".to_string())
+}
+
 /// Check the `Authorization` header against the ACL.
 ///
 /// Returns the response to send on refusal. When authentication is disabled in
 /// the config this is a no-op — including for `/d` and `/wb`, which previously
 /// demanded a key regardless of that setting.
+///
+/// A refusal is logged: a client with the wrong key otherwise gets a `403` that
+/// nobody but the client ever sees, which is the least useful place for it.
 fn authorize(
     state: &SharedState,
     req: &HttpRequest,
@@ -269,6 +312,12 @@ fn authorize(
     }
 
     let Some(header) = req.headers().get("Authorization") else {
+        // Common enough on an open port to be noise at warn level, and still
+        // worth having when someone is working out why a client fails.
+        log::debug!(
+            "Refused {}: no API key, asked for '{namespace}'",
+            peer_of(req)
+        );
         return Err(HttpResponse::Unauthorized().json(Message::new(
             "Please add the API key in the Authorization headers.",
         )));
@@ -289,6 +338,10 @@ fn authorize(
     if allowed {
         Ok(())
     } else {
+        log::warn!(
+            "{}",
+            refusal(&peer_of(req), apikey, acl.contains(apikey), verb, namespace)
+        );
         // Deliberately the same answer whether the key is unknown or merely
         // unauthorised here, so that probing cannot distinguish the two.
         Err(HttpResponse::Forbidden().json(Message::new(format!(
@@ -1333,6 +1386,36 @@ mod tests {
             format!("version: \"{}\"", env!("CARGO_PKG_VERSION")),
             "the served document names the wrong version"
         );
+    }
+
+    /// Issue #5: a client with the wrong key was told `403` and the server said
+    /// nothing, so the one person who could fix it — whoever runs the server —
+    /// never saw it.
+    // `use actix_web::test` shadows the built-in attribute in this module, so
+    // even a test with nothing to await is spelled the same as its neighbours.
+    #[actix_web::test]
+    async fn a_refusal_says_what_happened_without_quoting_the_key() {
+        let unknown = refusal("10.0.0.9:5000", "hunter2", false, "write", "feeds/ips");
+        assert!(unknown.contains("10.0.0.9:5000"), "{unknown}");
+        assert!(unknown.contains("no such key"), "{unknown}");
+        assert!(unknown.contains("write"), "{unknown}");
+        assert!(unknown.contains("feeds/ips"), "{unknown}");
+        // The key itself never reaches the log: a log is copied, shipped and
+        // read by more people than a credential should be.
+        assert!(!unknown.contains("hunter2"), "{unknown}");
+        assert!(unknown.contains(&fingerprint("hunter2")), "{unknown}");
+
+        // A key that exists but is not allowed here is a different problem,
+        // and the log says which — even though the client is told neither.
+        let known = refusal("10.0.0.9:5000", "analyst", true, "read", "private");
+        assert!(known.contains("may not read 'private'"), "{known}");
+        assert!(!known.contains("no such key"), "{known}");
+
+        // The same key gives the same handle every time, or following one
+        // through a log would be impossible.
+        assert_eq!(fingerprint("analyst"), fingerprint("analyst"));
+        assert_ne!(fingerprint("analyst"), fingerprint("analyst2"));
+        assert_eq!(fingerprint("analyst").len(), 8);
     }
 
     #[actix_web::test]
