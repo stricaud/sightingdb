@@ -1,0 +1,1105 @@
+openapi: "3.0.3"
+
+# The SightingDB HTTP API, as a specification you can import into Postman,
+# Insomnia, Bruno or anything else that reads OpenAPI 3.
+#
+#   File > Import > doc/openapi.yaml
+#
+# The server also serves this file at /_api/openapi.yaml, so a running instance
+# can always hand you the description of itself:
+#
+#   curl -k https://localhost:9999/_api/openapi.yaml -o sightingdb.yaml
+#
+# 3.0.3 rather than 3.1 because that is what every importer agrees on.
+
+info:
+  title: SightingDB
+  version: "0.5.7"
+  description: |
+    A database for **sightings**: how often a value has been seen, where, and
+    when. A sighting is `<namespace, value>`; everything else — counts, first
+    and last seen, hourly statistics, consensus across namespaces — the
+    database keeps for you.
+
+    ## Authentication
+
+    Every data and management endpoint takes the API key in an `Authorization`
+    header, as the key itself with no scheme:
+
+        Authorization: changeme
+
+    A key carries grants: `r`, `w` or `rw`, each optionally scoped to a
+    namespace prefix, plus `admin` for the management interface. `/health` and
+    `/i` need no key at all, and when `authenticate = false` the data endpoints
+    do not either — the management interface always does.
+
+    ## Namespaces are paths
+
+    `feeds/misp/ips` is one namespace, not three, and it appears in the URL as
+    a path: `/r/feeds/misp/ips?val=1.2.3.4`. Storage is one file per *top-level*
+    namespace, which is the unit that is kept in memory or evicted.
+
+servers:
+  - url: https://localhost:9999
+    description: A local instance with TLS on, as `--setup` configures it
+  - url: http://localhost:9999
+    description: A local instance with `ssl = false`, as the container ships
+
+tags:
+  - name: sightings
+    description: Writing and reading sightings
+  - name: bulk
+    description: Many sightings in one request
+  - name: stix
+    description: STIX 2.1 export
+  - name: storage
+    description: What stays in memory
+  - name: service
+    description: Health and version, no key required
+  - name: management
+    description: The interface behind /_management/, for an `admin` key
+
+security:
+  - apiKey: []
+
+paths:
+  # -------------------------------------------------------------------------
+  # Sightings
+  # -------------------------------------------------------------------------
+  /w/{namespace}:
+    get:
+      tags: [sightings]
+      summary: Record a sighting
+      description: |
+        Counts one sighting of `val` in `namespace`, creating the namespace if
+        it is new, and answers with the running count.
+      parameters:
+        - $ref: "#/components/parameters/Namespace"
+        - name: val
+          in: query
+          required: true
+          schema: { type: string }
+          example: 1.2.3.4
+        - name: timestamp
+          in: query
+          description: Unix seconds. Absent records the sighting as now.
+          schema: { type: integer, format: int64 }
+          example: 1566624658
+        - name: ttl
+          in: query
+          description: |
+            Seconds from the last sighting until the value expires. Absent
+            leaves whatever the value already had; 0 clears it.
+          schema: { type: integer, format: int64, minimum: 0 }
+          example: 86400
+        - name: tags
+          in: query
+          description: |
+            Comma-separated tags, merged with whatever the value already
+            carried. The vocabulary the STIX export reads is in the README:
+            `stix-type:`, `tlp:`, `confidence:`, `identity:`, and others.
+          schema: { type: string }
+          example: stix-type:ipv4-addr,tlp:amber
+      responses:
+        "200":
+          description: Recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: ok }
+                  count: { type: integer, format: int64, example: 2 }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /r/{namespace}:
+    get:
+      tags: [sightings]
+      summary: Read a value, or list a whole namespace
+      description: |
+        With `val`, answers with that value. Without it, answers with every
+        value in the namespace.
+
+        A read is recorded as a *shadow sighting* under `_shadow/<namespace>`,
+        so you can see how often something was searched for — including things
+        that were never found. `noshadow` suppresses that.
+      parameters:
+        - $ref: "#/components/parameters/Namespace"
+        - name: val
+          in: query
+          schema: { type: string }
+          example: 1.2.3.4
+        - $ref: "#/components/parameters/NoShadow"
+      responses:
+        "200":
+          description: The value, or the whole namespace
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Attribute"
+                  - $ref: "#/components/schemas/NamespaceView"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /rs/{namespace}:
+    get:
+      tags: [sightings]
+      summary: Read a value with its hourly statistics
+      description: |
+        The same as `/r`, plus `stats`: a count per hour, keyed by the Unix
+        timestamp of the hour. `val` is required — a whole namespace has no
+        statistics of its own.
+      parameters:
+        - $ref: "#/components/parameters/Namespace"
+        - name: val
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/NoShadow"
+      responses:
+        "200":
+          description: The value, with statistics
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Attribute" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /d/{namespace}:
+    get:
+      tags: [sightings]
+      summary: Delete a namespace
+      description: |
+        Removes the namespace and everything in it, giving back the consensus
+        its values were holding. Needs write access.
+      parameters:
+        - $ref: "#/components/parameters/Namespace"
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # -------------------------------------------------------------------------
+  # Bulk
+  # -------------------------------------------------------------------------
+  /wb:
+    post:
+      tags: [bulk]
+      summary: Record many sightings
+      description: |
+        Each item is authorized on its own. A mix of accepted and rejected
+        items answers `200` with `message: partial` and the failures listed;
+        everything failing answers `400`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BulkRequest" }
+            example:
+              items:
+                - namespace: feeds/misp/ips
+                  value: 1.2.3.4
+                  tags: stix-type:ipv4-addr,tlp:amber
+                - namespace: feeds/misp/domains
+                  value: evil.example
+                  timestamp: 1566624658
+                  ttl: 86400
+      responses:
+        "200":
+          description: Everything, or some of it, was recorded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BulkWriteResponse" }
+        "400":
+          description: Nothing could be recorded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BulkWriteResponse" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /rb:
+    post:
+      tags: [bulk]
+      summary: Read many values
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BulkRequest" }
+            example:
+              items:
+                - namespace: feeds/misp/ips
+                  value: 1.2.3.4
+                  noshadow: true
+      responses:
+        "200":
+          description: One entry per item, in the order asked for
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    description: Each item is an attribute, or an error object.
+                    items: { type: object }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /rbs:
+    post:
+      tags: [bulk]
+      summary: Read many values, with statistics
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BulkRequest" }
+      responses:
+        "200":
+          description: One entry per item, each carrying its hourly statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { type: object }
+
+  # -------------------------------------------------------------------------
+  # STIX
+  # -------------------------------------------------------------------------
+  /stix/{namespace}:
+    get:
+      tags: [stix]
+      summary: Export one namespace as a STIX 2.1 bundle
+      description: |
+        Each value becomes an `indicator` carrying its pattern and a `sighting`
+        with the count and window, plus the identities and TLP markings they
+        refer to. Ids are derived, so the same data exports byte for byte the
+        same and one value in two namespaces yields one indicator.
+
+        A value whose observable type cannot be worked out is skipped, and the
+        response headers say how many that was.
+      parameters:
+        - $ref: "#/components/parameters/Namespace"
+        - name: limit
+          in: query
+          description: Values read, 10000 by default and 100000 at most.
+          schema: { type: integer, minimum: 1, maximum: 100000 }
+      responses:
+        "200":
+          description: A STIX 2.1 bundle
+          headers:
+            X-SightingDB-Exported: { $ref: "#/components/headers/Exported" }
+            X-SightingDB-Skipped: { $ref: "#/components/headers/Skipped" }
+            X-SightingDB-Truncated: { $ref: "#/components/headers/Truncated" }
+          content:
+            application/stix+json:
+              schema: { $ref: "#/components/schemas/StixBundle" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /_api/stix:
+    post:
+      tags: [stix]
+      summary: Export one or more namespaces as STIX 2.1
+      description: |
+        The same export for a script: a namespace is a path, so POST saves
+        encoding it into a URL, and several can be gathered into one bundle.
+        Every namespace is authorized on its own — naming one the key may not
+        read refuses the whole request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ExportRequest" }
+            example:
+              namespaces: [feeds/misp/ips, feeds/otx/ips]
+              q: "10.0."
+              limit: 5000
+      responses:
+        "200":
+          description: A STIX 2.1 bundle
+          headers:
+            X-SightingDB-Exported: { $ref: "#/components/headers/Exported" }
+            X-SightingDB-Skipped: { $ref: "#/components/headers/Skipped" }
+            X-SightingDB-Truncated: { $ref: "#/components/headers/Truncated" }
+            X-SightingDB-Missing:
+              description: Namespaces asked for that do not exist, comma separated.
+              schema: { type: string }
+          content:
+            application/stix+json:
+              schema: { $ref: "#/components/schemas/StixBundle" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: None of the namespaces asked for exist
+
+  # -------------------------------------------------------------------------
+  # Storage
+  # -------------------------------------------------------------------------
+  /_api/tier:
+    post:
+      tags: [storage]
+      summary: Set what stays in memory, and for how long
+      description: |
+        Name any namespace and the setting lands on its top-level namespace,
+        which is one file paged in and out as a unit — so it covers everything
+        under it, and the reply says so.
+
+        Either field takes `"default"` to stop overriding. Needs write access
+        and a configured `tiers_file`, which is where the change is written so
+        it survives a restart.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TierChange" }
+            example:
+              namespace: feeds/misp/ips
+              tier: warm
+              warm_idle: 86400
+      responses:
+        "200":
+          description: The settings now in force
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TierResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: No tiers_file is configured, so there is nowhere to write it
+
+  # -------------------------------------------------------------------------
+  # Service
+  # -------------------------------------------------------------------------
+  /health:
+    get:
+      tags: [service]
+      summary: Liveness and readiness
+      description: |
+        Needs no key whatever `authenticate` is set to. There is no separate
+        readiness path: the snapshot is restored before the listener is bound,
+        so an answer at all means the database is up.
+      security: []
+      responses:
+        "200":
+          description: The process, and what it holds in memory
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /i:
+    get:
+      tags: [service]
+      summary: Implementation and version
+      security: []
+      responses:
+        "200":
+          description: What this is
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  implementation: { type: string, example: SightingDB }
+                  version: { type: string, example: "0.5.7" }
+                  vendor: { type: string }
+                  author: { type: string }
+
+  /_api/openapi.yaml:
+    get:
+      tags: [service]
+      summary: This specification, as served by the running instance
+      security: []
+      responses:
+        "200":
+          description: The OpenAPI document
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /c/{namespace}:
+    get:
+      tags: [service]
+      summary: Not implemented
+      description: Reserved for per-namespace configuration; answers 501.
+      parameters:
+        - $ref: "#/components/parameters/Namespace"
+      responses:
+        "501":
+          description: Not implemented
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+
+  # -------------------------------------------------------------------------
+  # Management
+  # -------------------------------------------------------------------------
+  /_management/api/session:
+    get:
+      tags: [management]
+      summary: Check a key holds the admin grant
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /_management/api/info:
+    get:
+      tags: [management]
+      summary: What this server is configured to do
+      description: |
+        Read from the configuration file at startup, so this reports rather
+        than edits.
+      responses:
+        "200":
+          description: The configuration in force
+          content:
+            application/json:
+              schema: { type: object }
+
+  /_management/api/namespaces:
+    get:
+      tags: [management]
+      summary: List namespaces
+      parameters:
+        - name: q
+          in: query
+          description: Substring filter over whole namespace names.
+          schema: { type: string }
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of namespaces
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/NamespaceEntry" }
+    post:
+      tags: [management]
+      summary: Create a namespace
+      description: |
+        Creates one before anything is written to it, nesting as deep as you
+        like: `feeds/misp/ips` creates the whole path. An empty namespace is a
+        real namespace — it is snapshotted and survives a restart.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace]
+              properties:
+                namespace: { type: string, example: feeds/misp/ips }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  namespace: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: It already exists
+
+  /_management/api/tree:
+    get:
+      tags: [management]
+      summary: One level of the namespace tree
+      description: |
+        Namespaces are flat paths; this groups them by the segment after
+        `path`, so an interface can browse them like folders.
+      parameters:
+        - name: path
+          in: query
+          description: The folder to open. Empty is the root.
+          schema: { type: string }
+          example: feeds
+        - name: q
+          in: query
+          description: Substring filter over the names at this level.
+          schema: { type: string }
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of children
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/TreeEntry" }
+
+  /_management/api/values:
+    get:
+      tags: [management]
+      summary: The values in one namespace
+      parameters:
+        - name: namespace
+          in: query
+          required: true
+          schema: { type: string }
+        - name: q
+          in: query
+          schema: { type: string }
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of values, without their statistics
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Page"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Attribute" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [management]
+      summary: Add one value, or a pasted list of them
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, values]
+              properties:
+                namespace: { type: string, example: feeds/misp/ips }
+                values:
+                  type: array
+                  items: { type: string }
+                  example: [1.2.3.4, 5.6.7.8]
+                tags: { type: string, example: stix-type:ipv4-addr }
+                ttl: { type: integer, format: int64 }
+                timestamp: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: What was recorded, and what was rejected
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  namespace: { type: string }
+                  written: { type: integer }
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        value: { type: string }
+                        error: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /_management/api/value:
+    get:
+      tags: [management]
+      summary: One value, with its hourly statistics
+      parameters:
+        - name: namespace
+          in: query
+          required: true
+          schema: { type: string }
+        - name: value
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The value
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Attribute" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /_management/api/sightings:
+    get:
+      tags: [management]
+      summary: Every namespace holding one value
+      description: |
+        What the relationship graph draws. Only namespaces the key may read are
+        returned, while `consensus` counts them all — so a scoped key can tell
+        it is not seeing everything without being told the names.
+      parameters:
+        - name: value
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500 }
+      responses:
+        "200":
+          description: Where the value has been seen
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  value: { type: string }
+                  consensus: { type: integer, format: int64 }
+                  truncated: { type: boolean }
+                  paged_in:
+                    type: boolean
+                    description: Finding them all meant reading shards from disk.
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        namespace: { type: string }
+                        shard: { type: string }
+                        count: { type: integer, format: int64 }
+                        first_seen: { type: integer, format: int64 }
+                        last_seen: { type: integer, format: int64 }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /_management/api/tags:
+    post:
+      tags: [management]
+      summary: Replace a value's tags
+      description: |
+        Writes through `/w` merge tags; this replaces the set, which is the only
+        way a wrong tag comes off. It is not a sighting: nothing is counted and
+        no timestamp moves.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, value, tags]
+              properties:
+                namespace: { type: string }
+                value: { type: string }
+                tags:
+                  type: string
+                  description: The whole set, comma separated. Empty clears it.
+                  example: stix-type:ipv4-addr,tlp:amber
+      responses:
+        "200":
+          description: The value as it now stands
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Attribute" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /_management/api/tier:
+    post:
+      tags: [management, storage]
+      summary: Set what stays in memory, and for how long
+      description: The same as `/_api/tier`, for the interface's own key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TierChange" }
+      responses:
+        "200":
+          description: The settings now in force
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TierResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: No tiers_file is configured
+
+  /_management/api/keys:
+    get:
+      tags: [management]
+      summary: List API keys and their grants
+      responses:
+        "200":
+          description: Every key
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/KeyEntry" }
+    post:
+      tags: [management]
+      summary: Create or replace a key
+      description: |
+        Written to the configured `acl_file` and adopted at once, with no
+        restart. Removing the admin grant from the last admin key is refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/KeyEntry" }
+            example:
+              key: analyst
+              admin: false
+              read: [feeds]
+              write: []
+      responses:
+        "200":
+          description: The key as saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/KeyEntry" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: That would leave no admin key, or no acl_file is configured
+
+  /_management/api/keys/generate:
+    get:
+      tags: [management]
+      summary: Suggest a strong key
+      responses:
+        "200":
+          description: A key nobody has to invent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key: { type: string }
+
+  /_management/api/keys/{key}:
+    delete:
+      tags: [management]
+      summary: Revoke a key
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: That would revoke the last admin key
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        The key on its own, with no `Bearer` or other scheme in front of it.
+
+  parameters:
+    Namespace:
+      name: namespace
+      in: path
+      required: true
+      description: |
+        A namespace path such as `feeds/misp/ips`. Slashes are part of the
+        name; do not encode them.
+      schema: { type: string }
+      example: feeds/misp/ips
+    NoShadow:
+      name: noshadow
+      in: query
+      description: |
+        Present at any value — including empty — to suppress the shadow
+        sighting this read would otherwise record.
+      allowEmptyValue: true
+      schema: { type: string }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+
+  headers:
+    Exported:
+      description: Values written into the bundle.
+      schema: { type: integer }
+    Skipped:
+      description: Values left out because their observable type was unknown.
+      schema: { type: integer }
+    Truncated:
+      description: Whether a namespace held more than the export read.
+      schema: { type: boolean }
+
+  responses:
+    Ok:
+      description: Done
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Message" }
+    BadRequest:
+      description: The request could not be read, or asked for something impossible
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Message" }
+    Unauthorized:
+      description: No API key was given
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Message" }
+    Forbidden:
+      description: |
+        The key may not do this. Deliberately the same answer whether the key
+        is unknown or merely unauthorised, so probing cannot tell them apart.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Message" }
+    NotFound:
+      description: No such namespace, or no such value in it
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Message" }
+
+  schemas:
+    Message:
+      type: object
+      properties:
+        message: { type: string }
+
+    Attribute:
+      type: object
+      description: One value, and what is known about it.
+      properties:
+        value: { type: string, example: 1.2.3.4 }
+        first_seen:
+          type: integer
+          format: int64
+          description: Unix seconds.
+          example: 1566624658
+        last_seen: { type: integer, format: int64, example: 1566624689 }
+        count:
+          type: integer
+          format: int64
+          description: Sightings in this namespace.
+          example: 2
+        consensus:
+          type: integer
+          format: int64
+          description: How many namespaces have seen this value.
+          example: 3
+        ttl:
+          type: integer
+          format: int64
+          description: Seconds from the last sighting until it expires; 0 never.
+        tags:
+          type: string
+          description: Comma-separated set. See the tag vocabulary in the README.
+          example: stix-type:ipv4-addr,tlp:amber
+        stats:
+          type: object
+          description: |
+            Sightings per hour, keyed by the Unix timestamp of the hour. Only
+            present on `/rs`, `/rbs` and the management value endpoint.
+          additionalProperties: { type: integer, format: int64 }
+
+    NamespaceView:
+      type: object
+      description: Every value in a namespace, as `/r/<namespace>` answers.
+      properties:
+        attributes:
+          type: array
+          items: { $ref: "#/components/schemas/Attribute" }
+
+    Page:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: Matches before paging, not the number returned.
+        offset: { type: integer }
+
+    NamespaceEntry:
+      type: object
+      properties:
+        namespace: { type: string, example: feeds/misp/ips }
+        shard:
+          type: string
+          description: The top-level namespace, which storage settings belong to.
+          example: feeds
+        tier:
+          type: string
+          enum: [hot, warm, cold]
+        resident:
+          type: boolean
+          description: Whether the shard is in memory rather than on disk.
+        warm_idle:
+          type: integer
+          format: int64
+          description: Seconds a warm shard may sit untouched.
+        own_tier:
+          type: boolean
+          description: The tier is set on the shard rather than the default.
+        own_warm_idle: { type: boolean }
+
+    TreeEntry:
+      type: object
+      properties:
+        name:
+          type: string
+          description: The path segment, which is what a row is labelled with.
+          example: misp
+        path: { type: string, example: feeds/misp }
+        is_namespace:
+          type: boolean
+          description: |
+            Whether the path is a namespace of its own and so may hold values.
+            A path can be both this and a folder with others underneath.
+        descendants: { type: integer }
+        shard: { type: string }
+        tier: { type: string, enum: [hot, warm, cold] }
+        resident: { type: boolean }
+        warm_idle: { type: integer, format: int64 }
+        own_tier: { type: boolean }
+        own_warm_idle: { type: boolean }
+
+    BulkRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [namespace, value]
+            properties:
+              namespace: { type: string }
+              value: { type: string }
+              timestamp: { type: integer, format: int64, nullable: true }
+              ttl: { type: integer, format: int64, nullable: true }
+              tags: { type: string }
+              noshadow: { type: boolean }
+
+    BulkWriteResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          enum: [ok, partial, failed]
+        written: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              namespace: { type: string }
+              value: { type: string }
+              error: { type: string }
+
+    ExportRequest:
+      type: object
+      description: Name one namespace, or several to gather into one bundle.
+      properties:
+        namespace:
+          type: string
+          description: Shorthand for a single namespace.
+        namespaces:
+          type: array
+          items: { type: string }
+        q:
+          type: string
+          description: Substring filter over values.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          default: 10000
+
+    StixBundle:
+      type: object
+      description: A STIX 2.1 bundle. See https://oasis-open.github.io/cti-documentation/
+      properties:
+        type: { type: string, example: bundle }
+        id: { type: string, example: bundle--2ac7882f-76a3-4a9b-97b3-811b3af1c7c0 }
+        objects:
+          type: array
+          items: { type: object }
+
+    TierChange:
+      type: object
+      description: |
+        Both halves are optional, and both take `"default"` to stop overriding.
+        Sending neither clears the setting entirely.
+      properties:
+        namespace:
+          type: string
+          description: Any namespace; the setting lands on its top-level namespace.
+          example: feeds/misp/ips
+        tier:
+          type: string
+          description: hot, warm, cold, or default.
+          example: warm
+        warm_idle:
+          description: |
+            Seconds a warm shard may sit untouched. A number, or the string
+            `"default"` to go back to the configured window.
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: 0
+            - type: string
+          example: 86400
+
+    TierResult:
+      type: object
+      properties:
+        shard: { type: string }
+        tier: { type: string, enum: [hot, warm, cold] }
+        warm_idle: { type: integer, format: int64 }
+        own_tier: { type: boolean }
+        own_warm_idle: { type: boolean }
+        effect:
+          type: string
+          description: What the shard will now do, in a sentence.
+          example: "'feeds' and everything under it is dropped after 86400s untouched"
+
+    KeyEntry:
+      type: object
+      required: [key, admin, read, write]
+      properties:
+        key: { type: string }
+        admin:
+          type: boolean
+          description: Whether the key may use the management interface.
+        read:
+          type: array
+          description: Namespace prefixes this key may read. An empty string is all.
+          items: { type: string }
+        write:
+          type: array
+          items: { type: string }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, example: ok }
+        version: { type: string }
+        uptime_seconds: { type: integer, format: int64 }
+        resident_shards:
+          type: integer
+          description: Shards in memory. A restored database reports 0 until used.
+        shards: { type: integer }

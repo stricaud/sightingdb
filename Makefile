@@ -194,11 +194,13 @@ helm-template: ## Render the chart to stdout, as it would be installed
 helm-package: ## Package the chart into a .tgz
 	$(HELM) package $(CHART)
 
-sync-version: ## Copy the crate version into the chart's appVersion
+sync-version: ## Copy the crate version into the chart and the OpenAPI document
 	@version=$$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2); \
 	sed -i.bak "s/^appVersion: .*/appVersion: \"$$version\"/" $(CHART)/Chart.yaml; \
 	rm -f $(CHART)/Chart.yaml.bak; \
-	echo "chart appVersion is now $$version"
+	sed -i.bak "s/^  version: \".*\"/  version: \"$$version\"/" doc/openapi.yaml; \
+	rm -f doc/openapi.yaml.bak; \
+	echo "chart appVersion and the OpenAPI version are now $$version"
 
 ##@ Running it
 

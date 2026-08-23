@@ -6,7 +6,7 @@ type: application
 version: 0.1.0
 # The application version this chart defaults to, and the default image tag.
 # `make sync-version` copies it from Cargo.toml.
-appVersion: "0.5.5"
+appVersion: "0.5.7"
 home: https://github.com/stricaud/sightingdb
 sources:
   - https://github.com/stricaud/sightingdb

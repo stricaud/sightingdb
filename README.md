@@ -183,6 +183,30 @@ REST Endpoints
 	/c: configure (GET, not implemented)
 	/i: info (GET)
 	/health: liveness and readiness, no key required (GET)
+	/_api/openapi.yaml: this API as an OpenAPI 3 document (GET)
+
+OpenAPI
+=======
+
+[`doc/openapi.yaml`](doc/openapi.yaml) describes the whole HTTP API — data,
+STIX, storage and management — as an OpenAPI 3.0.3 document. Import it into
+Postman (**File → Import**), Insomnia, Bruno or anything else that reads
+OpenAPI, and every endpoint arrives with its parameters, example bodies and
+responses.
+
+A running instance also serves it, so you can always ask an instance to
+describe *itself* rather than trusting a file that may be older:
+
+	$ curl -k https://localhost:9999/_api/openapi.yaml -o sightingdb.yaml
+
+That copy has the version rewritten to whatever the server actually is. Set
+the API key once in Postman as a collection-level API-key auth with the header
+name `Authorization` and the key as the value — no `Bearer` in front of it —
+and every request inherits it.
+
+A test asserts that every route the server registers appears in the document,
+so an endpoint added without documentation fails the build rather than being
+discovered by whoever imported the collection.
 
 Status codes
 ------------

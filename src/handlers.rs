@@ -64,6 +64,33 @@ impl SharedState {
 
 pub type State = web::Data<SharedState>;
 
+/// The API description, for `/_api/openapi.yaml`.
+///
+/// The file carries a version of its own so that it stands alone when someone
+/// imports it straight from the repository, but a running server knows better:
+/// it rewrites that line with the version it actually is, so the two cannot
+/// drift into describing a release nobody is running.
+static OPENAPI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    const SPEC: &str = include_str!("../doc/openapi.yaml");
+    let stated = format!("\n  version: \"{}\"", env!("CARGO_PKG_VERSION"));
+
+    let Some(info) = SPEC.find("\ninfo:") else {
+        return SPEC.to_string();
+    };
+    let Some(line) = SPEC[info..].find("\n  version: ").map(|at| info + at) else {
+        return SPEC.to_string();
+    };
+    let end = SPEC[line + 1..]
+        .find('\n')
+        .map_or(SPEC.len(), |at| line + 1 + at);
+
+    let mut spec = String::with_capacity(SPEC.len() + stated.len());
+    spec.push_str(&SPEC[..line]);
+    spec.push_str(&stated);
+    spec.push_str(&SPEC[end..]);
+    spec
+});
+
 fn error_response(err: &ApiError) -> HttpResponse {
     HttpResponse::build(err.status()).json(err.body())
 }
@@ -295,6 +322,7 @@ pub async fn help() -> impl Responder {
             "\t/c: configure (GET)\n",
             "\t/i: info (GET)\n",
             "\t/health: liveness and readiness, no key required (GET)\n",
+            "\t/_api/openapi.yaml: this API as an OpenAPI 3 document (GET)\n",
         ))
 }
 
@@ -305,6 +333,18 @@ pub async fn info() -> impl Responder {
         vendor: "github.com/stricaud/sightingdb",
         author: "Sebastien Tricaud",
     })
+}
+
+/// The OpenAPI description of this API, as shipped in `doc/openapi.yaml`.
+///
+/// Compiled in rather than read from disk so a running instance always hands
+/// out the description of *itself*, and unauthenticated because a specification
+/// is documentation — `/help` already lists every route to anyone who asks.
+pub async fn openapi() -> impl Responder {
+    HttpResponse::Ok()
+        .content_type("application/yaml; charset=utf-8")
+        .insert_header(("Cache-Control", "public, max-age=86400"))
+        .body(OPENAPI.as_str())
 }
 
 /// Liveness and readiness in one, for orchestrators.
@@ -634,6 +674,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/c/{namespace:.*}", web::get().to(configure_endpoint))
         .route("/i", web::get().to(info))
         .route("/health", web::get().to(health))
+        .route("/_api/openapi.yaml", web::get().to(openapi))
         .default_service(web::to(help));
 }
 
@@ -1227,6 +1268,71 @@ mod tests {
         assert!(!st.db.namespace_exists("_config/acl/apikeys/mine"));
         assert!(st.db.legacy_apikeys().is_empty());
         assert!(st.acl().can_write(KEY, "any/namespace"));
+    }
+
+    /// The specification is only useful if it still describes this server, so
+    /// every route registered here has to appear in it. A route added without
+    /// a line in the document fails this rather than being found by whoever
+    /// imports it into Postman.
+    #[actix_web::test]
+    async fn the_openapi_document_describes_every_route() {
+        let st = state(false);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/_api/openapi.yaml")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = test::read_body(resp).await;
+        let spec = String::from_utf8_lossy(&body);
+
+        assert!(spec.starts_with("openapi:"), "not an OpenAPI document");
+        for path in [
+            "  /w/{namespace}:",
+            "  /r/{namespace}:",
+            "  /rs/{namespace}:",
+            "  /d/{namespace}:",
+            "  /wb:",
+            "  /rb:",
+            "  /rbs:",
+            "  /stix/{namespace}:",
+            "  /_api/stix:",
+            "  /_api/tier:",
+            "  /_api/openapi.yaml:",
+            "  /c/{namespace}:",
+            "  /i:",
+            "  /health:",
+            "  /_management/api/session:",
+            "  /_management/api/info:",
+            "  /_management/api/namespaces:",
+            "  /_management/api/tree:",
+            "  /_management/api/values:",
+            "  /_management/api/value:",
+            "  /_management/api/sightings:",
+            "  /_management/api/tags:",
+            "  /_management/api/tier:",
+            "  /_management/api/keys:",
+            "  /_management/api/keys/generate:",
+            "  /_management/api/keys/{key}:",
+        ] {
+            assert!(spec.contains(path), "{path} is not in the OpenAPI document");
+        }
+
+        // Whatever the file says, the server says what it is.
+        let info = spec.find("\ninfo:").expect("an info section");
+        let version = spec[info..]
+            .lines()
+            .find(|line| line.starts_with("  version:"))
+            .expect("a version");
+        assert_eq!(
+            version.trim(),
+            format!("version: \"{}\"", env!("CARGO_PKG_VERSION")),
+            "the served document names the wrong version"
+        );
     }
 
     #[actix_web::test]
