@@ -1,0 +1,49 @@
+{{ include "sightingdb.fullname" . }} is installed.
+
+  Image:    {{ include "sightingdb.image" . }}
+  HTTP:     {{ include "sightingdb.url" . }}  (in-cluster)
+  Storage:  {{ if .Values.persistence.enabled }}{{ if .Values.persistence.existingClaim }}existing claim {{ .Values.persistence.existingClaim }}{{ else }}{{ .Values.persistence.size }} volume{{ end }}{{ else }}NONE — everything is lost when the pod restarts{{ end }}
+  TLS:      {{ .Values.tls.mode }}
+{{- if .Values.config.dns.enabled }}
+  DNS:      {{ include "sightingdb.fullname" . }}-dns:{{ .Values.dnsService.port }} for {{ .Values.config.dns.zone }} (bound on {{ .Values.config.dns.listen_port }} in the pod)
+{{- end }}
+
+Reach it from your machine:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "sightingdb.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+Then the management interface is at
+{{ ternary "https" "http" (eq (include "sightingdb.tlsEnabled" .) "true") }}://localhost:{{ .Values.service.port }}/_management/
+
+Your admin key{{ if not .Values.acl.keys }}, generated on install and kept across upgrades{{ end }}:
+
+  kubectl --namespace {{ .Release.Namespace }} get secret {{ include "sightingdb.aclSecretName" . }} \
+    -o jsonpath='{.data.admin-key}' | base64 -d; echo
+
+Write and read a sighting:
+
+  curl -k -H "Authorization: <key>" "{{ ternary "https" "http" (eq (include "sightingdb.tlsEnabled" .) "true") }}://localhost:{{ .Values.service.port }}/w/my/namespace?val=127.0.0.1"
+  curl -k -H "Authorization: <key>" "{{ ternary "https" "http" (eq (include "sightingdb.tlsEnabled" .) "true") }}://localhost:{{ .Values.service.port }}/r/my/namespace?val=127.0.0.1"
+
+Check it works:
+
+  helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence is off. The database is held in memory and snapshotted to
+an emptyDir, so everything is lost when the pod is replaced. Set
+persistence.enabled=true for anything you mean to keep.
+{{- end }}
+{{- if and .Values.acl.keys (hasKey .Values.acl.keys "changeme") }}
+
+WARNING: the API key "changeme" is in use. It is in this chart's examples and
+in the project's README, so treat it as public: set acl.keys to something of
+your own, or leave acl.keys empty and let the chart generate a key.
+{{- end }}
+{{- if and (eq .Values.tls.mode "disabled") (not .Values.ingress.enabled) }}
+
+NOTE: TLS is off and there is no ingress, so traffic to the pod is plain HTTP.
+That is the usual arrangement inside a cluster; set tls.mode if the pod itself
+should terminate TLS.
+{{- end }}

@@ -1,8 +1,18 @@
-version: '3'
+# Runs the image built from this working tree. From the repository root:
+#     docker compose -f docker/docker-compose.yml up --build
 services:
   sightingdb:
-    build: .
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     environment:
+      # Replaces the built-in key. Leave it out and the default applies.
       - SIGHTINGDB_APIKEY=changeme
     ports:
       - "9999:9999"
+    volumes:
+      # Without this the database lives only as long as the container.
+      - sightingdb:/var/lib/sightingdb
+
+volumes:
+  sightingdb:

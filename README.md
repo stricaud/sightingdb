@@ -171,6 +171,7 @@ REST Endpoints
 	/_api/stix: export one or more namespaces as STIX 2.1 (POST)
 	/c: configure (GET, not implemented)
 	/i: info (GET)
+	/health: liveness and readiness, no key required (GET)
 
 Status codes
 ------------
@@ -614,6 +615,117 @@ the next save would make it real.
 
 API keys are *not* in the snapshot: they come from the configuration, so
 permissions are reviewable and can live in version control.
+
+Containers and Kubernetes
+=========================
+
+	$ make            # what every target does
+	$ make deploy     # into the cluster kubectl already points at
+	$ make dev        # into a kind cluster this creates for the purpose
+
+Both build a container image from the source in your working tree, install the
+Helm chart, wait for the pod and then write a sighting through it to prove it
+works. The difference is the cluster:
+
+* **`make deploy`** uses whatever `kubectl config current-context` names —
+  Docker Desktop, Rancher Desktop, minikube, k3d, or a kind cluster you made
+  yourself. It hands the image over the way that cluster expects: `kind load`,
+  `k3d image import`, `minikube image load`, or — for current Docker Desktop,
+  whose node is a container of its own rather than a user of this machine's
+  image store — `docker save` piped into the node's containerd. `make load`
+  does only that step.
+* **`make dev`** creates a kind cluster named `sightingdb` first, and
+  `make teardown` deletes it and everything in it.
+
+Then `make port-forward` and `make admin-key` get you into the management
+interface, and `make uninstall` removes the release.
+
+**These targets refuse to touch a cluster that is not local.** They install,
+delete and write data, so they check the context against a list of local ones
+(`docker-desktop`, `rancher-desktop`, `minikube`, `colima`, `kind-*`, `k3d-*`,
+`k3s-*`) and stop if it is anything else — a `kubectl config use-context` away
+from production should not be one keystroke away from `make deploy`. The
+context is resolved once and passed explicitly to every helm and kubectl call,
+so nothing can be redirected midway. `ALLOW_ANY_CONTEXT=1` overrides it
+deliberately, and `CONTEXT=<name>` picks one without switching your current
+context.
+
+A cluster that is not local — one that has to *pull* the image — needs it in a
+registry it can reach:
+
+	$ make image-push IMAGE=registry.example.com/sightingdb TAG=0.5.6
+	$ helm upgrade --install sightingdb ./helm/sightingdb \
+	    --set image.repository=registry.example.com/sightingdb --set image.tag=0.5.6
+
+Docker
+------
+
+	$ docker build -f docker/Dockerfile -t sightingdb:dev .
+	$ docker run --rm -p 9999:9999 -v sightingdb:/var/lib/sightingdb sightingdb:dev
+
+The image builds this working tree — not a clone of the repository — in a
+builder stage and ships the binary on `debian-slim`. Mount a volume at
+`/var/lib/sightingdb`: without one the database lives only as long as the
+container. TLS is off in the baked-in configuration, because a certificate
+built into an image is the same certificate for everyone who pulls it;
+terminate TLS in front of it, or mount a key and certificate and set `ssl`,
+`ssl_cert` and `ssl_key`.
+
+**It never runs as root.** The image creates a `sightingdb` user and group at
+uid/gid 10001 and starts the daemon as that user, the same way the systemd unit
+does with `User=sightingdb`. SightingDB has no privilege-dropping code and needs
+none: nothing it opens requires root, so there is no window where it is root and
+nothing to get wrong in the dropping. The one exception is a port below 1024 —
+the DNS listener on 53 — and that is a capability rather than a reason to start
+as root:
+
+	$ docker run --cap-add NET_BIND_SERVICE ...        # or publish 53:5353
+
+Two consequences worth knowing. A **bind mount** from the host arrives owned by
+whoever owns it on the host, so it has to be writable by uid 10001
+(`chown 10001:10001 ./data`) — a named volume inherits the image's ownership and
+needs nothing. And because the data directory is owned by group 0 and is
+group-writable, the image also works where the uid is assigned rather than
+chosen, as on OpenShift.
+
+Helm
+----
+
+The chart is in [`helm/sightingdb`](helm/sightingdb), with its own
+[README](helm/sightingdb/README.md). Every option in
+[`etc/sightingdb.toml`](etc/sightingdb.toml) has a value, and the configuration
+file is rendered from them:
+
+	helm install sightingdb ./helm/sightingdb \
+	  --namespace sightingdb --create-namespace \
+	  --set image.repository=ghcr.io/you/sightingdb --set image.tag=0.5.5
+
+Worth knowing before you deploy it:
+
+* **One pod.** SightingDB holds its data in memory and snapshots it to one
+  directory, so a second replica would be a second, unrelated database — the
+  chart is a StatefulSet of one and has no `replicaCount`. Scale by giving the
+  pod more memory.
+* **The admin key lives in a Secret.** `acl.keys` renders an `acl.toml` into
+  `<release>-acl`, alongside an `admin-key` entry holding the first key with the
+  `admin` grant — `make admin-key`, or:
+
+		kubectl -n sightingdb get secret sightingdb-acl -o jsonpath='{.data.admin-key}' | base64 -d
+
+  Leave `acl.keys` empty and one is generated on install and kept across
+  upgrades, so no known key is ever shipped.
+* **Keys are seeded, not managed.** An init container copies that `acl.toml`
+  onto the data volume, because the management interface rewrites the file and a
+  mounted Secret is read-only. Keys created in the interface therefore live on
+  the volume and survive upgrades; they are not written back into the Secret.
+* **Namespaces can be created up front.** `bootstrap.namespaces` creates them
+  through the management API after install and upgrade, so a deployment starts
+  with the structure its writers and ACL prefixes assume rather than with
+  nothing until the first write.
+* **`/health` is the probe.** It needs no API key whatever `authenticate` is
+  set to, and reports the version, uptime and how many shards are in memory.
+  There is no separate readiness path: the snapshot is restored before the
+  listener is bound, so an answer at all means the database is up.
 
 Tests
 =====

@@ -1,0 +1,48 @@
+# What `make dev` installs: a working SightingDB on a local kind cluster.
+#
+# Differences from the defaults are all about being local — an image built on
+# this machine rather than pulled, a small volume, and a couple of namespaces
+# created up front so there is something to look at in the interface.
+
+image:
+  repository: sightingdb
+  tag: dev
+  # The image is loaded into the cluster with `kind load`, not pulled.
+  pullPolicy: IfNotPresent
+
+persistence:
+  enabled: true
+  size: 1Gi
+
+# Plain HTTP, reached through `kubectl port-forward`. Nothing here leaves the
+# machine, and it keeps `curl` from needing -k.
+tls:
+  mode: disabled
+
+# A known key, on purpose: this is a kind cluster on your own machine, and
+# copy-pasting the README's curl lines is the point of it. Anywhere else, leave
+# acl.keys empty and let the chart generate one.
+acl:
+  keys:
+    changeme: "rw, admin"
+    analyst: "r:feeds"
+
+bootstrap:
+  namespaces:
+    - feeds/misp/ips
+    - feeds/misp/domains
+    - feeds/otx/ips
+
+logging:
+  level: debug
+
+config:
+  daemon:
+    # Snapshot often, so stopping the pod loses nothing worth missing.
+    snapshot_interval: 60
+  stix:
+    identity: "Local SightingDB"
+    identity_class: organization
+    types:
+      ipv4-addr: feeds/misp/ips
+      domain-name: feeds/misp/domains

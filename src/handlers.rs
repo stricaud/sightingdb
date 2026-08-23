@@ -27,6 +27,8 @@ pub struct SharedState {
     /// What the STIX export needs: who we publish as, and which observable
     /// type each namespace is configured to hold.
     pub stix: crate::config::StixSettings,
+    /// When the process came up, which is what `/health` reports.
+    pub started: std::time::Instant,
 }
 
 impl SharedState {
@@ -45,6 +47,7 @@ impl SharedState {
             acl_file: None,
             tiers_file: None,
             stix: crate::config::StixSettings::default(),
+            started: std::time::Instant::now(),
         }
     }
 }
@@ -191,6 +194,20 @@ struct BulkWriteError {
     error: String,
 }
 
+/// What a health check gets: enough to tell a live database from a process
+/// that is merely running, and nothing that would be worth an unauthenticated
+/// request to find out.
+#[derive(Debug, Serialize)]
+struct HealthData {
+    status: &'static str,
+    version: &'static str,
+    uptime_seconds: u64,
+    /// Shards in memory, out of how many exist. A restored database that has
+    /// not been touched yet reports 0 of n, which is normal rather than ill.
+    resident_shards: usize,
+    shards: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct InfoData {
     implementation: &'static str,
@@ -276,6 +293,7 @@ pub async fn help() -> impl Responder {
             "\t/_api/stix: export one or more namespaces as STIX 2.1 (POST)\n",
             "\t/c: configure (GET)\n",
             "\t/i: info (GET)\n",
+            "\t/health: liveness and readiness, no key required (GET)\n",
         ))
 }
 
@@ -285,6 +303,24 @@ pub async fn info() -> impl Responder {
         version: env!("CARGO_PKG_VERSION"),
         vendor: "github.com/stricaud/sightingdb",
         author: "Sebastien Tricaud",
+    })
+}
+
+/// Liveness and readiness in one, for orchestrators.
+///
+/// Unauthenticated on purpose: a kubelet has no API key, and this reports the
+/// process rather than the data. There is no separate readiness endpoint
+/// because there is no window where this answers and the database is not yet
+/// loaded — the snapshot is restored before the listener is bound, so a
+/// response at all means the database is up.
+pub async fn health(state: State) -> HttpResponse {
+    let (resident_shards, shards) = state.db.residency();
+    HttpResponse::Ok().json(HealthData {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds: state.started.elapsed().as_secs(),
+        resident_shards,
+        shards,
     })
 }
 
@@ -595,6 +631,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/_api/stix", web::post().to(export_stix_api))
         .route("/c/{namespace:.*}", web::get().to(configure_endpoint))
         .route("/i", web::get().to(info))
+        .route("/health", web::get().to(health))
         .default_service(web::to(help));
 }
 
@@ -1188,6 +1225,45 @@ mod tests {
         assert!(!st.db.namespace_exists("_config/acl/apikeys/mine"));
         assert!(st.db.legacy_apikeys().is_empty());
         assert!(st.acl().can_write(KEY, "any/namespace"));
+    }
+
+    #[actix_web::test]
+    async fn health_answers_without_a_key_even_when_authentication_is_on() {
+        let st = state(true);
+        let app = app!(st);
+
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert!(body["uptime_seconds"].is_u64(), "{body}");
+        // Nothing is stored yet, so nothing is resident.
+        assert_eq!(body["shards"], 0);
+        assert_eq!(body["resident_shards"], 0);
+    }
+
+    #[actix_web::test]
+    async fn health_reports_what_is_in_memory() {
+        let st = state(false);
+        let app = app!(st);
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/ips?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+
+        let body: Value = test::read_body_json(
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await,
+        )
+        .await;
+        // The namespace's own shard, plus the internal one holding `_all`.
+        assert_eq!(body["shards"], 2);
+        assert_eq!(body["resident_shards"], 2);
     }
 
     // -- tags and STIX -------------------------------------------------------

@@ -1,0 +1,100 @@
+{{- if .Values.bootstrap.namespaces }}
+{{/*
+Creates the namespaces a deployment expects to have, so a fresh install starts
+with the structure its writers and its ACL prefixes already assume rather than
+with nothing until the first write lands.
+
+A hook rather than an init container: the namespaces are created through the
+management API, which means the daemon has to be up and answering first.
+Creating one that exists answers 409, so re-running this changes nothing.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sightingdb.fullname" . }}-bootstrap
+  labels:
+    {{- include "sightingdb.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.bootstrap.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "sightingdb.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "sightingdb.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: bootstrap
+          image: {{ include "sightingdb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: SIGHTINGDB_URL
+              value: {{ include "sightingdb.url" . }}
+            - name: SIGHTINGDB_ADMIN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sightingdb.aclSecretName" . }}
+                  key: {{ .Values.bootstrap.adminKeySecretKey | default "admin-key" }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # The pod may still be starting: the hook runs as soon as the
+              # StatefulSet is created, not once it is ready.
+              deadline=$(( $(date +%s) + {{ .Values.bootstrap.timeoutSeconds }} ))
+              until curl -fsSk "$SIGHTINGDB_URL/health" >/dev/null 2>&1; do
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  echo "SightingDB did not come up within {{ .Values.bootstrap.timeoutSeconds }}s" >&2
+                  exit 1
+                fi
+                sleep 2
+              done
+              echo "SightingDB is up"
+
+              for namespace in {{ range .Values.bootstrap.namespaces }}{{ . | quote }} {{ end }}; do
+                code=$(curl -sSk -o /tmp/out -w '%{http_code}' -X POST \
+                  -H "Authorization: $SIGHTINGDB_ADMIN_KEY" \
+                  -H 'Content-Type: application/json' \
+                  -d "{\"namespace\":\"$namespace\"}" \
+                  "$SIGHTINGDB_URL/_management/api/namespaces")
+                case "$code" in
+                  200) echo "created $namespace" ;;
+                  # Already there, which is the normal answer on an upgrade.
+                  409) echo "$namespace already exists" ;;
+                  *)   echo "could not create $namespace: HTTP $code $(cat /tmp/out)" >&2; exit 1 ;;
+                esac
+              done
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The root filesystem is read-only, and curl needs somewhere to write.
+        - name: tmp
+          emptyDir: {}
+{{- end }}

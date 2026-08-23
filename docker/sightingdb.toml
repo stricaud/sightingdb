@@ -1,17 +1,27 @@
+# The configuration baked into the container image, for `docker run`. It is
+# deliberately small: Kubernetes mounts its own over the top, rendered from
+# helm/sightingdb/values.yaml.
+
 [daemon]
 listen_ip = "0.0.0.0"
 listen_port = 9999
 authenticate = true
-daemonize = false
-ssl = true
-ssl_cert = "ssl/cert.pem"
-ssl_key = "ssl/key.pem"
-post_limit = 2_500_000_000
-log_out = "/var/log/sightingdb/sightingdb.log"
-log_err = "/var/log/sightingdb/sightingdb.error.log"
 
-# Mount a volume at /var/lib/sightingdb to keep the database across container
-# restarts; without one it lives only as long as the container.
+# The container is the process; letting it fork would leave the supervisor
+# watching a pid that has already exited.
+daemonize = false
+
+# Off because a certificate baked into an image is the same certificate for
+# everyone who pulls it. Terminate TLS in front of the container, or mount a
+# key and certificate and set these three.
+ssl = false
+# ssl_cert = "/etc/sightingdb/tls/tls.crt"
+# ssl_key = "/etc/sightingdb/tls/tls.key"
+
+post_limit = 2_500_000_000
+
+# Mount a volume here to keep the database across container restarts; without
+# one it lives only as long as the container.
 dbdir = "/var/lib/sightingdb"
 snapshot_interval = 300
 sweep_interval = 60
@@ -19,6 +29,11 @@ sweep_interval = 60
 stats_retention = 720
 shadow_ttl = 2_592_000
 
-# Rewritten by the management interface; keep it on a mounted volume so keys
-# survive a container restart.
+# Rewritten by the management interface, so it lives on the volume rather than
+# in the image: keys have to survive a restart, and the image is read-only.
 acl_file = "/var/lib/sightingdb/acl.toml"
+
+[storage]
+default_tier = "hot"
+warm_idle = 3600
+tiers_file = "/var/lib/sightingdb/tiers.toml"

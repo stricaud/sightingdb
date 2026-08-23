@@ -1,0 +1,362 @@
+# Default values for SightingDB.
+#
+# Everything under `config` is the daemon's own configuration file, key for key
+# with etc/sightingdb.toml. A key left null is not written at all, so the
+# daemon's own default applies — and since the daemon refuses to start on an
+# unknown key, nothing is written that it would not recognise.
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image:
+  repository: sightingdb
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Workload
+#
+# There is deliberately no replicaCount. SightingDB holds its data in memory
+# and snapshots it to one directory; a second replica would be a second,
+# unrelated database answering half the requests, with its own consensus counts
+# and its own API keys. Scale by giving the pod more memory, not more pods.
+# ---------------------------------------------------------------------------
+podAnnotations: {}
+podLabels: {}
+
+# Runs as the uid the image creates. fsGroup is what makes the volume writable.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+resources: {}
+  # requests:
+  #   cpu: 250m
+  #   memory: 512Mi
+  # limits:
+  #   memory: 4Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# The database is written out on the way down, so give it room to finish.
+terminationGracePeriodSeconds: 120
+
+updateStrategy:
+  type: RollingUpdate
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+# Anything the chart does not model.
+extraArgs: []
+extraEnv: []
+  # - name: RUST_BACKTRACE
+  #   value: "1"
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+extraInitContainers: []
+
+# ---------------------------------------------------------------------------
+# Probes
+#
+# `/health` reports the process and what it holds in memory, and needs no key
+# whatever `authenticate` is set to. There is no separate readiness path: the
+# snapshot is restored before the listener is bound, so an answer at all means
+# the database is up.
+# ---------------------------------------------------------------------------
+probes:
+  startup:
+    enabled: true
+    failureThreshold: 30
+    periodSeconds: 2
+  liveness:
+    enabled: true
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 9999
+  nodePort: null
+  annotations: {}
+  labels: {}
+  clusterIP: ""
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+
+# The DNS listener, when config.dns.enabled is true. UDP and TCP on the same
+# port, as a resolver expects.
+#
+# `port` is what clients ask on; `config.dns.listen_port` is what the pod binds,
+# and defaults to 5353 because the container runs unprivileged with every
+# capability dropped, and binding below 1024 needs CAP_NET_BIND_SERVICE. Bind
+# 53 directly by adding it back:
+#
+#   securityContext:
+#     capabilities:
+#       drop: ["ALL"]
+#       add: ["NET_BIND_SERVICE"]
+dnsService:
+  type: ClusterIP
+  port: 53
+  nodePort: null
+  annotations: {}
+  clusterIP: ""
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  hosts:
+    - host: sightingdb.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: sightingdb-tls
+    #   hosts: [sightingdb.local]
+
+# ---------------------------------------------------------------------------
+# Storage
+#
+# The daemon snapshots to `config.daemon.dbdir` and rewrites `acl_file` and
+# `tiers_file` when the management interface changes a key or a tier, so this
+# volume is where anything that has to survive a restart lives.
+# ---------------------------------------------------------------------------
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  annotations: {}
+  # Use a claim you made yourself instead of the chart's volumeClaimTemplate.
+  existingClaim: ""
+
+# ---------------------------------------------------------------------------
+# TLS
+#
+#   disabled   — plain HTTP. The usual arrangement in a cluster, where TLS ends
+#                at the ingress and the pod is reached over the pod network.
+#   secret     — mount an existing kubernetes.io/tls secret and serve HTTPS.
+#   selfsigned — an init container asks the binary to write a certificate onto
+#                the data volume on first start. For getting going, not for
+#                anything a client outside the cluster has to trust.
+# ---------------------------------------------------------------------------
+tls:
+  mode: disabled
+  secretName: ""
+
+# ---------------------------------------------------------------------------
+# API keys
+#
+# Rendered into an acl.toml held in a Secret. The management interface rewrites
+# that file when a key is created or revoked, and a mounted Secret is read
+# only — so an init container seeds a writable copy onto the data volume, and
+# the daemon is pointed at that. Keys created in the interface therefore
+# survive a restart, and are *not* written back into the Secret.
+# ---------------------------------------------------------------------------
+acl:
+  # <apikey> = <grant>[, <grant>...]; grant is r, w or rw, optionally scoped
+  # with :<namespace prefix>, plus "admin" for the management interface.
+  #
+  # Left empty, one key with full access is generated on install and kept
+  # across upgrades. Read it with:
+  #
+  #   kubectl get secret <release>-acl -o jsonpath='{.data.admin-key}' | base64 -d
+  #
+  # Empty by default because a chart that ships a known key installs a database
+  # anyone who has read the chart can write to.
+  keys: {}
+    # changeme: "rw, admin"
+    # analyst: "r:feeds"
+    # feed-misp: "rw:feeds/misp"
+  # A Secret you manage yourself, with an acl.toml key in it. Takes precedence.
+  existingSecret: ""
+  # Copy the Secret over the working copy on every start, rather than only when
+  # there is not one yet. Turn this on to manage keys purely from values.yaml,
+  # accepting that keys made in the interface are lost at the next restart.
+  overwriteOnStart: false
+
+# ---------------------------------------------------------------------------
+# Namespaces to create on install
+#
+# A namespace normally comes into being when something is first written to it.
+# Listing them here creates them up front — as a post-install and post-upgrade
+# hook, through the management API — so a fresh deployment starts with the
+# structure its writers and its ACL prefixes already assume. Creating one that
+# exists is a no-op, so upgrades are safe.
+#
+# This needs a key with the admin grant, which the chart takes from acl.keys.
+# Bringing your own acl.existingSecret means putting an `admin-key` entry in it.
+# ---------------------------------------------------------------------------
+bootstrap:
+  namespaces: []
+    # - feeds/misp/ips
+    # - feeds/misp/domains
+    # - feeds/otx/ips
+  timeoutSeconds: 120
+  backoffLimit: 3
+  adminKeySecretKey: admin-key
+
+# ---------------------------------------------------------------------------
+# Logging
+#
+# A log4rs configuration, mounted and passed with -l. The default logs to the
+# container's stdout, which is where kubectl logs looks.
+# ---------------------------------------------------------------------------
+logging:
+  level: info
+  # Log every write to stdout as well. Chatty on a busy database.
+  writeLog: false
+  # Replace the generated configuration entirely with your own log4rs YAML.
+  config: ""
+
+# ---------------------------------------------------------------------------
+# The daemon's configuration file
+#
+# Mirrors etc/sightingdb.toml. Anything left null is omitted from the rendered
+# file, leaving the daemon's own default in force.
+# ---------------------------------------------------------------------------
+config:
+  daemon:
+    # Turn the HTTP API off to run as a DNS or ZMQ ingest node only.
+    enabled: true
+    listen_ip: "0.0.0.0"
+    listen_port: 9999
+    # An unauthenticated database should be a deliberate choice. The management
+    # interface always needs an admin key regardless.
+    authenticate: true
+    # Largest accepted bulk POST body, in bytes.
+    post_limit: 2500000000
+    # Where snapshots are written. This is the mounted volume; a value outside
+    # it would not survive the pod.
+    dbdir: /var/lib/sightingdb
+    # Seconds between snapshots. The database is always saved on a clean
+    # shutdown; this bounds what a crash can lose. 0 saves only on shutdown.
+    snapshot_interval: 300
+    # zstd level for snapshot files.
+    compression_level: 3
+    # Seconds between sweeps, which reclaim expired values. 0 disables it.
+    sweep_interval: 60
+    # Hourly statistics kept per value: 720 is 30 days. 0 keeps everything.
+    stats_retention: 720
+    # Seconds a shadow sighting — a record of something searched for — lives.
+    # 0 keeps them forever.
+    shadow_ttl: 2592000
+    # ssl, ssl_cert, ssl_key, daemonize, log_out, log_err and acl_file are set
+    # by the chart from `tls`, `acl` and `persistence`; they are not listed
+    # here because two places to set one thing is one too many.
+
+  storage:
+    # hot stays in memory; warm is written out and dropped once untouched for
+    # warm_idle seconds; cold is dropped at the next sweep. Evicted data is
+    # read back on demand.
+    default_tier: hot
+    warm_idle: 3600
+    # Per top-level namespace overrides.
+    tiers: {}
+      # archive: cold
+      # myorg: hot
+
+  # DNSBL-style lookups. Off by default: it answers without an API key, so
+  # whatever is exposed here is public to anyone who can reach the port.
+  dns:
+    enabled: false
+    listen_ip: "0.0.0.0"
+    # Not 53: see dnsService above. The Service maps 53 to this.
+    listen_port: 5353
+    # Required when enabled: the zone this answers for, without a trailing dot.
+    # Empty on purpose, so turning DNS on is a decision about which zone.
+    zone: ""
+    ttl: 60
+    # Queries per second per source address. 0 disables the limit.
+    rate_limit: 100
+    threads: 2
+    # Whether a lookup raises a shadow sighting — an unauthenticated write.
+    shadow: false
+    # <label> = { namespace, encoding }. The encoding is how the queried name
+    # is turned back into a value: ip, domain or base32.
+    namespaces: {}
+      # ips:
+      #   namespace: feeds/ips
+      #   encoding: ip
+
+  # Subscribing to a ZeroMQ publisher, typically MISP's.
+  zmq:
+    enabled: false
+    endpoint: tcp://misp.example.com:50000
+    topics:
+      - misp_json_attribute
+      - misp_json
+    format: misp
+    require_to_ids: true
+    # Where unmapped types go. Null drops them.
+    default_namespace: null
+    # TTL applied to ingested sightings; 0 leaves them permanent.
+    ttl: 0
+    reconnect: 5
+    # MISP attribute type to namespace.
+    types: {}
+      # ip-src: misp/ips
+      # domain: misp/domains
+      # md5: misp/hashes
+
+  # STIX 2.1, both ways: --import-stix reads it, /stix and /_api/stix write it.
+  stix:
+    # Who exports are published as.
+    identity: null
+    identity_class: null
+    default_namespace: null
+    ttl: 0
+    # STIX observable type to namespace. Read both ways: a namespace mapped
+    # here is one whose values the export knows the type of.
+    types: {}
+      # ipv4-addr: stix/ips
+      # domain-name: stix/domains
+      # "file.SHA-256": stix/hashes
+
+# Raw TOML, used instead of everything under `config` above. The escape hatch
+# for something the chart does not model yet.
+configOverride: ""
+
+# A ConfigMap you manage yourself, with a sightingdb.toml key in it. Takes
+# precedence over both of the above.
+existingConfigMap: ""

@@ -1,0 +1,257 @@
+{{/*
+A StatefulSet of one.
+
+Not a Deployment, because the database is one process with one data directory:
+a rolling Deployment would briefly run two pods writing to the same volume, and
+the second would restore a stale snapshot and then overwrite the first's. A
+StatefulSet stops the old pod before starting the new one.
+*/}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "sightingdb.fullname" . }}
+  labels:
+    {{- include "sightingdb.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ include "sightingdb.fullname" . }}-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "sightingdb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sightingdb.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # A configuration change should restart the pod; without this the
+        # ConfigMap is updated and the running daemon never re-reads it.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/acl: {{ include (print $.Template.BasePath "/secret-acl.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "sightingdb.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: seed-acl
+          image: {{ include "sightingdb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # The management interface rewrites acl.toml, so the daemon reads a
+          # writable copy on the data volume rather than the mounted Secret.
+          # Copied once unless acl.overwriteOnStart says otherwise, so keys
+          # created in the interface are not thrown away on every restart.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              if [ -f "{{ include "sightingdb.aclFile" . }}" ] && [ "{{ .Values.acl.overwriteOnStart }}" != "true" ]; then
+                echo "acl.toml is already on the volume, keeping it"
+              else
+                cp "{{ include "sightingdb.aclSeedFile" . }}" "{{ include "sightingdb.aclFile" . }}"
+                echo "seeded acl.toml from the secret"
+              fi
+          volumeMounts:
+            - name: data
+              mountPath: {{ include "sightingdb.dataDir" . }}
+            - name: acl-seed
+              mountPath: {{ include "sightingdb.configDir" . }}/acl-seed
+              readOnly: true
+        {{- if eq .Values.tls.mode "selfsigned" }}
+        - name: selfsigned-cert
+          image: {{ include "sightingdb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # The binary writes the pair itself, at the paths the configuration
+          # names. Onto the data volume, since everything else is read-only.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p "{{ include "sightingdb.dataDir" . }}/ssl"
+              if [ -f "{{ include "sightingdb.tlsCert" . }}" ]; then
+                echo "a certificate is already on the volume, keeping it"
+              else
+                sightingdb -c "{{ include "sightingdb.configFile" . }}" --install-selfsigned-keys
+              fi
+          volumeMounts:
+            - name: data
+              mountPath: {{ include "sightingdb.dataDir" . }}
+            - name: config
+              mountPath: {{ include "sightingdb.configDir" . }}
+              readOnly: true
+        {{- end }}
+        {{- with .Values.extraInitContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: sightingdb
+          image: {{ include "sightingdb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          args:
+            - -c
+            - {{ include "sightingdb.configFile" . }}
+            - -l
+            - {{ include "sightingdb.logConfigFile" . }}
+            {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.config.daemon.listen_port }}
+              protocol: TCP
+            {{- if .Values.config.dns.enabled }}
+            - name: dns-udp
+              containerPort: {{ .Values.config.dns.listen_port }}
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: {{ .Values.config.dns.listen_port }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: {{ include "sightingdb.scheme" . }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: {{ include "sightingdb.scheme" . }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: {{ include "sightingdb.scheme" . }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ include "sightingdb.dataDir" . }}
+            - name: config
+              mountPath: {{ include "sightingdb.configDir" . }}
+              readOnly: true
+            {{- if eq .Values.tls.mode "secret" }}
+            - name: tls
+              mountPath: {{ include "sightingdb.tlsDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "sightingdb.configMapName" . }}
+        - name: acl-seed
+          secret:
+            secretName: {{ include "sightingdb.aclSecretName" . }}
+        {{- if eq .Values.tls.mode "secret" }}
+        - name: tls
+          secret:
+            secretName: {{ required "tls.secretName is required when tls.mode is \"secret\"" .Values.tls.secretName }}
+        {{- end }}
+        {{- if and .Values.persistence.enabled .Values.persistence.existingClaim }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim }}
+        {{- else if not .Values.persistence.enabled }}
+        # No volume: the database lives as long as the pod does. Fine for a
+        # test, a loss of everything on the next restart in anything else.
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  {{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "sightingdb.labels" . | nindent 10 }}
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}
+  {{- end }}

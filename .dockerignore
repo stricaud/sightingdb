@@ -1,0 +1,16 @@
+# The build happens inside the image; sending a local target/ directory would
+# mean uploading gigabytes to the daemon before anything starts.
+target/
+.git/
+.github/
+.idea/
+helm/
+doc/
+log/
+tests/
+etc/ssl/
+*.pid
+
+# Note: docker/ is NOT excluded. The runtime stage copies the entrypoint and
+# the default configuration out of it, and an excluded file cannot be COPYed.
+docker/docker-compose.yml

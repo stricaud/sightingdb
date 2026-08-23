@@ -1,0 +1,209 @@
+{{- if not .Values.existingConfigMap }}
+{{- $daemon := .Values.config.daemon }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sightingdb.fullname" . }}
+  labels:
+    {{- include "sightingdb.labels" . | nindent 4 }}
+data:
+  sightingdb.toml: |
+    {{- if .Values.configOverride }}
+    {{- .Values.configOverride | nindent 4 }}
+    {{- else }}
+    # Rendered by the sightingdb Helm chart from values.yaml. Editing this
+    # ConfigMap by hand works until the next `helm upgrade`.
+    #
+    # The daemon refuses to start on a key it does not recognise, so only keys
+    # that were set are written; everything else is its own default. Numbers go
+    # through int64 because Helm holds YAML numbers as float64, and a
+    # post_limit of 2.5e+09 is not something TOML will hand back as an integer.
+
+    [daemon]
+    {{- with $daemon }}
+    {{- if not (kindIs "invalid" .enabled) }}
+    enabled = {{ .enabled }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .listen_ip) }}
+    listen_ip = {{ .listen_ip | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .listen_port) }}
+    listen_port = {{ int64 .listen_port }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .authenticate) }}
+    authenticate = {{ .authenticate }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .post_limit) }}
+    post_limit = {{ int64 .post_limit }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .dbdir) }}
+    dbdir = {{ .dbdir | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .snapshot_interval) }}
+    snapshot_interval = {{ int64 .snapshot_interval }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .compression_level) }}
+    compression_level = {{ int64 .compression_level }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .sweep_interval) }}
+    sweep_interval = {{ int64 .sweep_interval }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .stats_retention) }}
+    stats_retention = {{ int64 .stats_retention }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .shadow_ttl) }}
+    shadow_ttl = {{ int64 .shadow_ttl }}
+    {{- end }}
+    {{- end }}
+
+    # The container is the process: forking would leave the kubelet watching a
+    # pid that has already exited.
+    daemonize = false
+    ssl = {{ include "sightingdb.tlsEnabled" . }}
+    {{- if eq (include "sightingdb.tlsEnabled" .) "true" }}
+    ssl_cert = {{ include "sightingdb.tlsCert" . | quote }}
+    ssl_key = {{ include "sightingdb.tlsKey" . | quote }}
+    {{- end }}
+    # Rewritten by the management interface when a key is created or revoked,
+    # so it is on the data volume rather than in a read-only mount.
+    acl_file = {{ include "sightingdb.aclFile" . | quote }}
+
+    {{- with .Values.config.storage }}
+
+    [storage]
+    {{- if not (kindIs "invalid" .default_tier) }}
+    default_tier = {{ .default_tier | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .warm_idle) }}
+    warm_idle = {{ int64 .warm_idle }}
+    {{- end }}
+    # Rewritten by the management interface, for the same reason as acl_file.
+    tiers_file = {{ include "sightingdb.tiersFile" $ | quote }}
+    {{- with .tiers }}
+
+    [storage.tiers]
+    {{- range $shard, $tier := . }}
+    {{ $shard | quote }} = {{ $tier | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- with .Values.config.dns }}
+    {{- if .enabled }}
+
+    [dns]
+    enabled = true
+    {{- if not (kindIs "invalid" .listen_ip) }}
+    listen_ip = {{ .listen_ip | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .listen_port) }}
+    listen_port = {{ int64 .listen_port }}
+    {{- end }}
+    zone = {{ required "config.dns.zone is required when the DNS listener is enabled" .zone | quote }}
+    {{- if not (kindIs "invalid" .ttl) }}
+    ttl = {{ int64 .ttl }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .rate_limit) }}
+    rate_limit = {{ int64 .rate_limit }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .threads) }}
+    threads = {{ int64 .threads }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .shadow) }}
+    shadow = {{ .shadow }}
+    {{- end }}
+    {{- range $label, $exposed := .namespaces }}
+
+    [dns.namespaces.{{ $label }}]
+    namespace = {{ $exposed.namespace | quote }}
+    encoding = {{ $exposed.encoding | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- with .Values.config.zmq }}
+    {{- if .enabled }}
+
+    [zmq]
+    enabled = true
+    endpoint = {{ required "config.zmq.endpoint is required when ZMQ ingest is enabled" .endpoint | quote }}
+    {{- if not (kindIs "invalid" .topics) }}
+    topics = [{{ range $i, $topic := .topics }}{{ if $i }}, {{ end }}{{ $topic | quote }}{{ end }}]
+    {{- end }}
+    {{- if not (kindIs "invalid" .format) }}
+    format = {{ .format | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .require_to_ids) }}
+    require_to_ids = {{ .require_to_ids }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .default_namespace) }}
+    default_namespace = {{ .default_namespace | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .ttl) }}
+    ttl = {{ int64 .ttl }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .reconnect) }}
+    reconnect = {{ int64 .reconnect }}
+    {{- end }}
+    {{- with .types }}
+
+    # A key containing a dot has to be quoted, or TOML reads it as a table.
+    [zmq.types]
+    {{- range $type, $namespace := . }}
+    {{ $type | quote }} = {{ $namespace | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- with .Values.config.stix }}
+    {{- $stix := . }}
+    {{- if or (not (kindIs "invalid" .identity)) (not (kindIs "invalid" .identity_class)) (not (kindIs "invalid" .default_namespace)) .ttl .types }}
+
+    [stix]
+    {{- if not (kindIs "invalid" .identity) }}
+    identity = {{ .identity | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .identity_class) }}
+    identity_class = {{ .identity_class | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .default_namespace) }}
+    default_namespace = {{ .default_namespace | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .ttl) }}
+    ttl = {{ int64 .ttl }}
+    {{- end }}
+    {{- with .types }}
+
+    [stix.types]
+    {{- range $type, $namespace := . }}
+    {{ $type | quote }} = {{ $namespace | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
+  log4rs.yml: |
+    {{- if .Values.logging.config }}
+    {{- .Values.logging.config | nindent 4 }}
+    {{- else }}
+    # Everything to the container's stdout, which is where `kubectl logs` reads
+    # from. A file appender in a pod is a file nobody will ever see.
+    appenders:
+      stdout:
+        kind: console
+
+    root:
+      level: {{ .Values.logging.level }}
+      appenders:
+        - stdout
+
+    loggers:
+      sightingdb::db_log:
+        level: {{ ternary .Values.logging.level "off" .Values.logging.writeLog }}
+        appenders:
+          - stdout
+        additive: false
+    {{- end }}
+{{- end }}

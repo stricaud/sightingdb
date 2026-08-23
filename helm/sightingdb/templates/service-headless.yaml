@@ -1,0 +1,17 @@
+{{/* The StatefulSet's governing service: stable network identity, nothing else. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sightingdb.fullname" . }}-headless
+  labels:
+    {{- include "sightingdb.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "sightingdb.selectorLabels" . | nindent 4 }}

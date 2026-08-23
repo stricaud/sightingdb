@@ -1,0 +1,72 @@
+{{/*
+`helm test` — writes a sighting, reads it back, and checks the count is what it
+should be. A test that only fetched /health would pass on a database that
+cannot store anything.
+*/}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "sightingdb.fullname" . }}-test
+  labels:
+    {{- include "sightingdb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  {{- with .Values.image.pullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.podSecurityContext }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: test
+      image: {{ include "sightingdb.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      {{- with .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      env:
+        - name: SIGHTINGDB_URL
+          value: {{ include "sightingdb.url" . }}
+        - name: SIGHTINGDB_ADMIN_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "sightingdb.aclSecretName" . }}
+              key: {{ .Values.bootstrap.adminKeySecretKey | default "admin-key" }}
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          auth="Authorization: $SIGHTINGDB_ADMIN_KEY"
+
+          echo "health:"
+          curl -fsSk -H "$auth" "$SIGHTINGDB_URL/health"
+          echo
+
+          # A namespace of its own, so a test never touches real data.
+          ns="_helm_test/{{ .Release.Name }}"
+          curl -fsSk -H "$auth" "$SIGHTINGDB_URL/w/$ns?val=203.0.113.1" >/dev/null
+          curl -fsSk -H "$auth" "$SIGHTINGDB_URL/w/$ns?val=203.0.113.1" >/dev/null
+
+          echo "read back:"
+          body=$(curl -fsSk -H "$auth" "$SIGHTINGDB_URL/r/$ns?val=203.0.113.1&noshadow")
+          echo "$body"
+          echo "$body" | grep -q '"count":2' || {
+            echo "expected the value to have been seen twice" >&2
+            exit 1
+          }
+
+          curl -fsSk -H "$auth" "$SIGHTINGDB_URL/d/$ns" >/dev/null
+          echo "ok"
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}

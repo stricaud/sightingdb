@@ -1,0 +1,20 @@
+apiVersion: v2
+name: sightingdb
+description: A database designed for Sightings, a technique to count items
+type: application
+# Chart version: bumped when the chart changes, independently of the app.
+version: 0.1.0
+# The application version this chart defaults to, and the default image tag.
+# `make sync-version` copies it from Cargo.toml.
+appVersion: "0.5.5"
+home: https://github.com/stricaud/sightingdb
+sources:
+  - https://github.com/stricaud/sightingdb
+keywords:
+  - sightings
+  - threat-intelligence
+  - indicators
+  - database
+maintainers:
+  - name: Sebastien Tricaud
+    url: https://github.com/stricaud
