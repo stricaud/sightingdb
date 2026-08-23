@@ -1,6 +1,6 @@
 [package]
 name = "sightingdb"
-version = "0.5.8"
+version = "0.5.9"
 authors = ["Sebastien Tricaud <sebastien.tricaud@gmail.com>"]
 edition = "2024"
 rust-version = "1.88"
