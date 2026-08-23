@@ -72,6 +72,28 @@ struct Cli {
     #[arg(long)]
     setup: bool,
 
+    /// List the files this installation uses, and whether each is there
+    #[arg(long)]
+    installed: bool,
+
+    /// Start the installed service
+    #[arg(long)]
+    start: bool,
+
+    /// Stop the installed service. `kill` will not: the service manager
+    /// restarts the daemon when it dies
+    #[arg(long)]
+    stop: bool,
+
+    /// Restart the installed service
+    #[arg(long)]
+    restart: bool,
+
+    /// Stop the daemon and remove everything this installation put on disk.
+    /// Asks for confirmation, and cannot be told not to
+    #[arg(long)]
+    erase: bool,
+
     /// Sets the level of verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -79,6 +101,40 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Answered before logging starts, so the output is the answer rather than
+    // the answer with the configuration loader's own remarks mixed in. Each of
+    // these acts on an installation and then exits, without touching the
+    // database or the network.
+    let action = [
+        (cli.installed, "installed"),
+        (cli.start, "start"),
+        (cli.stop, "stop"),
+        (cli.restart, "restart"),
+        (cli.erase, "erase"),
+    ]
+    .into_iter()
+    .filter(|(asked, _)| *asked)
+    .map(|(_, name)| name)
+    .collect::<Vec<_>>();
+
+    if action.len() > 1 {
+        bail!("--{} cannot be combined", action.join(" and --"));
+    }
+    if let Some(action) = action.first() {
+        let config_path = match &cli.config {
+            Some(path) => path.clone(),
+            None => config::locate()?,
+        };
+        let logging = cli.logging_config.as_deref();
+        let report = match *action {
+            "installed" => setup::installed_report(&config_path, logging)?,
+            "erase" => setup::erase(&config_path, logging, &setup::ask_to_erase)?,
+            other => setup::service_control(&config_path, logging, other)?,
+        };
+        print!("{report}");
+        return Ok(());
+    }
 
     // Before anything else, and never fatal unless a file was named: `--setup`
     // exists precisely for the case where nothing is installed yet, so it must
@@ -244,7 +300,7 @@ fn main() -> Result<()> {
 
 /// Places a logging configuration is looked for when `-l` was not given, in
 /// the same order the main configuration is located.
-fn logging_candidates() -> Vec<PathBuf> {
+pub fn logging_candidates() -> Vec<PathBuf> {
     let mut candidates = vec![PathBuf::from("/etc/sightingdb/log4rs.yml")];
     if let Some(mut home) = dirs::home_dir() {
         home.push(".sightingdb");

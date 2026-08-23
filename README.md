@@ -96,11 +96,80 @@ Options
 -------
 
 	-c, --config <FILE>          Configuration file (default: see above)
+	    --setup                  Install: directories, configuration, certificate, key, service
+	    --installed              List the files this installation uses, and whether each is there
+	    --start                  Start the installed service
+	    --stop                   Stop it. 
+	    --restart                Restart it
+	    --erase                  Stop it and remove everything this installation put on disk
 	    --install-selfsigned-keys Write a self-signed cert and key, then exit
 	    --import-stix <PATH>     Import STIX 2.1 bundles, then exit
 	-l, --logging-config <FILE>  log4rs configuration file (default: etc/log4rs.yml)
 	-k, --apikey <APIKEY>        Set the default API key, replacing the built-in 'changeme'
 	-v, --verbose...             Increase verbosity
+
+What is installed
+-----------------
+
+	$ sightingdb --installed
+	SightingDB 0.5.7 — the files this installation uses
+
+	  present  configuration    /etc/sightingdb/sightingdb.toml     2.9 KB, mode 0644
+	  present  logging config   /etc/sightingdb/log4rs.yml          110 B, mode 0644
+	  present  API keys         /etc/sightingdb/acl.toml            265 B, mode 0600  (rewritten when a key is saved)
+	  missing  tiers            /etc/sightingdb/tiers.toml            (written when a tier is changed)
+	  present  TLS certificate  /etc/sightingdb/ssl/cert.pem        1.2 KB, mode 0644
+	  present  TLS key          /etc/sightingdb/ssl/key.pem         1.7 KB, mode 0600
+	  present  database         /var/lib/sightingdb                 7 file(s), 4.2 MB
+	  present  binary           /usr/local/bin/sightingdb           12.4 MB, mode 0755  (left alone by --erase)
+	  present  service          /etc/systemd/system/sightingdb.service  1.6 KB, mode 0644
+
+Paths come from the configuration, so these are the files *this* install reads
+and writes, in full — not the ones a default install would use. A missing file
+is often normal: the tiers file appears the first time a tier is changed. A key
+or certificate that more than its owner can read is called out with the `chmod`
+that fixes it.
+
+Starting and stopping
+---------------------
+
+	$ sightingdb --stop
+	$ sightingdb --start
+	$ sightingdb --restart
+
+**`kill` does not stop it, and neither does `kill -9`.** Both service managers
+are told to keep it running — the systemd unit has `Restart=on-failure` and the
+launchd plist has `KeepAlive` — so the supervisor starts it again the moment it
+dies. Stopping means telling the supervisor, which these flags do, and which
+differs by platform and by whether the service is the system's or your own:
+
+	systemctl stop sightingdb                 # Linux, system
+	systemctl --user stop sightingdb          # Linux, yours
+	launchctl bootout system/com.github.stricaud.sightingdb          # macOS, system
+	launchctl bootout gui/$(id -u)/com.github.stricaud.sightingdb    # macOS, yours
+
+`--installed` prints the right one for the service it finds. `--restart` uses
+`systemctl restart` or launchd's `kickstart -k`, since launchd has no restart
+verb of its own.
+
+Removing it again
+-----------------
+
+	$ sightingdb --erase
+
+The counterpart of `--setup`. It lists what will go, requires the word `erase`
+typed in full — not `y`, and there is no flag to skip it — then stops the
+service, stops any daemon still running with this configuration, and removes
+the files.
+
+It removes **only what this installation owns**: the configuration, the key
+file, the tiers file, the certificate and key, and the snapshots in `dbdir`. A
+logging configuration found in `/etc` or your home directory is the machine's
+rather than this install's, a service unit that runs a different configuration
+belongs to that one, and the binary is left where it is — all three are listed
+under "left alone" before you confirm. In `dbdir` it removes the snapshot files
+it recognises and then the directory if that is all it held; anything else it
+finds there stays, and it says so.
 
 Client Demo
 ===========
