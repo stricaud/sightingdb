@@ -295,7 +295,6 @@ REST Endpoints
 	/_api/openapi.yaml: this API as an OpenAPI 3 document (GET)
 
 OpenAPI
-=======OpenAPI
 =======
 
 [`doc/openapi.yaml`](doc/openapi.yaml) describes the whole HTTP API — data,
