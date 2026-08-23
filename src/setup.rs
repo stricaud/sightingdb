@@ -249,7 +249,7 @@ impl Plan {
     }
 }
 
-const LAUNCHD_LABEL: &str = "com.devo.sightingdb";
+const LAUNCHD_LABEL: &str = "com.github.stricaud.sightingdb";
 const SERVICE_USER: &str = "sightingdb";
 /// Minimal logging configuration, so the service has one without hunting.
 const LOG_CONFIG: &str = "refresh_rate: 30 seconds\n\

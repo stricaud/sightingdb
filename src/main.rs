@@ -41,7 +41,7 @@ use crate::maintenance::Shutdown;
     name = "sightingdb",
     version,
     about = "Sightings Database",
-    author = "Sebastien Tricaud <sebastien.tricaud@devo.com>"
+    author = "Sebastien Tricaud <sebastien.tricaud@gmail.com>"
 )]
 struct Cli {
     /// Sets a custom config file
