@@ -291,10 +291,17 @@ config:
     # read back on demand.
     default_tier: hot
     warm_idle: 3600
-    # Per top-level namespace overrides.
+    # Overrides, keyed by top-level namespace and covering everything under it —
+    # storage is one file per top-level namespace, paged in and out as a unit.
+    # A tier on its own, or a mapping to give that namespace its own window:
     tiers: {}
       # archive: cold
       # myorg: hot
+      # feeds:
+      #   tier: warm
+      #   warm_idle: 86400
+      # staging:
+      #   warm_idle: 300
 
   # DNSBL-style lookups. Off by default: it answers without an API key, so
   # whatever is exposed here is public to anyone who can reach the port.

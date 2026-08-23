@@ -81,9 +81,14 @@ data:
     tiers_file = {{ include "sightingdb.tiersFile" $ | quote }}
     {{- with .tiers }}
 
+    # A tier, or a table setting the tier, the idle window, or both.
     [storage.tiers]
-    {{- range $shard, $tier := . }}
-    {{ $shard | quote }} = {{ $tier | quote }}
+    {{- range $shard, $setting := . }}
+    {{- if kindIs "map" $setting }}
+    {{ $shard | quote }} = { {{ if $setting.tier }}tier = {{ $setting.tier | quote }}{{ if $setting.warm_idle }}, {{ end }}{{ end }}{{ if $setting.warm_idle }}warm_idle = {{ int64 $setting.warm_idle }}{{ end }} }
+    {{- else }}
+    {{ $shard | quote }} = {{ $setting | quote }}
+    {{- end }}
     {{- end }}
     {{- end }}
     {{- end }}

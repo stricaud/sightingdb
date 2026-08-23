@@ -339,9 +339,16 @@ fn server_info(
         warm_idle: settings.tiers.warm_idle.as_secs(),
         tiers: settings
             .tiers
-            .shards
+            .entries
             .iter()
-            .map(|(shard, tier)| (shard.clone(), tier.as_str().to_string()))
+            .map(|(namespace, entry)| {
+                let tier = entry.tier.map_or("inherited", crate::tier::Tier::as_str);
+                let described = match entry.warm_idle {
+                    Some(idle) => format!("{tier} (idle {idle}s)"),
+                    None => tier.to_string(),
+                };
+                (namespace.clone(), described)
+            })
             .collect(),
     }
 }

@@ -201,9 +201,9 @@ struct RawStorage {
     /// dropped from memory.
     #[serde(default = "default_warm_idle")]
     warm_idle: u64,
-    /// Per-shard overrides, keyed by top-level namespace.
+    /// Overrides keyed by namespace, inherited by everything under each one.
     #[serde(default)]
-    tiers: HashMap<String, String>,
+    tiers: HashMap<String, toml::Value>,
     tiers_file: Option<PathBuf>,
 }
 
@@ -422,17 +422,19 @@ impl RawConfig {
 
 impl RawStorage {
     fn to_policy(&self) -> Result<TierPolicy> {
-        let mut shards = HashMap::new();
-        for (shard, tier) in &self.tiers {
-            let tier =
-                Tier::parse(tier).with_context(|| format!("in [storage.tiers] entry '{shard}'"))?;
-            shards.insert(shard.trim().to_string(), tier);
+        let mut entries = HashMap::new();
+        for (namespace, value) in &self.tiers {
+            // Either `"archive" = "cold"` or
+            // `"feeds/misp" = { tier = "warm", warm_idle = 86400 }`.
+            let entry = crate::tier::parse_entry(value)
+                .with_context(|| format!("in [storage.tiers] entry '{namespace}'"))?;
+            entries.insert(namespace.trim().trim_matches('/').to_string(), entry);
         }
 
         Ok(TierPolicy {
             default_tier: Tier::parse(&self.default_tier)
                 .context("in 'default_tier' of [storage]")?,
-            shards,
+            entries,
             warm_idle: std::time::Duration::from_secs(self.warm_idle),
         })
     }

@@ -89,11 +89,16 @@ warm_idle = 3600
 # them but not change them.
 tiers_file = "tiers.toml"
 
-# Per-namespace overrides, keyed by the top-level namespace.
+# Overrides, keyed by the top-level namespace and covering everything under it.
+# An entry is a tier, or a table setting the tier, the idle window, or both —
+# so two warm shards can wait different lengths of time before being written
+# out. Changed from the management interface or POST /_api/tier as well, which
+# rewrites tiers_file.
 # [storage.tiers]
 # myorg = "hot"
 # archive = "cold"
-# occasional = "warm"
+# occasional = { tier = "warm", warm_idle = 86400 }
+# staging = { warm_idle = 300 }
 
 # API keys, used only when acl_file is not set.
 #

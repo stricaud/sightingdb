@@ -291,6 +291,7 @@ pub async fn help() -> impl Responder {
             "\t/d: delete (GET)\n",
             "\t/stix: export a namespace as a STIX 2.1 bundle (GET)\n",
             "\t/_api/stix: export one or more namespaces as STIX 2.1 (POST)\n",
+            "\t/_api/tier: set a namespace's tier and idle window (POST)\n",
             "\t/c: configure (GET)\n",
             "\t/i: info (GET)\n",
             "\t/health: liveness and readiness, no key required (GET)\n",
@@ -629,6 +630,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/d/{namespace:.*}", web::get().to(delete))
         .route("/stix/{namespace:.*}", web::get().to(export_stix))
         .route("/_api/stix", web::post().to(export_stix_api))
+        .route("/_api/tier", web::post().to(crate::admin::set_tier))
         .route("/c/{namespace:.*}", web::get().to(configure_endpoint))
         .route("/i", web::get().to(info))
         .route("/health", web::get().to(health))

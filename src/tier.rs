@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     /// Never evicted.
@@ -45,12 +45,67 @@ impl Tier {
     }
 }
 
-/// Which tier each shard is in, and how long `warm` waits.
+/// One shard's storage settings. Either half may be left unset, in which case
+/// the configured default applies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
+    /// Seconds a warm shard may sit untouched. `None` takes the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_idle: Option<u64>,
+}
+
+impl Entry {
+    /// A tier with no idle window of its own.
+    #[cfg(test)]
+    pub fn tier(tier: Tier) -> Entry {
+        Entry {
+            tier: Some(tier),
+            warm_idle: None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tier.is_none() && self.warm_idle.is_none()
+    }
+}
+
+/// What a shard's settings work out to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Resolved {
+    pub tier: Tier,
+    pub warm_idle: u64,
+    /// Set on the shard itself; absent means it takes the configured default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own_tier: Option<Tier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own_warm_idle: Option<u64>,
+}
+
+impl Resolved {
+    /// How long this shard may sit untouched, or `None` if it never goes.
+    pub fn idle_allowance(&self) -> Option<Duration> {
+        match self.tier {
+            Tier::Hot => None,
+            Tier::Warm => Some(Duration::from_secs(self.warm_idle)),
+            Tier::Cold => Some(Duration::ZERO),
+        }
+    }
+}
+
+/// Which tier each shard is in, and how long `warm` waits for it.
+///
+/// Keyed by shard — the first path segment of a namespace — because a shard is
+/// one file, paged in and out as a unit. Setting one therefore covers every
+/// namespace under it, `feeds` covering `feeds/misp/ips` and its siblings
+/// alike; there is no finer setting because there is no finer eviction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierPolicy {
     pub default_tier: Tier,
-    /// Keyed by shard, which is the first path segment of a namespace.
-    pub shards: HashMap<String, Tier>,
+    /// Keyed by shard. An entry may set the tier, the idle window, or both.
+    pub entries: HashMap<String, Entry>,
+    /// The idle window a warm shard gets when it does not name its own.
     pub warm_idle: Duration,
 }
 
@@ -60,31 +115,64 @@ impl Default for TierPolicy {
             // Everything resident unless asked otherwise, which is how the
             // database behaved before tiering existed.
             default_tier: Tier::Hot,
-            shards: HashMap::new(),
+            entries: HashMap::new(),
             warm_idle: Duration::from_secs(3600),
         }
     }
 }
 
 impl TierPolicy {
-    pub fn tier_of(&self, shard: &str) -> Tier {
+    /// The settings in force for a shard, and whether each half is the shard's
+    /// own or the configured default.
+    pub fn resolve(&self, shard: &str) -> Resolved {
         // Consensus is consulted on every write and API keys on every request,
-        // so the internal shard is never a candidate for eviction whatever the
+        // so internal state is never a candidate for eviction whatever the
         // configuration says.
         if shard == crate::persistence::INTERNAL_SHARD {
-            return Tier::Hot;
+            return Resolved {
+                tier: Tier::Hot,
+                warm_idle: self.warm_idle.as_secs(),
+                own_tier: None,
+                own_warm_idle: None,
+            };
         }
-        self.shards.get(shard).copied().unwrap_or(self.default_tier)
+
+        let entry = self.entry(shard);
+        Resolved {
+            tier: entry.tier.unwrap_or(self.default_tier),
+            warm_idle: entry.warm_idle.unwrap_or(self.warm_idle.as_secs()),
+            own_tier: entry.tier,
+            own_warm_idle: entry.warm_idle,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn tier_of(&self, shard: &str) -> Tier {
+        self.resolve(shard).tier
     }
 
     /// Seconds a shard may sit untouched before it is evicted, or `None` if it
     /// never is.
     pub fn idle_allowance(&self, shard: &str) -> Option<Duration> {
-        match self.tier_of(shard) {
-            Tier::Hot => None,
-            Tier::Warm => Some(self.warm_idle),
-            Tier::Cold => Some(Duration::ZERO),
+        self.resolve(shard).idle_allowance()
+    }
+
+    /// Set or clear one shard's settings. An empty entry is a removal, so the
+    /// shard goes back to the configured defaults.
+    pub fn set(&mut self, shard: &str, entry: Entry) {
+        let shard = shard.trim().trim_matches('/').to_string();
+        if entry.is_empty() {
+            self.entries.remove(&shard);
+        } else {
+            self.entries.insert(shard, entry);
         }
+    }
+
+    pub fn entry(&self, shard: &str) -> Entry {
+        self.entries
+            .get(shard.trim().trim_matches('/'))
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -98,7 +186,57 @@ pub struct TierFile {
     pub default_tier: String,
     pub warm_idle: u64,
     #[serde(default)]
-    pub tiers: HashMap<String, String>,
+    pub tiers: HashMap<String, toml::Value>,
+}
+
+/// Read one entry of the `[tiers]` table.
+///
+/// Either spelling works, because the short one is what almost every entry
+/// wants and the long one is what a per-namespace idle window needs:
+///
+/// ```toml
+/// "archive" = "cold"
+/// "feeds" = { tier = "warm", warm_idle = 86400 }
+/// "staging" = { warm_idle = 300 }
+/// ```
+pub fn parse_entry(value: &toml::Value) -> Result<Entry> {
+    match value {
+        toml::Value::String(tier) => Ok(Entry {
+            tier: Some(Tier::parse(tier)?),
+            warm_idle: None,
+        }),
+        toml::Value::Table(table) => {
+            let mut entry = Entry::default();
+            for (key, field) in table {
+                match key.as_str() {
+                    "tier" => {
+                        let tier = field.as_str().with_context(|| {
+                            format!("'tier' should be a string, found {}", field.type_str())
+                        })?;
+                        entry.tier = Some(Tier::parse(tier)?);
+                    }
+                    "warm_idle" => {
+                        let seconds = field
+                            .as_integer()
+                            .filter(|seconds| *seconds >= 0)
+                            .with_context(|| {
+                                format!("'warm_idle' should be a number of seconds, found {field}")
+                            })?;
+                        entry.warm_idle = Some(seconds as u64);
+                    }
+                    other => bail!("unknown key '{other}', expected tier or warm_idle"),
+                }
+            }
+            if entry.is_empty() {
+                bail!("says nothing: give it a tier, a warm_idle, or both");
+            }
+            Ok(entry)
+        }
+        other => bail!(
+            "should be a tier, or a table of tier and warm_idle, found {}",
+            other.type_str()
+        ),
+    }
 }
 
 impl TierPolicy {
@@ -108,17 +246,17 @@ impl TierPolicy {
         let file: TierFile =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
 
-        let mut shards = HashMap::new();
-        for (shard, tier) in file.tiers {
-            let tier = Tier::parse(&tier)
-                .with_context(|| format!("for '{shard}' in {}", path.display()))?;
-            shards.insert(shard, tier);
+        let mut entries = HashMap::new();
+        for (namespace, value) in file.tiers {
+            let entry = parse_entry(&value)
+                .with_context(|| format!("for '{namespace}' in {}", path.display()))?;
+            entries.insert(namespace, entry);
         }
 
         Ok(TierPolicy {
             default_tier: Tier::parse(&file.default_tier)
                 .with_context(|| format!("for 'default_tier' in {}", path.display()))?,
-            shards,
+            entries,
             warm_idle: Duration::from_secs(file.warm_idle),
         })
     }
@@ -132,7 +270,11 @@ impl TierPolicy {
              #\n\
              # hot   never evicted\n\
              # warm  dropped once untouched for warm_idle seconds\n\
-             # cold  dropped at the next sweep once idle\n\n",
+             # cold  dropped at the next sweep once idle\n\
+             #\n\
+             # Keyed by the top-level namespace, which is the unit that is paged in\n\
+             # and out: \"feeds\" covers \"feeds/misp/ips\" and everything beside it.\n\
+             # An entry may set the tier, the idle window, or both.\n\n",
         );
         body.push_str(&format!(
             "default_tier = \"{}\"\n",
@@ -143,10 +285,19 @@ impl TierPolicy {
             self.warm_idle.as_secs()
         ));
 
-        let mut shards: Vec<(&String, &Tier)> = self.shards.iter().collect();
-        shards.sort_by(|a, b| a.0.cmp(b.0));
-        for (shard, tier) in shards {
-            body.push_str(&format!("\"{shard}\" = \"{}\"\n", tier.as_str()));
+        let mut entries: Vec<(&String, &Entry)> = self.entries.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (namespace, entry) in entries {
+            let value = match (entry.tier, entry.warm_idle) {
+                (Some(tier), None) => format!("\"{}\"", tier.as_str()),
+                (Some(tier), Some(idle)) => {
+                    format!("{{ tier = \"{}\", warm_idle = {idle} }}", tier.as_str())
+                }
+                (None, Some(idle)) => format!("{{ warm_idle = {idle} }}"),
+                // Not stored: `set` removes an entry that says nothing.
+                (None, None) => continue,
+            };
+            body.push_str(&format!("\"{namespace}\" = {value}\n"));
         }
 
         if let Some(parent) = path.parent() {
@@ -168,9 +319,9 @@ mod tests {
     fn policy() -> TierPolicy {
         TierPolicy {
             default_tier: Tier::Warm,
-            shards: HashMap::from([
-                ("myorg".to_string(), Tier::Hot),
-                ("archive".to_string(), Tier::Cold),
+            entries: HashMap::from([
+                ("myorg".to_string(), Entry::tier(Tier::Hot)),
+                ("archive".to_string(), Entry::tier(Tier::Cold)),
             ]),
             warm_idle: Duration::from_secs(3600),
         }
@@ -198,11 +349,141 @@ mod tests {
     fn the_internal_shard_is_always_hot() {
         let mut p = policy();
         p.default_tier = Tier::Cold;
-        p.shards
-            .insert(crate::persistence::INTERNAL_SHARD.to_string(), Tier::Cold);
+        p.set(crate::persistence::INTERNAL_SHARD, Entry::tier(Tier::Cold));
 
         assert_eq!(p.tier_of(crate::persistence::INTERNAL_SHARD), Tier::Hot);
         assert_eq!(p.idle_allowance(crate::persistence::INTERNAL_SHARD), None);
+    }
+
+    #[test]
+    fn a_shard_may_set_its_own_idle_window() {
+        let mut p = policy();
+        assert_eq!(p.resolve("other").warm_idle, 3600);
+        assert_eq!(p.idle_allowance("other"), Some(Duration::from_secs(3600)));
+
+        // Warm, but this one is worth keeping for a day.
+        p.set(
+            "other",
+            Entry {
+                tier: Some(Tier::Warm),
+                warm_idle: Some(86_400),
+            },
+        );
+        assert_eq!(p.idle_allowance("other"), Some(Duration::from_secs(86_400)));
+
+        // The window alone, leaving the tier to the default.
+        p.set(
+            "windowed",
+            Entry {
+                tier: None,
+                warm_idle: Some(60),
+            },
+        );
+        let resolved = p.resolve("windowed");
+        assert_eq!(resolved.tier, Tier::Warm, "the default tier still applies");
+        assert_eq!(resolved.warm_idle, 60);
+        assert_eq!(resolved.own_tier, None);
+        assert_eq!(resolved.own_warm_idle, Some(60));
+
+        // A window is only a window: a hot shard never goes, and a cold one
+        // goes at the next sweep whatever it says.
+        p.set(
+            "myorg",
+            Entry {
+                tier: Some(Tier::Hot),
+                warm_idle: Some(60),
+            },
+        );
+        assert_eq!(p.idle_allowance("myorg"), None);
+        p.set(
+            "archive",
+            Entry {
+                tier: Some(Tier::Cold),
+                warm_idle: Some(60),
+            },
+        );
+        assert_eq!(p.idle_allowance("archive"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn clearing_a_shard_puts_it_back_on_the_defaults() {
+        let mut p = policy();
+        assert_eq!(p.resolve("myorg").own_tier, Some(Tier::Hot));
+
+        p.set("myorg", Entry::default());
+
+        let resolved = p.resolve("myorg");
+        assert_eq!(resolved.tier, Tier::Warm, "the default");
+        assert_eq!(resolved.own_tier, None);
+        assert!(!p.entries.contains_key("myorg"));
+    }
+
+    #[test]
+    fn an_idle_window_survives_the_file() {
+        let dir = std::env::temp_dir().join("sightingdb-tierfile-idle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiers.toml");
+
+        let mut original = policy();
+        original.set(
+            "feeds",
+            Entry {
+                tier: Some(Tier::Warm),
+                warm_idle: Some(86_400),
+            },
+        );
+        original.set(
+            "staging",
+            Entry {
+                tier: None,
+                warm_idle: Some(300),
+            },
+        );
+        original.save(&path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains(r#""feeds" = { tier = "warm", warm_idle = 86400 }"#),
+            "{written}"
+        );
+        assert!(
+            written.contains(r#""staging" = { warm_idle = 300 }"#),
+            "{written}"
+        );
+        // The short spelling is kept for entries that only set a tier.
+        assert!(written.contains(r#""archive" = "cold""#), "{written}");
+
+        assert_eq!(TierPolicy::load(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nonsense_entry_in_the_file_says_what_is_wrong() {
+        let dir = std::env::temp_dir().join("sightingdb-tierfile-nonsense");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiers.toml");
+
+        for (entry, expected) in [
+            (
+                "feeds = { tier = \"warm\", idle = 60 }",
+                "unknown key 'idle'",
+            ),
+            ("feeds = { warm_idle = -5 }", "warm_idle"),
+            ("feeds = {}", "says nothing"),
+            ("feeds = 60", "should be a tier"),
+        ] {
+            std::fs::write(
+                &path,
+                format!("default_tier = \"hot\"\nwarm_idle = 60\n\n[tiers]\n{entry}\n"),
+            )
+            .unwrap();
+            let err = format!("{:#}", TierPolicy::load(&path).unwrap_err());
+            assert!(err.contains(expected), "{entry} gave {err}");
+            assert!(err.contains("feeds"), "{entry} gave {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

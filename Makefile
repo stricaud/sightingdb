@@ -39,11 +39,20 @@ CONTEXT         ?= $(shell $(KUBECTL) config current-context 2>/dev/null)
 LOCAL_CONTEXTS  ?= docker-desktop rancher-desktop minikube colima kind-% k3d-% k3s-%
 
 KUBE            := $(KUBECTL) --context $(CONTEXT) --namespace $(NAMESPACE)
-HELM_INSTALL    := $(HELM) upgrade --install $(RELEASE) $(CHART) \
+
+# The id of the image that is actually built. Rebuilding under the same tag
+# leaves the StatefulSet identical, so Kubernetes has no reason to roll and you
+# keep looking at the old code; carrying the id as a pod annotation gives it
+# one. Recursively expanded, so it is read after `make image` has run rather
+# than when this file is parsed.
+IMAGE_ID         = $(shell $(DOCKER) image inspect $(IMAGE_REF) --format '{{.Id}}' 2>/dev/null)
+
+HELM_INSTALL     = $(HELM) upgrade --install $(RELEASE) $(CHART) \
                      --kube-context $(CONTEXT) \
                      --namespace $(NAMESPACE) --create-namespace \
                      --values $(VALUES) \
                      --set image.repository=$(IMAGE) --set image.tag=$(TAG) \
+                     $(if $(IMAGE_ID),--set podAnnotations.sightingdb-image-id=$(IMAGE_ID),) \
                      $(HELM_ARGS)
 
 .DEFAULT_GOAL := help
@@ -256,7 +265,7 @@ smoke: local-only ## Write and read a sighting, and export it as STIX, over a te
 
 ##@ Everything at once
 
-refresh: image load restart wait ## Rebuild, load and restart the pod: the loop while changing code
+refresh: image load install wait ## Rebuild, load and roll the pod: the loop while changing code
 	@echo "$(RELEASE) is running the image you just built"
 
 restart: local-only ## Restart the pod without changing the release

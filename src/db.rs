@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::attribute::{Attribute, AttributeView};
 use crate::db_log::log_attribute;
-use crate::tier::{Tier, TierPolicy};
+use crate::tier::TierPolicy;
 
 /// Namespace holding every value ever written, used to derive consensus.
 pub const ALL_NAMESPACE: &str = "_all";
@@ -73,10 +73,28 @@ pub struct WriteOpts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NamespaceEntry {
     pub namespace: String,
-    /// The top-level namespace, which is what a tier applies to.
+    /// The top-level namespace, which is the unit eviction acts on.
     pub shard: String,
     pub tier: String,
     pub resident: bool,
+    /// The settings in force here, and whether they were set on this namespace
+    /// or inherited from one above it.
+    #[serde(flatten)]
+    pub storage: StorageView,
+}
+
+/// What the interface needs to show and edit a row's storage settings.
+///
+/// These belong to the shard, so every namespace under one reports the same
+/// thing — which is the point: changing it from any row changes all of them,
+/// and the row names the shard it will change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StorageView {
+    /// Seconds a warm shard may sit untouched before it is written out.
+    pub warm_idle: u64,
+    /// Set on the shard itself, rather than taken from the configured default.
+    pub own_tier: bool,
+    pub own_warm_idle: bool,
 }
 
 /// One step down the namespace tree, as the management interface browses it.
@@ -91,13 +109,21 @@ pub struct TreeEntry {
     /// The whole path, which is what the row links to.
     pub path: String,
     /// Whether the path is a namespace in its own right, and so may hold values.
-    pub namespace: bool,
+    /// Named apart from [`NamespaceEntry::namespace`], which is a path: one
+    /// listing saying `namespace` for a string and the other for a flag is how
+    /// a caller ends up sending `true` where a name was wanted.
+    #[serde(rename = "is_namespace")]
+    pub is_namespace: bool,
     /// Namespaces below this one, so a folder can say how much is inside it.
     pub descendants: usize,
-    /// The top-level namespace, which is what a tier applies to.
+    /// The top-level namespace, which is the unit eviction acts on.
     pub shard: String,
     pub tier: String,
     pub resident: bool,
+    /// The settings in force at this path. A folder that is not a namespace of
+    /// its own still has them: they are what its children inherit.
+    #[serde(flatten)]
+    pub storage: StorageView,
 }
 
 /// One namespace a value has been seen in, for the relationship view.
@@ -119,6 +145,20 @@ pub struct Sightings {
     pub truncated: bool,
     /// True when finding them all meant reading shards back from disk.
     pub paged_in: bool,
+}
+
+impl StorageView {
+    fn of(policy: &TierPolicy, shard: &str) -> (String, StorageView) {
+        let resolved = policy.resolve(shard);
+        (
+            resolved.tier.as_str().to_string(),
+            StorageView {
+                warm_idle: resolved.warm_idle,
+                own_tier: resolved.own_tier.is_some(),
+                own_warm_idle: resolved.own_warm_idle.is_some(),
+            },
+        )
+    }
 }
 
 /// A slice of a listing, with the total so a caller can page through it.
@@ -747,11 +787,13 @@ impl Database {
             .take(limit)
             .map(|name| {
                 let shard = crate::persistence::shard_of(name);
+                let (tier, storage) = StorageView::of(&tiers, shard);
                 NamespaceEntry {
                     namespace: name.clone(),
                     shard: shard.to_string(),
-                    tier: tiers.tier_of(shard).as_str().to_string(),
+                    tier,
                     resident: shards.get(shard).is_some_and(|meta| meta.resident),
+                    storage,
                 }
             })
             .collect();
@@ -847,15 +889,17 @@ impl Database {
                 } else {
                     format!("{prefix}/{name}")
                 };
-                let (namespace, descendants) = children[name];
+                let (is_namespace, descendants) = children[name];
                 let shard = crate::persistence::shard_of(&path);
+                let (tier, storage) = StorageView::of(&tiers, shard);
                 TreeEntry {
                     name: name.to_string(),
-                    namespace,
+                    is_namespace,
                     descendants,
                     shard: shard.to_string(),
-                    tier: tiers.tier_of(shard).as_str().to_string(),
+                    tier,
                     resident: shards.get(shard).is_some_and(|meta| meta.resident),
+                    storage,
                     path,
                 }
             })
@@ -952,16 +996,40 @@ impl Database {
         found
     }
 
-    /// Change a shard's tier, taking effect at once.
+    /// Change a shard's storage settings, taking effect at once.
     ///
-    /// Promoting to `hot` does not load anything: the shard is paged in when
-    /// it is next used, as it would have been anyway.
-    pub fn set_tier(&self, shard: &str, tier: Tier) {
+    /// A shard is the whole of a top-level namespace, so this covers every
+    /// namespace under it. An empty entry removes the setting and the shard
+    /// goes back to the configured defaults. Promoting to `hot` does not load
+    /// anything: the shard is paged in when it is next used, as it would have
+    /// been anyway.
+    pub fn set_policy(&self, shard: &str, entry: crate::tier::Entry) {
         self.tiers
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .shards
-            .insert(shard.to_string(), tier);
+            .set(shard, entry);
+    }
+
+    /// What a shard's settings work out to.
+    pub fn resolved_policy(&self, shard: &str) -> crate::tier::Resolved {
+        self.tiers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .resolve(shard)
+    }
+
+    /// What a shard will do, in a sentence, for the interface to show.
+    pub fn shard_effect(&self, shard: &str) -> String {
+        match self.resolved_policy(shard).idle_allowance() {
+            None => format!("'{shard}' and everything under it stays in memory"),
+            Some(window) if window.is_zero() => {
+                format!("'{shard}' and everything under it is dropped at the next sweep once idle")
+            }
+            Some(window) => format!(
+                "'{shard}' and everything under it is dropped after {}s untouched",
+                window.as_secs()
+            ),
+        }
     }
 
     /// The current policy, for writing back to disk.
@@ -1667,16 +1735,16 @@ mod tests {
         // `feeds` holds values of its own *and* has namespaces under it.
         assert_eq!(root.items[0].name, "feeds");
         assert_eq!(root.items[0].path, "feeds");
-        assert!(root.items[0].namespace);
+        assert!(root.items[0].is_namespace);
         assert_eq!(root.items[0].descendants, 2);
         assert_eq!(root.items[1].name, "other");
-        assert!(!root.items[1].namespace);
+        assert!(!root.items[1].is_namespace);
 
         // A level in, `misp` is a folder holding two namespaces.
         let feeds = db.namespace_children("feeds", "", 0, 10, |_| true);
         assert_eq!(feeds.total, 1);
         assert_eq!(feeds.items[0].path, "feeds/misp");
-        assert!(!feeds.items[0].namespace);
+        assert!(!feeds.items[0].is_namespace);
         assert_eq!(feeds.items[0].descendants, 2);
 
         let misp = db.namespace_children("feeds/misp", "", 0, 10, |_| true);
@@ -2052,7 +2120,7 @@ mod tests {
             },
             TierPolicy {
                 default_tier: tier,
-                shards: HashMap::new(),
+                entries: HashMap::new(),
                 warm_idle: std::time::Duration::from_secs(3600),
             },
         );

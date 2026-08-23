@@ -144,12 +144,54 @@ pub struct TagChange {
     tags: String,
 }
 
-/// A tier change from the interface.
+/// A storage change from the interface or an automation.
+///
+/// Name any namespace: the setting lands on its top-level namespace, which is
+/// the unit that is paged in and out, and so covers everything under it. Both
+/// halves are optional, and `"default"` (or null) on either means "stop saying
+/// anything here and take the configured default".
 #[derive(Debug, Deserialize)]
 pub struct TierChange {
-    /// The top-level namespace. A tier applies to the whole of it.
-    shard: String,
-    tier: String,
+    /// Any namespace in the shard to change. `shard` is the older spelling.
+    #[serde(default, alias = "shard")]
+    namespace: String,
+    #[serde(default)]
+    tier: Option<String>,
+    /// Seconds a warm shard may sit untouched. Accepts a number or a string,
+    /// since a form field hands over text.
+    #[serde(default)]
+    warm_idle: Option<serde_json::Value>,
+}
+
+impl TierChange {
+    /// The settings to store, or an explanation of what was unreadable.
+    fn entry(&self) -> Result<crate::tier::Entry, String> {
+        let tier = match self.tier.as_deref().map(str::trim) {
+            None | Some("") | Some("default") | Some("inherit") => None,
+            Some(tier) => Some(crate::tier::Tier::parse(tier).map_err(|e| e.to_string())?),
+        };
+
+        let warm_idle = match &self.warm_idle {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Number(number)) => match number.as_u64() {
+                Some(seconds) => Some(seconds),
+                None => return Err("warm_idle cannot be negative".to_string()),
+            },
+            Some(serde_json::Value::String(text)) => {
+                let text = text.trim();
+                match text {
+                    "" | "default" | "inherit" => None,
+                    _ => Some(
+                        text.parse::<u64>()
+                            .map_err(|_| format!("'{text}' is not a number of seconds"))?,
+                    ),
+                }
+            }
+            Some(other) => return Err(format!("warm_idle should be a number, found {other}")),
+        };
+
+        Ok(crate::tier::Entry { tier, warm_idle })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -802,6 +844,15 @@ fn random_key() -> String {
 }
 
 /// Change a shard's tier and write it back, so it survives a restart.
+/// Set, change or clear the storage settings of the shard a namespace is in.
+///
+/// The tier decides whether the shard is kept in memory, and `warm_idle` how
+/// long a warm one waits before being written out — the second being the thing
+/// that could only be changed in the configuration file until now.
+///
+/// It applies to the whole top-level namespace, and the reply says so: a change
+/// made from a row deep in a tree is a change to everything beside it, which is
+/// better said than discovered.
 pub async fn set_tier(state: State, body: web::Json<TierChange>, req: HttpRequest) -> HttpResponse {
     let caller = match require_admin(&state, &req) {
         Ok(key) => key.to_string(),
@@ -809,17 +860,22 @@ pub async fn set_tier(state: State, body: web::Json<TierChange>, req: HttpReques
     };
 
     let change = body.into_inner();
-    let tier = match crate::tier::Tier::parse(&change.tier) {
-        Ok(tier) => tier,
-        Err(e) => return HttpResponse::BadRequest().json(Message::new(e.to_string())),
-    };
-    if change.shard.is_empty() || change.shard.starts_with('_') {
+    let namespace = change.namespace.trim().trim_matches('/');
+    if namespace.is_empty() {
+        return HttpResponse::BadRequest().json(Message::new("Name the namespace to change."));
+    }
+    if namespace.starts_with('_') {
         return HttpResponse::BadRequest().json(Message::new(
             "Internal namespaces are always hot and cannot be retiered.",
         ));
     }
-    // Reaching the interface is not the same as being allowed to see the data.
-    if let Err(resp) = require_read(&state, &caller, &change.shard) {
+    let entry = match change.entry() {
+        Ok(entry) => entry,
+        Err(e) => return HttpResponse::BadRequest().json(Message::new(e)),
+    };
+
+    // Changing what a namespace costs to keep is a change to it.
+    if let Err(resp) = require_write(&state, &caller, namespace) {
         return resp;
     }
 
@@ -830,19 +886,29 @@ pub async fn set_tier(state: State, body: web::Json<TierChange>, req: HttpReques
         ));
     };
 
-    state.db.set_tier(&change.shard, tier);
+    let shard = crate::persistence::shard_of(namespace).to_string();
+    state.db.set_policy(&shard, entry);
     if let Err(e) = state.db.tier_policy().save(path) {
         log::error!("Could not write {}: {e:#}", path.display());
         return HttpResponse::InternalServerError()
             .json(Message::new(format!("Could not write the tier file: {e}")));
     }
 
+    let resolved = state.db.resolved_policy(&shard);
     log::info!(
-        "Tier of '{}' set to {} by '{caller}'",
-        change.shard,
-        tier.as_str()
+        "Storage of '{shard}' set to {} (warm_idle {}s) by '{caller}'",
+        resolved.tier.as_str(),
+        resolved.warm_idle,
     );
-    HttpResponse::Ok().json(Message::new("ok"))
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "shard": shard,
+        "tier": resolved.tier.as_str(),
+        "warm_idle": resolved.warm_idle,
+        "own_tier": resolved.own_tier.is_some(),
+        "own_warm_idle": resolved.own_warm_idle.is_some(),
+        "effect": state.db.shard_effect(&shard),
+    }))
 }
 
 /// Register the admin routes.
@@ -1383,13 +1449,107 @@ mod tests {
 
         let resp = post_tier!(app, json!({"shard": "myorg", "tier": "cold"}), ADMIN);
         assert_eq!(resp.status(), StatusCode::OK);
-
         let body: Json =
             test::read_body_json(get!(app, "/_management/api/namespaces", Some(ADMIN))).await;
         assert_eq!(body["items"][0]["tier"], "cold");
 
         let written = std::fs::read_to_string(dir.0.join("tiers.toml")).unwrap();
         assert!(written.contains("\"myorg\" = \"cold\""), "{written}");
+    }
+
+    #[actix_web::test]
+    async fn the_idle_window_can_be_changed_and_cleared() {
+        let dir = TempDir::new("tieridle");
+        let st = tiered_state(&dir.0);
+        let app = app!(st);
+
+        // The thing that could only be set in the configuration file before.
+        let resp = post_tier!(
+            app,
+            json!({"namespace": "myorg/one", "tier": "warm", "warm_idle": 86400}),
+            ADMIN
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Json = test::read_body_json(resp).await;
+        // Named a namespace, changed its shard, and said so.
+        assert_eq!(body["shard"], "myorg");
+        assert_eq!(body["tier"], "warm");
+        assert_eq!(body["warm_idle"], 86400);
+        assert!(
+            body["effect"]
+                .as_str()
+                .unwrap()
+                .contains("everything under it"),
+            "{body}"
+        );
+
+        let written = std::fs::read_to_string(dir.0.join("tiers.toml")).unwrap();
+        assert!(
+            written.contains(r#""myorg" = { tier = "warm", warm_idle = 86400 }"#),
+            "{written}"
+        );
+
+        // A form hands over text, and "default" means stop saying anything.
+        let resp = post_tier!(
+            app,
+            json!({"namespace": "myorg", "tier": "warm", "warm_idle": "default"}),
+            ADMIN
+        );
+        let body: Json = test::read_body_json(resp).await;
+        assert_eq!(body["own_warm_idle"], false);
+        assert_eq!(body["warm_idle"], 3600, "back to the configured default");
+
+        // Clearing both leaves nothing behind.
+        let resp = post_tier!(app, json!({"namespace": "myorg", "tier": "default"}), ADMIN);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Json = test::read_body_json(resp).await;
+        assert_eq!(body["own_tier"], false);
+        let written = std::fs::read_to_string(dir.0.join("tiers.toml")).unwrap();
+        assert!(!written.contains("myorg"), "{written}");
+    }
+
+    #[actix_web::test]
+    async fn a_row_reports_the_window_its_shard_is_on() {
+        let dir = TempDir::new("tierrow");
+        let st = tiered_state(&dir.0);
+        let app = app!(st);
+        post_tier!(
+            app,
+            json!({"namespace": "myorg", "tier": "warm", "warm_idle": 900}),
+            ADMIN
+        );
+
+        for uri in [
+            "/_management/api/namespaces",
+            "/_management/api/tree?path=myorg",
+        ] {
+            let body: Json = test::read_body_json(get!(app, uri, Some(ADMIN))).await;
+            let item = &body["items"][0];
+            assert_eq!(item["tier"], "warm", "{uri}");
+            assert_eq!(item["warm_idle"], 900, "{uri}");
+            assert_eq!(item["own_tier"], true, "{uri}");
+            assert_eq!(item["own_warm_idle"], true, "{uri}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn an_unreadable_idle_window_is_refused() {
+        let dir = TempDir::new("tierjunk");
+        let st = tiered_state(&dir.0);
+        let app = app!(st);
+
+        for body in [
+            json!({"namespace": "myorg", "warm_idle": "soon"}),
+            json!({"namespace": "myorg", "warm_idle": -5}),
+            json!({"namespace": "", "tier": "warm"}),
+        ] {
+            assert_eq!(
+                post_tier!(app, body.clone(), ADMIN).status(),
+                StatusCode::BAD_REQUEST,
+                "{body}"
+            );
+        }
+        assert!(!dir.0.join("tiers.toml").exists());
     }
 
     #[actix_web::test]
@@ -1471,7 +1631,7 @@ mod tests {
         assert_eq!(body["total"], 1);
         assert_eq!(body["items"][0]["name"], "feeds");
         assert_eq!(body["items"][0]["path"], "feeds");
-        assert_eq!(body["items"][0]["namespace"], false);
+        assert_eq!(body["items"][0]["is_namespace"], false);
         assert_eq!(body["items"][0]["descendants"], 1);
 
         // A level down, `ips` is the namespace holding the values.
@@ -1479,7 +1639,7 @@ mod tests {
             test::read_body_json(get!(app, "/_management/api/tree?path=feeds", Some(ADMIN))).await;
         assert_eq!(body["items"][0]["name"], "ips");
         assert_eq!(body["items"][0]["path"], "feeds/ips");
-        assert_eq!(body["items"][0]["namespace"], true);
+        assert_eq!(body["items"][0]["is_namespace"], true);
         assert_eq!(body["items"][0]["descendants"], 0);
 
         // And nothing below that.

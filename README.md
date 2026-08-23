@@ -179,6 +179,7 @@ REST Endpoints
 	/d: delete (GET)
 	/stix: export a namespace as a STIX 2.1 bundle (GET)
 	/_api/stix: export one or more namespaces as STIX 2.1 (POST)
+	/_api/tier: set a namespace's tier and idle window (POST)
 	/c: configure (GET, not implemented)
 	/i: info (GET)
 	/health: liveness and readiness, no key required (GET)
@@ -625,6 +626,55 @@ the next save would make it real.
 
 API keys are *not* in the snapshot: they come from the configuration, so
 permissions are reviewable and can live in version control.
+
+Keeping it in memory, or not
+----------------------------
+
+Storage is one file per **top-level namespace** — a shard — so `feeds/misp/ips`
+and `feeds/otx/domains` live in `feeds`, and a shard is paged in and out as a
+unit. Which is why the settings below belong to the shard and cover everything
+under it: there is no finer setting because there is no finer eviction.
+
+	[storage]
+	default_tier = "hot"
+	warm_idle = 3600
+	tiers_file = "tiers.toml"
+
+	[storage.tiers]
+	archive = "cold"
+	feeds = { tier = "warm", warm_idle = 86400 }
+	staging = { warm_idle = 300 }
+
+| Tier | |
+| --- | --- |
+| `hot` | Never evicted. |
+| `warm` | Written out and dropped once untouched for `warm_idle` seconds. |
+| `cold` | Dropped at the next sweep once idle. |
+
+`warm_idle` is how long "untouched" means, and an entry may set it for one shard
+rather than taking the global one — a feed worth keeping for a day and a staging
+tree worth keeping for five minutes are both warm, on different windows. An
+entry may also set the window alone, leaving the tier to `default_tier`.
+
+Evicted data is not gone: the shard is read back when it is next used, so
+`cold` costs one load per burst of activity rather than one per operation.
+
+**Changing it while it runs.** Both halves are editable from the management
+interface — a tier control and, for a warm shard, the number of seconds beside
+it — and over HTTP for automation:
+
+	$ curl -k -X POST https://localhost:9999/_api/tier \
+	    -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -d '{"namespace": "feeds/misp/ips", "tier": "warm", "warm_idle": 86400}'
+	{"shard":"feeds","tier":"warm","warm_idle":86400,"own_tier":true,"own_warm_idle":true,
+	 "effect":"'feeds' and everything under it is dropped after 86400s untouched"}
+
+Name any namespace and the setting lands on its shard, which the reply says out
+loud: a change made from a row deep in a tree is a change to everything beside
+it. Either field takes `"default"` to stop overriding and go back to
+`[storage]`, and a change is written to `tiers_file` so it survives a restart.
+It needs write access to the namespace, and a configured `tiers_file` — without
+one the tiers are whatever the configuration says and cannot be changed here.
 
 Containers and Kubernetes
 =========================

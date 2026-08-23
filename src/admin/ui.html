@@ -51,6 +51,9 @@
   textarea { font: inherit; padding: .35rem .6rem; border: 1px solid var(--line);
              border-radius: 6px; background: var(--bg); color: var(--fg); }
   .kind { color: var(--muted); font-size: .85rem; }
+  input.idle { width: 6.5rem; margin-left: .3rem; }
+  /* The configured default rather than this shard's own setting. */
+  input.idle.inherited { color: var(--muted); border-style: dashed; }
   .cards { display: grid; gap: .6rem; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
   .card { border: 1px solid var(--line); border-radius: 8px; padding: .6rem .8rem; background: var(--panel); }
   .card h3 { margin: 0 0 .3rem; font-size: .8rem; text-transform: uppercase;
@@ -122,14 +125,18 @@
       <tbody id="ns-rows"></tbody>
     </table></div>
     <p class="muted" id="ns-empty"></p>
+    <p class="muted" id="ns-effect"></p>
     <p class="muted">A namespace is a path, so <code>feeds/misp/ips</code> browses
        like folders: <b>folder</b> means other namespaces sit underneath it,
        <b>namespace</b> means it holds values of its own, and a path can be both.
-       A tier applies to the whole top-level namespace, so changing it for
-       <code>myorg/one</code> changes <code>myorg</code> and everything under it.
-       <b>hot</b> stays in memory; <b>warm</b> is dropped once untouched for the
-       configured window; <b>cold</b> is dropped at the next sweep. Evicted data
-       is read back automatically when it is next used.</p>
+       <b>hot</b> stays in memory; <b>warm</b> is written out and dropped once
+       untouched for the seconds beside it; <b>cold</b> is dropped at the next
+       sweep. Evicted data is read back automatically when it is next used.
+       Storage settings belong to the whole top-level namespace, named after the
+       control, because that is one file paged in and out as a unit — changing
+       them for <code>myorg/one</code> changes <code>myorg</code> and everything
+       under it. A window shown greyed is the configured default; type over it
+       to give this one its own.</p>
   </section>
 
   <!-- Values held by the namespace being browsed -->
@@ -455,7 +462,7 @@ async function loadTree() {
       // A folder is named by its segment; what it holds says whether there is
       // anything under it, values in it, or both.
       const holds = [];
-      if (item.namespace) holds.push("namespace");
+      if (item.is_namespace) holds.push("namespace");
       if (item.descendants) holds.push(`${item.descendants} below`);
       return namespaceRow(item, item.name + (item.descendants ? "/" : ""),
                           holds.join(", ") || "folder", item.path);
@@ -493,6 +500,10 @@ async function loadSearch() {
  * control is labelled with the shard it will actually change.
  */
 function namespaceRow(item, label, holds, path) {
+  // `path` is passed in because the two listings disagree about their fields:
+  // a flat row carries `namespace` as its path, a tree row carries
+  // `is_namespace` as a flag. Reading it from the item is how a request ends
+  // up asking the server to change a namespace called "true".
   const tr = document.createElement("tr");
 
   const name = document.createElement("td");
@@ -519,12 +530,34 @@ function namespaceRow(item, label, holds, path) {
     o.selected = option === item.tier;
     select.append(o);
   }
-  select.title = `applies to ${item.shard}`;
-  select.onchange = () => setTier(item.shard, select.value, select);
+  select.title = `applies to ${item.shard} and everything under it`;
+  select.onchange = () => setStorage(path, { tier: select.value }, select);
+
+  // How long a warm shard waits. Only warm uses it, so it is only offered
+  // then — a number nobody can act on is a number in the way.
+  const idle = document.createElement("input");
+  idle.type = "number";
+  idle.min = "0";
+  idle.step = "60";
+  idle.className = "idle";
+  idle.value = item.warm_idle;
+  idle.title = item.own_warm_idle
+    ? `${item.shard} is written out after ${item.warm_idle}s untouched`
+    : `the configured default of ${item.warm_idle}s; set one for ${item.shard} here`;
+  if (!item.own_warm_idle) idle.classList.add("inherited");
+  idle.onchange = () => setStorage(path, { warm_idle: idle.value.trim() }, idle);
+
+  const unit = document.createElement("span");
+  unit.className = "muted";
+  unit.textContent = "s idle";
+
   const shard = document.createElement("span");
   shard.className = "muted";
   shard.textContent = ` ${item.shard}`;
-  tier.append(select, shard);
+
+  tier.append(select);
+  if (item.tier === "warm") tier.append(idle, unit);
+  tier.append(shard);
 
   tr.append(name, kind, resident, tier);
   return tr;
@@ -540,13 +573,17 @@ function paging(prefix, page) {
 }
 
 /**
- * Tiers are per top-level namespace, so one change moves every row sharing it.
- * The list is reloaded rather than patched so those rows agree again.
+ * Storage settings belong to the top-level namespace, so one change moves every
+ * row sharing it. The list is reloaded rather than patched so those rows agree
+ * again, and the server's own sentence about what will now happen is shown —
+ * a change made from a row deep in a tree is a change to everything beside it.
  */
-async function setTier(shard, tier, control) {
+async function setStorage(namespace, change, control) {
   control.disabled = true;
   try {
-    await api("/_management/api/tier", "POST", { shard, tier });
+    const reply = await api("/_management/api/tier", "POST", { namespace, ...change });
+    setError("");
+    $("ns-effect").textContent = reply.effect;
     await loadListing();
   } catch (e) {
     setError(e.message);
