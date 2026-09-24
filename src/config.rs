@@ -54,6 +54,9 @@ pub struct Settings {
     pub sweep_interval: u64,
     pub stats_retention: usize,
     pub shadow_ttl: u64,
+    /// How many rejected values to keep in memory for `/_management/api/rejections`.
+    /// 0 switches the record off.
+    pub rejection_log: usize,
     /// API keys. `None` means no `[acl]` table and no `acl_file`.
     pub acl: Option<Acl>,
     /// File holding the keys, which the management interface rewrites.
@@ -189,6 +192,8 @@ struct RawDaemon {
     stats_retention: usize,
     #[serde(default)]
     shadow_ttl: u64,
+    #[serde(default = "default_rejection_log")]
+    rejection_log: usize,
     acl_file: Option<PathBuf>,
 }
 
@@ -294,6 +299,9 @@ fn default_compression_level() -> i32 {
 }
 fn default_sweep_interval() -> u64 {
     60
+}
+fn default_rejection_log() -> usize {
+    crate::rejections::DEFAULT_CAPACITY
 }
 fn default_dns_ip() -> String {
     // Loopback, not every interface: DNS answers without authentication.
@@ -409,6 +417,7 @@ impl RawConfig {
             sweep_interval: daemon.sweep_interval,
             stats_retention: daemon.stats_retention,
             shadow_ttl: daemon.shadow_ttl,
+            rejection_log: daemon.rejection_log,
             acl,
             acl_file,
             tiers,

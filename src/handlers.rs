@@ -29,6 +29,9 @@ pub struct SharedState {
     pub stix: crate::config::StixSettings,
     /// When the process came up, which is what `/health` reports.
     pub started: std::time::Instant,
+    /// Values that were not written, from every path that writes. See
+    /// [`crate::rejections`] for why this is bounded and in memory.
+    pub rejections: crate::rejections::Rejections,
 }
 
 impl SharedState {
@@ -48,6 +51,7 @@ impl SharedState {
             tiers_file: None,
             stix: crate::config::StixSettings::default(),
             started: std::time::Instant::now(),
+            rejections: crate::rejections::Rejections::default(),
         }
     }
 }
@@ -104,6 +108,17 @@ pub struct ReadQuery {
     val: Option<String>,
     /// Present at any value (including empty) to suppress the shadow sighting.
     noshadow: Option<String>,
+    /// Present at any value to answer with how many values the namespace holds
+    /// instead of the values themselves.
+    count: Option<String>,
+}
+
+/// How many values a namespace holds, for `/r/<namespace>?count`.
+#[derive(Debug, Serialize)]
+struct CountResponse {
+    namespace: String,
+    #[serde(flatten)]
+    count: crate::db::ValueCount,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,8 +225,46 @@ enum BulkReadItem {
 struct BulkWriteResponse {
     message: &'static str,
     written: usize,
+    /// One entry per request item, in request order.
+    items: Vec<BulkWriteItem>,
+    /// The failures alone, kept because this field predates `items` and
+    /// clients read it. Every entry here also appears in `items`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<BulkWriteError>,
+}
+
+/// What a dry run found, in the shape `/wb` would have answered with.
+///
+/// `writable` rather than `written`, because nothing was: the name is the one
+/// place a reader is certain to look, so it is the place to say so.
+#[derive(Debug, Serialize)]
+struct BulkValidateResponse {
+    message: &'static str,
+    /// How many items would be recorded. Nothing has been.
+    writable: usize,
+    items: Vec<BulkWriteItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<BulkWriteError>,
+}
+
+/// What happened to one item of a bulk write.
+///
+/// Carries `index` as well as the namespace and value so that a caller can map
+/// an outcome back onto what it sent even when the same value appears twice in
+/// one batch. `count` is that value's running total after this sighting — the
+/// number `/w` returns, taken under the same lock that incremented it, so no
+/// follow-up read is needed to learn it.
+#[derive(Debug, Serialize)]
+struct BulkWriteItem {
+    index: usize,
+    namespace: String,
+    value: String,
+    /// `"ok"` or `"error"`.
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,31 +346,23 @@ pub(crate) fn peer_of(req: &HttpRequest) -> String {
         .unwrap_or_else(|| "an unknown address".to_string())
 }
 
-/// Check the `Authorization` header against the ACL.
+/// The API key on this request, if authentication is switched on.
 ///
-/// Returns the response to send on refusal. When authentication is disabled in
-/// the config this is a no-op — including for `/d` and `/wb`, which previously
-/// demanded a key regardless of that setting.
-///
-/// A refusal is logged: a client with the wrong key otherwise gets a `403` that
-/// nobody but the client ever sees, which is the least useful place for it.
-fn authorize(
-    state: &SharedState,
-    req: &HttpRequest,
-    namespace: &str,
-    access: Access,
-) -> Result<(), HttpResponse> {
+/// `Ok(None)` means authentication is disabled, which every permission check
+/// treats as "allowed". This is split out from [`refusal_for`] because the two
+/// answer different questions: whether a key was *supplied* is a fact about the
+/// request, while whether it reaches a given namespace is a fact about each
+/// namespace asked for. A bulk request needs the first once and the second per
+/// item.
+fn api_key<'r>(state: &SharedState, req: &'r HttpRequest) -> Result<Option<&'r str>, HttpResponse> {
     if !state.authenticate {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(header) = req.headers().get("Authorization") else {
         // Common enough on an open port to be noise at warn level, and still
         // worth having when someone is working out why a client fails.
-        log::debug!(
-            "Refused {}: no API key, asked for '{namespace}'",
-            peer_of(req)
-        );
+        log::debug!("Refused {}: no API key supplied", peer_of(req));
         return Err(HttpResponse::Unauthorized().json(Message::new(
             "Please add the API key in the Authorization headers.",
         )));
@@ -329,6 +374,29 @@ fn authorize(
             .json(Message::new("Authorization header is not valid UTF-8.")));
     };
 
+    Ok(Some(apikey))
+}
+
+/// Why `apikey` may not reach `namespace`, or `None` if it may.
+///
+/// The message is built here rather than by the caller so that a refusal reads
+/// identically whether it comes back as a whole-request `403` or as one item's
+/// status in a bulk response. That matters: the wording deliberately does not
+/// say whether the key exists, and a second copy of it elsewhere is exactly how
+/// that property gets lost.
+///
+/// A refusal is logged, because a client with the wrong key otherwise gets a
+/// `403` that nobody but the client ever sees.
+fn refusal_for(
+    state: &SharedState,
+    req: &HttpRequest,
+    apikey: Option<&str>,
+    namespace: &str,
+    access: Access,
+) -> Option<String> {
+    // Authentication disabled: everything is permitted.
+    let apikey = apikey?;
+
     let acl = state.acl();
     let (allowed, verb) = match access {
         Access::Read => (acl.can_read(apikey, namespace), "read"),
@@ -336,17 +404,35 @@ fn authorize(
     };
 
     if allowed {
-        Ok(())
-    } else {
-        log::warn!(
-            "{}",
-            refusal(&peer_of(req), apikey, acl.contains(apikey), verb, namespace)
-        );
-        // Deliberately the same answer whether the key is unknown or merely
-        // unauthorised here, so that probing cannot distinguish the two.
-        Err(HttpResponse::Forbidden().json(Message::new(format!(
-            "API key is not permitted to {verb} this namespace."
-        ))))
+        return None;
+    }
+
+    log::warn!(
+        "{}",
+        refusal(&peer_of(req), apikey, acl.contains(apikey), verb, namespace)
+    );
+    // Deliberately the same answer whether the key is unknown or merely
+    // unauthorised here, so that probing cannot distinguish the two.
+    Some(format!(
+        "API key is not permitted to {verb} this namespace."
+    ))
+}
+
+/// Check the `Authorization` header against the ACL.
+///
+/// Returns the response to send on refusal. When authentication is disabled in
+/// the config this is a no-op — including for `/d` and `/wb`, which previously
+/// demanded a key regardless of that setting.
+fn authorize(
+    state: &SharedState,
+    req: &HttpRequest,
+    namespace: &str,
+    access: Access,
+) -> Result<(), HttpResponse> {
+    let apikey = api_key(state, req)?;
+    match refusal_for(state, req, apikey, namespace, access) {
+        None => Ok(()),
+        Some(message) => Err(HttpResponse::Forbidden().json(Message::new(message))),
     }
 }
 
@@ -364,6 +450,7 @@ pub async fn help() -> impl Responder {
             "REST Endpoints:\n",
             "\t/w: write (GET)\n",
             "\t/wb: write in bulk mode (POST)\n",
+            "\t/vwb: check a bulk write without recording it (POST)\n",
             "\t/r: read (GET)\n",
             "\t/rs: read with statistics (GET)\n",
             "\t/rb: read in bulk mode (POST)\n",
@@ -451,6 +538,24 @@ fn do_read(
         return resp;
     }
 
+    // A count is about the namespace, so a value alongside it is a request for
+    // two different things at once rather than a narrowing of one.
+    if query.count.is_some() {
+        if query.val.is_some() {
+            return HttpResponse::BadRequest().json(Message::new(
+                "count applies to a namespace, not to one value. Drop val= to count, \
+                 or drop count to read the value.",
+            ));
+        }
+        return match state.db.value_count(namespace) {
+            Some(count) => HttpResponse::Ok().json(CountResponse {
+                namespace: namespace.to_string(),
+                count,
+            }),
+            None => error_response(&ApiError::NotFound(NotFound::namespace(namespace, ""))),
+        };
+    }
+
     let with_shadow = query.noshadow.is_none();
 
     match &query.val {
@@ -490,7 +595,18 @@ pub async fn write(
 
     let when = match query.timestamp.map(timestamp_to_instant).transpose() {
         Ok(when) => when,
-        Err(e) => return error_response(&e),
+        Err(e) => {
+            // Recorded here as well as below: a value turned away for its
+            // timestamp is as much a rejection as one turned away for itself,
+            // and this arm returns before the writer is ever reached.
+            state.rejections.record(
+                &namespace,
+                value,
+                &e.to_string(),
+                crate::rejections::Source::Write,
+            );
+            return error_response(&e);
+        }
     };
 
     let tags = query.tags.as_deref().unwrap_or_default();
@@ -499,7 +615,15 @@ pub async fn write(
             message: "ok",
             count,
         }),
-        Err(e) => error_response(&e),
+        Err(e) => {
+            state.rejections.record(
+                &namespace,
+                value,
+                &e.to_string(),
+                crate::rejections::Source::Write,
+            );
+            error_response(&e)
+        }
     }
 }
 
@@ -649,21 +773,72 @@ fn do_read_bulk(
     HttpResponse::Ok().json(BulkReadResponse { items })
 }
 
+/// One bulk item's fate, decided without touching the database.
+///
+/// `/wb` and `/vwb` both go through this and differ only in what they do with
+/// the answer: the first writes on `Ok`, the second reports it. That is the
+/// whole point of the dry run — the two cannot disagree about what is writable
+/// because there is only one set of rules, here.
+enum ItemCheck {
+    /// Writable, carrying the parsed timestamp so the writer need not parse it
+    /// a second time. `None` means "now".
+    Ok(Option<chrono::DateTime<chrono::Utc>>),
+    /// The ACL refused this namespace to this key.
+    Refused(String),
+    /// The item is not something we would write whoever asked.
+    Invalid(String),
+}
+
+/// Decide one item: may this key write it, and is it writable at all?
+///
+/// Deliberately does not read the database. Nothing it checks depends on
+/// stored state, which is what lets `/vwb` promise that a passing item would be
+/// accepted rather than merely that it looks plausible.
+fn check_item(
+    state: &SharedState,
+    req: &HttpRequest,
+    apikey: Option<&str>,
+    item: &BulkSighting,
+) -> ItemCheck {
+    if let Some(message) = refusal_for(state, req, apikey, &item.namespace, Access::Write) {
+        return ItemCheck::Refused(message);
+    }
+
+    if let Err(e) = sighting_writer::check(&item.namespace, &item.value) {
+        return ItemCheck::Invalid(e.to_string());
+    }
+
+    match item.timestamp.map(timestamp_to_instant).transpose() {
+        Ok(when) => ItemCheck::Ok(when),
+        Err(e) => ItemCheck::Invalid(e.to_string()),
+    }
+}
+
 pub async fn write_bulk(
     state: State,
     body: web::Json<BulkRequest>,
     req: HttpRequest,
 ) -> HttpResponse {
-    let mut written = 0usize;
+    // A missing or unreadable key fails the whole call: that is a fact about
+    // the request, not about any one item. Whether the key reaches a given
+    // namespace is decided per item below, so that one out-of-scope entry no
+    // longer discards the outcome of every item beside it.
+    let apikey = match api_key(&state, &req) {
+        Ok(apikey) => apikey,
+        Err(resp) => return resp,
+    };
+
+    let mut items = Vec::with_capacity(body.items.len());
     let mut errors = Vec::new();
+    let mut written = 0usize;
+    let mut refusals = 0usize;
 
-    for item in &body.items {
-        if let Err(resp) = authorize(&state, &req, &item.namespace, Access::Write) {
-            return resp;
-        }
-
-        let outcome = match item.timestamp.map(timestamp_to_instant).transpose() {
-            Ok(when) => sighting_writer::write_tagged(
+    for (index, item) in body.items.iter().enumerate() {
+        let outcome = match check_item(&state, &req, apikey, item) {
+            // The check has already ruled out everything `write_tagged` can
+            // refuse, so this cannot fail; if it ever does, the error is
+            // reported rather than swallowed.
+            ItemCheck::Ok(when) => sighting_writer::write_tagged(
                 &state.db,
                 &item.namespace,
                 &item.value,
@@ -671,41 +846,166 @@ pub async fn write_bulk(
                 item.ttl,
                 &item.tags,
             )
-            .map(|_| ()),
-            Err(e) => Err(e),
+            .map_err(|e| e.to_string()),
+            ItemCheck::Refused(message) => {
+                refusals += 1;
+                Err(message)
+            }
+            ItemCheck::Invalid(message) => Err(message),
         };
 
         match outcome {
-            Ok(()) => written += 1,
-            Err(e) => errors.push(BulkWriteError {
-                namespace: item.namespace.clone(),
-                value: item.value.clone(),
-                error: e.to_string(),
-            }),
+            Ok(count) => {
+                written += 1;
+                items.push(BulkWriteItem {
+                    index,
+                    namespace: item.namespace.clone(),
+                    value: item.value.clone(),
+                    status: "ok",
+                    count: Some(count),
+                    error: None,
+                });
+            }
+            Err(message) => {
+                state.rejections.record(
+                    &item.namespace,
+                    &item.value,
+                    &message,
+                    crate::rejections::Source::BulkWrite,
+                );
+                errors.push(BulkWriteError {
+                    namespace: item.namespace.clone(),
+                    value: item.value.clone(),
+                    error: message.clone(),
+                });
+                items.push(BulkWriteItem {
+                    index,
+                    namespace: item.namespace.clone(),
+                    value: item.value.clone(),
+                    status: "error",
+                    count: None,
+                    error: Some(message),
+                });
+            }
         }
     }
 
-    // Every item failing is a client error; a mix is reported as partial so the
-    // caller can see exactly which items did not land.
-    if errors.is_empty() {
-        HttpResponse::Ok().json(BulkWriteResponse {
-            message: "ok",
-            written,
-            errors,
-        })
-    } else if written == 0 {
-        HttpResponse::BadRequest().json(BulkWriteResponse {
-            message: "failed",
-            written,
-            errors,
-        })
+    // An ACL refusal is reported like any other per-item failure: it is one
+    // item's outcome, not a verdict on the batch, and the items beside it that
+    // were permitted have been recorded.
+    //
+    // The exception is a request that achieved nothing and was refused all the
+    // way through, which is a permission failure entire and answers as one. A
+    // batch that wrote nothing for *mixed* reasons is a bad request, since a
+    // 403 would misdescribe the items that failed for their own sake; the
+    // refusals are still in `items` either way.
+    let (status, message) = if errors.is_empty() {
+        (actix_web::http::StatusCode::OK, "ok")
+    } else if written > 0 {
+        (actix_web::http::StatusCode::OK, "partial")
+    } else if refusals == errors.len() {
+        (actix_web::http::StatusCode::FORBIDDEN, "failed")
     } else {
-        HttpResponse::Ok().json(BulkWriteResponse {
-            message: "partial",
-            written,
-            errors,
-        })
+        (actix_web::http::StatusCode::BAD_REQUEST, "failed")
+    };
+
+    HttpResponse::build(status).json(BulkWriteResponse {
+        message,
+        written,
+        items,
+        errors,
+    })
+}
+
+/// `POST /vwb` — would this batch be accepted?
+///
+/// Answers exactly what [`write_bulk`] would answer for the same body, down to
+/// the status code and each item's status, and writes nothing. That equivalence
+/// is the contract: a client can send a batch here, and a `message: ok` means
+/// the same batch sent to `/wb` is accepted in full.
+///
+/// Both routes decide each item with [`check_item`], so the preview cannot
+/// drift from the writer. What it cannot promise is that the answer survives:
+/// the ACL can be rewritten and a value can expire between the two calls, so
+/// this reports what is true now, not a reservation. Callers that need the
+/// outcome of the write itself should read the `items` that `/wb` returns —
+/// which is why this route exists to check a batch *before* committing to it,
+/// not to replace reading what came back.
+///
+/// It reveals nothing `/wb` would not: the same refusal, worded the same way,
+/// for the same items. What it adds is the option of finding out without
+/// leaving a sighting behind.
+pub async fn validate_bulk(
+    state: State,
+    body: web::Json<BulkRequest>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let apikey = match api_key(&state, &req) {
+        Ok(apikey) => apikey,
+        Err(resp) => return resp,
+    };
+
+    let mut items = Vec::with_capacity(body.items.len());
+    let mut errors = Vec::new();
+    let mut writable = 0usize;
+    let mut refusals = 0usize;
+
+    for (index, item) in body.items.iter().enumerate() {
+        let message = match check_item(&state, &req, apikey, item) {
+            ItemCheck::Ok(_) => {
+                writable += 1;
+                items.push(BulkWriteItem {
+                    index,
+                    namespace: item.namespace.clone(),
+                    value: item.value.clone(),
+                    status: "ok",
+                    // No sighting was recorded, so there is no count to give.
+                    count: None,
+                    error: None,
+                });
+                continue;
+            }
+            ItemCheck::Refused(message) => {
+                refusals += 1;
+                message
+            }
+            ItemCheck::Invalid(message) => message,
+        };
+
+        errors.push(BulkWriteError {
+            namespace: item.namespace.clone(),
+            value: item.value.clone(),
+            error: message.clone(),
+        });
+        items.push(BulkWriteItem {
+            index,
+            namespace: item.namespace.clone(),
+            value: item.value.clone(),
+            status: "error",
+            count: None,
+            error: Some(message),
+        });
     }
+
+    // The same rule `write_bulk` applies, so that the dry run and the write
+    // answer alike. See the comment there for why a wholly refused batch is a
+    // 403 and a mixed failure a 400.
+    let (status, message) = if errors.is_empty() {
+        (actix_web::http::StatusCode::OK, "ok")
+    } else if writable > 0 {
+        (actix_web::http::StatusCode::OK, "partial")
+    } else if refusals == errors.len() {
+        (actix_web::http::StatusCode::FORBIDDEN, "failed")
+    } else {
+        (actix_web::http::StatusCode::BAD_REQUEST, "failed")
+    };
+
+    HttpResponse::build(status).json(BulkValidateResponse {
+        message,
+        writable,
+        items,
+        errors,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +1020,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/rbs", web::post().to(read_bulk_with_stats))
         .route("/w/{namespace:.*}", web::get().to(write))
         .route("/wb", web::post().to(write_bulk))
+        .route("/vwb", web::post().to(validate_bulk))
         .route("/d/{namespace:.*}", web::get().to(delete))
         .route("/stix/{namespace:.*}", web::get().to(export_stix))
         .route("/_api/stix", web::post().to(export_stix_api))
@@ -930,6 +1231,161 @@ mod tests {
         assert_eq!(body["stats"]["1593716400"], 1, "{body}");
     }
 
+    /// Counting is a read of the namespace, answered from the map's own length
+    /// rather than by walking it.
+    #[actix_web::test]
+    async fn counting_a_namespace_reports_how_many_values_it_holds() {
+        let st = state(false);
+        let app = app!(st);
+
+        for uri in ["/w/ns?val=a", "/w/ns?val=b", "/w/ns?val=a"] {
+            test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        }
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/r/ns?count").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+
+        // Two distinct values, written three times between them.
+        assert_eq!(body["namespace"], "ns", "{body}");
+        assert_eq!(body["values"], 2, "{body}");
+        assert_eq!(body["paged_in"], false, "{body}");
+
+        // Nothing here can expire, so the stored count is the visible one.
+        assert_eq!(body["exact"], true, "{body}");
+    }
+
+    /// A TTL anywhere in the namespace makes the count an upper bound, because
+    /// a value stops being visible at expiry but is only removed by the next
+    /// sweep. The response has to say so rather than quietly be wrong.
+    #[actix_web::test]
+    async fn a_namespace_with_a_ttl_reports_its_count_as_inexact() {
+        let st = state(false);
+        let app = app!(st);
+
+        test::call_service(
+            &app,
+            test::TestRequest::get().uri("/w/ns?val=a").to_request(),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/r/ns?count").to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["exact"], true, "before any ttl: {body}");
+
+        // One TTL is enough, and it stays that way afterwards.
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/ns?val=b&ttl=3600")
+                .to_request(),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/r/ns?count").to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["values"], 2, "{body}");
+        assert_eq!(body["exact"], false, "a ttl was not reported: {body}");
+    }
+
+    /// Counting must not be a way round the ACL, and must not invent a
+    /// namespace that is not there.
+    #[actix_web::test]
+    async fn counting_is_authorized_and_404s_for_an_unknown_namespace() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("feed", parse_grants("rw:feeds").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/secrets?count")
+                .insert_header(("Authorization", "feed"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/feeds/nothing-here?count")
+                .insert_header(("Authorization", "feed"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Counting a namespace is not a search for a value, so it must not leave
+    /// a shadow sighting behind the way reading one does.
+    #[actix_web::test]
+    async fn counting_raises_no_shadow_sighting() {
+        let st = state(false);
+        let app = app!(st);
+
+        test::call_service(
+            &app,
+            test::TestRequest::get().uri("/w/ns?val=a").to_request(),
+        )
+        .await;
+        test::call_service(
+            &app,
+            test::TestRequest::get().uri("/r/ns?count").to_request(),
+        )
+        .await;
+
+        assert!(
+            !st.db.namespace_exists("_shadow/ns"),
+            "counting raised a shadow sighting"
+        );
+    }
+
+    /// `count` and `val` ask for two different things, so asking for both is a
+    /// mistake worth naming rather than resolving silently.
+    #[actix_web::test]
+    async fn counting_and_reading_a_value_at_once_is_rejected() {
+        let st = state(false);
+        let app = app!(st);
+
+        test::call_service(
+            &app,
+            test::TestRequest::get().uri("/w/ns?val=a").to_request(),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/ns?val=a&count")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(
+            body["message"].as_str().unwrap().contains("namespace"),
+            "{body}"
+        );
+    }
+
     #[actix_web::test]
     async fn read_with_stats_needs_a_value() {
         let st = state(false);
@@ -1112,6 +1568,82 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// A bulk write is a sighting, not a replacement: writing a value that is
+    /// already there must add to it.
+    ///
+    /// Pinned because the accumulation is spread across three places that could
+    /// each regress independently — `Attribute::increment` widens the seen
+    /// window and bumps the count, `Attribute::add_tags` merges rather than
+    /// assigns, and an item that omits `ttl` must leave the stored one alone.
+    #[actix_web::test]
+    async fn a_bulk_write_accumulates_onto_an_existing_value() {
+        let st = state(false);
+        let app = app!(st);
+
+        // Both sightings must land inside the TTL window, or the value expires
+        // and the read below sees nothing.
+        let earlier = chrono::Utc::now().timestamp() - 60;
+        let later = earlier + 30;
+
+        // Seed with a plain write carrying a tag and a TTL.
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!(
+                    "/w/ns?val=1.2.3.4&tags=tlp:amber&ttl=3600&timestamp={earlier}"
+                ))
+                .to_request(),
+        )
+        .await;
+
+        // The same value again in bulk: a second tag, no TTL, later timestamp.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .set_json(json!({"items": [{
+                    "namespace": "ns",
+                    "value": "1.2.3.4",
+                    "tags": "stix-type:ipv4-addr",
+                    "timestamp": later,
+                }]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/ns?val=1.2.3.4&noshadow")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+
+        // The sighting was counted, not overwritten.
+        assert_eq!(body["count"], 2, "bulk write replaced the count: {body}");
+
+        // Both sightings are inside the seen window.
+        assert_eq!(body["first_seen"], earlier, "first_seen moved: {body}");
+        assert_eq!(body["last_seen"], later, "last_seen did not widen: {body}");
+
+        // Tags merged; neither writer's tag was lost.
+        let tags = body["tags"].as_str().unwrap();
+        assert!(tags.contains("tlp:amber"), "seed tag was dropped: {body}");
+        assert!(
+            tags.contains("stix-type:ipv4-addr"),
+            "bulk tag was dropped: {body}"
+        );
+
+        // An item with no `ttl` leaves the stored one alone.
+        assert_eq!(
+            body["ttl"], 3600,
+            "an absent ttl cleared the stored one: {body}"
+        );
+    }
+
     /// Regression: `/d` and `/wb` used to demand a key even with
     /// `authenticate=false`.
     #[actix_web::test]
@@ -1209,6 +1741,10 @@ mod tests {
 
     /// Bulk requests are checked per item, so one out-of-scope entry must not
     /// ride in on the back of an in-scope one.
+    ///
+    /// The refusal is reported as that item's status rather than as the status
+    /// of the request, so what this pins is the part that matters: the value
+    /// the key may not write is not written.
     #[actix_web::test]
     async fn bulk_requests_are_authorized_per_item() {
         let mut inner = SharedState::new(true);
@@ -1233,7 +1769,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["message"], "partial", "{body}");
+        assert_eq!(body["items"][0]["status"], "ok", "{body}");
+        assert_eq!(body["items"][1]["status"], "error", "{body}");
+
+        assert_eq!(st.db.count("feeds/a", "ok"), 1);
         assert_eq!(st.db.count("secrets", "nope"), 0);
     }
 
@@ -1350,6 +1892,7 @@ mod tests {
             "  /rs/{namespace}:",
             "  /d/{namespace}:",
             "  /wb:",
+            "  /vwb:",
             "  /rb:",
             "  /rbs:",
             "  /stix/{namespace}:",
@@ -1363,6 +1906,7 @@ mod tests {
             "  /_management/api/info:",
             "  /_management/api/namespaces:",
             "  /_management/api/tree:",
+            "  /_management/api/rejections:",
             "  /_management/api/values:",
             "  /_management/api/value:",
             "  /_management/api/sightings:",
@@ -1851,6 +2395,401 @@ mod tests {
         .await;
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Each item carries its own outcome, indexed back onto the request.
+    #[actix_web::test]
+    async fn a_bulk_write_reports_a_status_per_item() {
+        let st = state(false);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .set_json(json!({"items": [
+                    {"namespace": "ns", "value": "good"},
+                    {"namespace": "ns", "value": ""},
+                    {"namespace": "ns", "value": "good"}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        let items = body["items"].as_array().unwrap();
+
+        assert_eq!(items.len(), 3, "one entry per request item: {body}");
+
+        // Index-aligned with the request, so a repeated value is still
+        // traceable back to the entry that produced it.
+        for (n, item) in items.iter().enumerate() {
+            assert_eq!(item["index"], n, "{body}");
+        }
+
+        // A successful item reports the running count for that value, which is
+        // what removes the need for a follow-up read.
+        assert_eq!(items[0]["status"], "ok");
+        assert_eq!(items[0]["count"], 1, "{body}");
+        assert!(items[0]["error"].is_null(), "{body}");
+
+        assert_eq!(items[1]["status"], "error");
+        assert!(items[1]["error"].is_string(), "{body}");
+        assert!(items[1]["count"].is_null(), "{body}");
+
+        // Second sighting of the same value: the count moved on.
+        assert_eq!(items[2]["status"], "ok");
+        assert_eq!(items[2]["count"], 2, "{body}");
+
+        assert_eq!(body["written"], 2);
+        assert_eq!(body["message"], "partial");
+    }
+
+    /// An out-of-scope item fails on its own account: the items beside it were
+    /// permitted, so they are recorded and the request is a partial success.
+    #[actix_web::test]
+    async fn a_refused_item_does_not_discard_the_rest_of_the_batch() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("feed", parse_grants("rw:feeds").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .insert_header(("Authorization", "feed"))
+                .set_json(json!({"items": [
+                    {"namespace": "secrets", "value": "nope"},
+                    {"namespace": "feeds/a", "value": "yes"}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        // A refusal alongside a success is a partial write, not a 403: the
+        // refusal is item 0's status, and `items` is where a client reads it.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        let items = body["items"].as_array().unwrap();
+
+        assert_eq!(items[0]["status"], "error", "{body}");
+        assert!(items[0]["error"].is_string(), "{body}");
+        assert_eq!(items[1]["status"], "ok", "{body}");
+        assert_eq!(body["written"], 1, "{body}");
+        assert_eq!(body["message"], "partial", "{body}");
+
+        // The in-scope sighting landed even though it came after the refusal;
+        // the out-of-scope one did not.
+        assert_eq!(st.db.count("feeds/a", "yes"), 1);
+        assert_eq!(st.db.count("secrets", "nope"), 0);
+    }
+
+    /// A batch where every item is refused keeps the old whole-request answer.
+    #[actix_web::test]
+    async fn a_wholly_refused_bulk_write_is_403_and_writes_nothing() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("feed", parse_grants("rw:feeds").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .insert_header(("Authorization", "feed"))
+                .set_json(json!({"items": [{"namespace": "secrets", "value": "nope"}]}))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["written"], 0, "{body}");
+        assert_eq!(body["message"], "failed", "{body}");
+        assert_eq!(st.db.count("secrets", "nope"), 0);
+    }
+
+    /// Nothing written, but not everything was refused: the failures did not
+    /// share a cause, so the request is a bad one rather than a forbidden one.
+    /// The refusal is still reported, as that item's status.
+    #[actix_web::test]
+    async fn an_all_failed_batch_with_mixed_causes_is_400_not_403() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("feed", parse_grants("rw:feeds").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .insert_header(("Authorization", "feed"))
+                .set_json(json!({"items": [
+                    {"namespace": "secrets", "value": "refused"},
+                    {"namespace": "feeds/a", "value": ""}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["written"], 0, "{body}");
+        assert_eq!(body["message"], "failed", "{body}");
+        assert_eq!(body["items"][0]["status"], "error", "{body}");
+        assert_eq!(body["items"][1]["status"], "error", "{body}");
+        assert_eq!(st.db.count("secrets", "refused"), 0);
+    }
+
+    /// The dry run must agree with the writer on every item and on the status,
+    /// or it is worse than useless: it would give a client confidence that the
+    /// write then fails to honour.
+    ///
+    /// Runs the same batches through both routes and compares the answers.
+    #[actix_web::test]
+    async fn vwb_answers_what_wb_would_answer() {
+        let batches = [
+            // Everything writable.
+            json!({"items": [
+                {"namespace": "feeds/a", "value": "1.2.3.4"},
+                {"namespace": "feeds/b", "value": "evil.example", "ttl": 86400}
+            ]}),
+            // Some writable, some not.
+            json!({"items": [
+                {"namespace": "feeds/a", "value": "good"},
+                {"namespace": "feeds/a", "value": ""},
+                {"namespace": "secrets", "value": "refused"}
+            ]}),
+            // Nothing writable, every failure a refusal.
+            json!({"items": [
+                {"namespace": "secrets", "value": "a"},
+                {"namespace": "other", "value": "b"}
+            ]}),
+            // Nothing writable, failures of mixed cause.
+            json!({"items": [
+                {"namespace": "secrets", "value": "refused"},
+                {"namespace": "feeds/a", "value": ""}
+            ]}),
+            // A timestamp that is not an instant.
+            json!({"items": [
+                {"namespace": "feeds/a", "value": "x", "timestamp": i64::MAX}
+            ]}),
+            // The _config tree, which no key may write.
+            json!({"items": [
+                {"namespace": "_config/acl/apikeys/mine", "value": "x"}
+            ]}),
+        ];
+
+        for batch in batches {
+            // A fresh database each time, so the write half of the comparison
+            // starts where the dry run did.
+            let grants = || {
+                let mut inner = SharedState::new(true);
+                inner
+                    .acl
+                    .get_mut()
+                    .unwrap()
+                    .set("feed", parse_grants("rw:feeds").unwrap());
+                web::Data::new(inner)
+            };
+
+            let dry_state: State = grants();
+            let dry_app = app!(dry_state);
+            let dry = test::call_service(
+                &dry_app,
+                test::TestRequest::post()
+                    .uri("/vwb")
+                    .insert_header(("Authorization", "feed"))
+                    .set_json(batch.clone())
+                    .to_request(),
+            )
+            .await;
+            let dry_status = dry.status();
+            let dry_body: Value = test::read_body_json(dry).await;
+
+            let wet_state: State = grants();
+            let wet_app = app!(wet_state);
+            let wet = test::call_service(
+                &wet_app,
+                test::TestRequest::post()
+                    .uri("/wb")
+                    .insert_header(("Authorization", "feed"))
+                    .set_json(batch.clone())
+                    .to_request(),
+            )
+            .await;
+            let wet_status = wet.status();
+            let wet_body: Value = test::read_body_json(wet).await;
+
+            assert_eq!(
+                dry_status, wet_status,
+                "status differs for {batch}: /vwb {dry_body}, /wb {wet_body}"
+            );
+            assert_eq!(
+                dry_body["message"], wet_body["message"],
+                "message differs for {batch}"
+            );
+            assert_eq!(
+                dry_body["writable"], wet_body["written"],
+                "count of accepted items differs for {batch}"
+            );
+
+            let dry_items = dry_body["items"].as_array().unwrap();
+            let wet_items = wet_body["items"].as_array().unwrap();
+            assert_eq!(dry_items.len(), wet_items.len(), "item count for {batch}");
+            for (d, w) in dry_items.iter().zip(wet_items) {
+                assert_eq!(d["index"], w["index"], "{batch}");
+                assert_eq!(d["namespace"], w["namespace"], "{batch}");
+                assert_eq!(d["value"], w["value"], "{batch}");
+                assert_eq!(d["status"], w["status"], "status for {d} vs {w}");
+                assert_eq!(d["error"], w["error"], "error for {d} vs {w}");
+            }
+        }
+    }
+
+    /// The whole point: it must not record anything, including under `_all`
+    /// and `_shadow`, and including for the items it says are writable.
+    #[actix_web::test]
+    async fn vwb_records_nothing() {
+        let st = state(false);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/vwb")
+                .set_json(json!({"items": [
+                    {"namespace": "ns", "value": "writable"},
+                    {"namespace": "ns", "value": ""}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["message"], "partial", "{body}");
+        assert_eq!(body["writable"], 1, "{body}");
+        assert_eq!(body["items"][0]["status"], "ok", "{body}");
+        assert_eq!(body["items"][1]["status"], "error", "{body}");
+
+        // Nothing was counted, so no count is reported.
+        assert!(body["items"][0]["count"].is_null(), "{body}");
+
+        // And nothing reached the database, by any door.
+        assert_eq!(st.db.count("ns", "writable"), 0);
+        assert!(!st.db.namespace_exists("ns"), "the namespace was created");
+        assert_eq!(st.db.count(crate::db::ALL_NAMESPACE, "writable"), 0);
+        assert!(
+            !st.db.namespace_exists("_shadow/ns"),
+            "a shadow sighting was raised"
+        );
+    }
+
+    /// A dry run still needs a key when authentication is on, and still says
+    /// nothing about which keys exist.
+    #[actix_web::test]
+    async fn vwb_needs_a_key_and_reveals_nothing_extra() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("known", parse_grants("rw:feeds").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let body = json!({"items": [{"namespace": "secrets", "value": "x"}]});
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/vwb")
+                .set_json(body.clone())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let mut seen = Vec::new();
+        for key in ["known", "no-such-key"] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/vwb")
+                    .insert_header(("Authorization", key))
+                    .set_json(body.clone())
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let got: Value = test::read_body_json(resp).await;
+            seen.push(got["items"][0]["error"].as_str().unwrap().to_string());
+        }
+        assert_eq!(
+            seen[0], seen[1],
+            "the dry run told the keys apart: {seen:?}"
+        );
+    }
+
+    /// A per-item refusal must read exactly like a whole-request one, or the
+    /// bulk route becomes the way to tell a valid key from an invalid one.
+    #[actix_web::test]
+    async fn a_per_item_refusal_reveals_no_more_than_a_whole_request_one() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("known", parse_grants("rw:feeds").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let mut seen = Vec::new();
+        for key in ["known", "no-such-key"] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/wb")
+                    .insert_header(("Authorization", key))
+                    .set_json(json!({"items": [{"namespace": "secrets", "value": "x"}]}))
+                    .to_request(),
+            )
+            .await;
+            let body: Value = test::read_body_json(resp).await;
+            seen.push(body["items"][0]["error"].as_str().unwrap().to_string());
+        }
+
+        assert_eq!(
+            seen[0], seen[1],
+            "a known key and an unknown one got different refusals: {seen:?}"
+        );
+
+        // And the same wording the single-value route uses.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/secrets?val=x")
+                .insert_header(("Authorization", "known"))
+                .to_request(),
+        )
+        .await;
+        let single: Value = test::read_body_json(resp).await;
+        assert_eq!(single["message"], seen[0].as_str(), "{single}");
     }
 
     /// Regression: the old handler reported only the last item's outcome.

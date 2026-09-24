@@ -252,13 +252,99 @@ Omit `val=` to list every value in a namespace:
 
 Reading is recorded as a "shadow sighting" under `_shadow/<namespace>`, so you can see how often a value was searched for. Add `noshadow` to the query string to suppress that.
 
+To ask how many values a namespace holds without fetching them:
+
+	$ curl -k 'https://localhost:9999/r/my/namespace/?count'
+	{"namespace":"my/namespace","values":3,"exact":true,"paged_in":false}
+
+This is O(1) — the value map already knows its own length. `exact` is `false`
+when the namespace has ever held a TTL, because a value stops being visible the
+moment it expires but is only removed by the next sweep, leaving the stored
+count an upper bound in between. Counting raises no shadow sighting.
+
 Bulk
 ----
 	$ curl -k -X POST https://localhost:9999/wb -H 'Content-Type: application/json' \
 	    -d '{"items":[{"namespace":"my/namespace","value":"127.0.0.1"}]}'
-	{"message":"ok","written":1}
+	{"message":"ok","written":1,"items":[{"index":0,"namespace":"my/namespace","value":"127.0.0.1","status":"ok","count":1}]}
 
 `timestamp`, `ttl`, `tags` and `noshadow` are optional on each item.
+
+Every item gets its own outcome in `items`, in the order you sent them, so one
+bad entry tells you which one it was instead of casting doubt on the batch. A
+successful item carries the value's resulting `count` — the same number `/w`
+answers with, read under the lock that incremented it, so you do not need a
+follow-up read to learn it:
+
+	$ curl -k -X POST https://localhost:9999/wb -H 'Content-Type: application/json' \
+	    -d '{"items":[{"namespace":"my/namespace","value":"127.0.0.1"},{"namespace":"my/namespace","value":""}]}'
+	{"message":"partial","written":1,"items":[{"index":0,...,"status":"ok","count":2},{"index":1,...,"status":"error","error":"Refusing to write an empty value."}],"errors":[...]}
+
+A failing item does not discard the ones beside it: whatever was accepted is
+kept, and `written` counts it. An item your key may not write fails the same
+way as any other — its `status` is `error` and the rest of the batch still
+lands — so **read `items` rather than the status code** to find out what
+happened to a given entry.
+
+The status describes the batch as a whole:
+
+| status | `message` | when |
+| ------ | --------- | ---- |
+| `200`  | `ok`      | every item landed |
+| `200`  | `partial` | some landed, some did not |
+| `403`  | `failed`  | nothing landed, and every item was refused |
+| `400`  | `failed`  | nothing landed, for reasons that were not all refusals |
+
+### Checking a batch first
+
+`/vwb` is a dry run of `/wb`. It takes the same body and answers what `/wb`
+would have answered for it — the same status, the same `message`, the same
+`status` and `error` on every item — and records nothing at all:
+
+	$ curl -k -X POST https://localhost:9999/vwb -H 'Content-Type: application/json' \
+	    -d '{"items":[{"namespace":"my/namespace","value":"127.0.0.1"},{"namespace":"my/namespace","value":""}]}'
+	{"message":"partial","writable":1,"items":[{"index":0,...,"status":"ok"},{"index":1,...,"status":"error","error":"Refusing to write an empty value."}],"errors":[...]}
+
+`writable` rather than `written`, because nothing was. Items carry no `count`
+for the same reason. A `message` of `ok` means the same batch sent to `/wb`
+would be accepted in full.
+
+Both routes decide each item with the same code, so the dry run cannot drift
+into approving something the writer rejects. It is a report, not a reservation:
+the ACL can be rewritten between the two calls, so a batch that validates can
+still be refused when you write it. `/vwb` is for checking a batch *before* you
+commit to it — it does not replace reading the `items` that `/wb` gives back.
+
+It also leaves no trace, which `/wb` cannot: probing with a real write records a
+sighting you then have to live with.
+
+### Which values were rejected
+
+Every write path answers its own caller about a value it would not write — but
+a caller is not always there to read it, and the ZMQ ingest has no caller at
+all. So all of them also record it, and the management interface can be asked
+after the fact:
+
+	$ curl -k -H 'Authorization: changeme' \
+	    'https://localhost:9999/_management/api/rejections?namespace=feeds&limit=5'
+	{"rejections":[{"when":1790263370,"namespace":"feeds/misp/ips","value":"","reason":"Refusing to write an empty value.","source":"ingest"}],"total":1,"capacity":1000}
+
+`source` is which path turned it away: `write` (`/w`), `bulkwrite` (`/wb`),
+`management`, or `ingest`. Newest first, filtered to what your key may read.
+`DELETE` the same URL to forget them all, which needs an unscoped key.
+
+The record is **bounded and in memory**. Once `total` reaches `capacity` the
+oldest entries are being dropped to make room, it does not survive a restart,
+and it is deliberately kept out of snapshots, consensus and the STIX export —
+a value that was never written has no business appearing there. It is for
+working out why a feed is failing, not for audit. Set `rejection_log` in
+`[daemon]` to resize it, or to 0 to switch it off.
+
+`/vwb` records nothing here, since it writes nothing — a dry run would
+otherwise let anyone flood the record without writing a thing.
+
+The `errors` array predates `items` and is still sent when there are failures;
+everything in it also appears in `items`.
 
 Authentication
 --------------
@@ -281,6 +367,7 @@ REST Endpoints
 ==============
 	/w: write (GET)
 	/wb: write in bulk mode (POST)
+	/vwb: check a bulk write without recording it (POST)
 	/r: read (GET)
 	/rs: read with statistics (GET)
 	/rb: read in bulk mode (POST)
@@ -294,8 +381,12 @@ REST Endpoints
 	/health: liveness and readiness, no key required (GET)
 	/_api/openapi.yaml: this API as an OpenAPI 3 document (GET)
 
-OpenAPI
-=======
+API reference
+=============
+
+[`doc/routes.md`](doc/routes.md) walks every route with a real request and the
+response it actually returns, including the error cases and what each status
+code means. Start there if you are writing a client by hand.
 
 [`doc/openapi.yaml`](doc/openapi.yaml) describes the whole HTTP API — data,
 STIX, storage and management — as an OpenAPI 3.0.3 document. Import it into
@@ -346,6 +437,7 @@ Beyond the listen address and TLS settings, `[daemon]` accepts:
 	sweep_interval    Seconds between eviction sweeps (default 60). 0 disables the sweeper.
 	stats_retention   Hourly statistics buckets kept per value (default 0 = unlimited).
 	shadow_ttl        Seconds a shadow sighting is kept (default 0 = forever).
+	rejection_log     Rejected values kept in memory (default 1000, 0 = off).
 
 The retention settings default to keeping everything, so upgrading an existing
 install never starts discarding data on its own. The configuration shipped in

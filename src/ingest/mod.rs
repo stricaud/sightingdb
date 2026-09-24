@@ -134,6 +134,15 @@ async fn consume(
                         Ok(()) => stats.written += 1,
                         Err(e) => {
                             stats.rejected += 1;
+                            // A feed has no caller to answer, so this is the
+                            // only place the rejected value is kept: the log
+                            // line below is off at any normal level.
+                            state.rejections.record(
+                                &sighting.namespace,
+                                &sighting.value,
+                                &e.to_string(),
+                                crate::rejections::Source::Ingest,
+                            );
                             log::debug!(
                                 "ZMQ ingest rejected {}/{}: {e}",
                                 sighting.namespace,

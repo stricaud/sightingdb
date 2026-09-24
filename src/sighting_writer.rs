@@ -32,14 +32,7 @@ pub fn write_tagged(
     ttl: Option<u64>,
     tags: &str,
 ) -> Result<u64, ApiError> {
-    if value.is_empty() {
-        return Err(ApiError::EmptyValue);
-    }
-    // The `_config` tree holds API keys. Letting it be written over HTTP would
-    // let any key holder mint further keys for themselves.
-    if namespace.starts_with(CONFIG_PREFIX) {
-        return Err(ApiError::ConfigNamespace);
-    }
+    check(namespace, value)?;
 
     Ok(db.write_tagged(
         namespace,
@@ -51,6 +44,29 @@ pub fn write_tagged(
         },
         tags,
     ))
+}
+
+/// Everything [`write_tagged`] refuses before it touches the database.
+///
+/// Split out so that the dry run behind `/vwb` can answer "would this be
+/// accepted?" with the very check the writer uses. A validator that is a
+/// second copy of the rules is worse than no validator at all: it drifts, and
+/// then it tells a client yes where the writer says no.
+///
+/// Everything here is decided from the namespace and the value alone, which is
+/// what makes the dry run possible — none of it depends on database state, so
+/// passing this check today means the write is accepted today. It says nothing
+/// about a later write, since the ACL can change underneath it.
+pub fn check(namespace: &str, value: &str) -> Result<(), ApiError> {
+    if value.is_empty() {
+        return Err(ApiError::EmptyValue);
+    }
+    // The `_config` tree holds API keys. Letting it be written over HTTP would
+    // let any key holder mint further keys for themselves.
+    if namespace.starts_with(CONFIG_PREFIX) {
+        return Err(ApiError::ConfigNamespace);
+    }
+    Ok(())
 }
 
 /// Convert a client-supplied Unix timestamp into an instant.

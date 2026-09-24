@@ -57,6 +57,32 @@ impl BrowseQuery {
     }
 }
 
+/// Which rejections to list.
+#[derive(Debug, Deserialize)]
+pub struct RejectionsQuery {
+    /// Only rejections under this namespace, matched as a subtree the way an
+    /// ACL grant is. Absent lists every namespace the key may read.
+    namespace: Option<String>,
+    limit: Option<usize>,
+}
+
+impl RejectionsQuery {
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+    }
+}
+
+/// A page of rejections, and how many are held in total.
+#[derive(Debug, Serialize)]
+pub struct RejectionPage {
+    rejections: Vec<crate::rejections::Rejection>,
+    /// Everything currently kept, not just this page, so the interface can say
+    /// "showing 50 of 1000".
+    total: usize,
+    /// The cap. Once `total` reaches it, the oldest rejections are being lost.
+    capacity: usize,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ValuesQuery {
     namespace: String,
@@ -125,8 +151,22 @@ pub struct NewValues {
 pub struct WriteReport {
     namespace: String,
     written: usize,
+    /// Each value that was recorded, with its running total afterwards.
+    ///
+    /// The count comes back from the write itself, taken under the lock that
+    /// incremented it, so reporting it costs nothing and saves the interface a
+    /// read to find out what a paste actually did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    counts: Vec<ValueCount>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<ValueError>,
+}
+
+/// One recorded value and how often it has now been seen.
+#[derive(Debug, Serialize)]
+pub struct ValueCount {
+    value: String,
+    count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -490,6 +530,73 @@ pub async fn namespaces(
     HttpResponse::Ok().json(page)
 }
 
+/// `GET /_management/api/rejections` — values that were not written.
+///
+/// Newest first, because the question is nearly always "what has just started
+/// failing?". Every write path feeds this, including the ZMQ ingest, which has
+/// no caller of its own to tell.
+///
+/// Filtered by what the key may *read*: a rejection names a namespace and a
+/// value someone tried to put in it, which is not something to hand to a key
+/// that could not have read that namespace anyway.
+pub async fn rejections(
+    state: State,
+    query: web::Query<RejectionsQuery>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let key = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    if let Some(namespace) = &query.namespace
+        && let Err(resp) = require_read(&state, &key, namespace)
+    {
+        return resp;
+    }
+
+    let acl = state.acl();
+    // Over-fetch, then drop what this key may not read, so that filtering does
+    // not silently return a short page.
+    let mut found: Vec<_> = state
+        .rejections
+        .recent(query.namespace.as_deref(), MAX_LIMIT)
+        .into_iter()
+        .filter(|entry| acl.can_read(&key, &entry.namespace))
+        .collect();
+    drop(acl);
+    found.truncate(query.limit());
+
+    HttpResponse::Ok().json(RejectionPage {
+        rejections: found,
+        total: state.rejections.len(),
+        capacity: state.rejections.capacity(),
+    })
+}
+
+/// `DELETE /_management/api/rejections` — forget them all.
+///
+/// How an operator marks a feed as dealt with, so that what shows up next is
+/// new rather than the same thousand entries they have already read.
+pub async fn clear_rejections(state: State, req: HttpRequest) -> HttpResponse {
+    let key = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    // Clearing is all-or-nothing, so it takes a key that could read all of it.
+    if !state.acl().can_read(&key, "") {
+        return HttpResponse::Forbidden().json(Message::new(
+            "Clearing the rejection log needs a key with unscoped read access.",
+        ));
+    }
+
+    let held = state.rejections.len();
+    state.rejections.clear();
+    log::info!("{held} rejection(s) cleared by '{key}'");
+    HttpResponse::Ok().json(Message::new("ok"))
+}
+
 pub async fn values(
     state: State,
     query: web::Query<ValuesQuery>,
@@ -616,17 +723,32 @@ pub async fn add_values(
     let mut report = WriteReport {
         namespace: namespace.clone(),
         written: 0,
+        counts: Vec::with_capacity(values.len()),
         errors: Vec::new(),
     };
     for value in values {
         match crate::sighting_writer::write_tagged(
             &state.db, &namespace, value, when, body.ttl, &body.tags,
         ) {
-            Ok(_) => report.written += 1,
-            Err(e) => report.errors.push(ValueError {
-                value: value.to_string(),
-                error: e.to_string(),
-            }),
+            Ok(count) => {
+                report.written += 1;
+                report.counts.push(ValueCount {
+                    value: value.to_string(),
+                    count,
+                });
+            }
+            Err(e) => {
+                state.rejections.record(
+                    &namespace,
+                    value,
+                    &e.to_string(),
+                    crate::rejections::Source::Management,
+                );
+                report.errors.push(ValueError {
+                    value: value.to_string(),
+                    error: e.to_string(),
+                });
+            }
         }
     }
 
@@ -948,6 +1070,11 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
             web::post().to(create_namespace),
         )
         .route("/_management/api/tree", web::get().to(tree))
+        .route("/_management/api/rejections", web::get().to(rejections))
+        .route(
+            "/_management/api/rejections",
+            web::delete().to(clear_rejections),
+        )
         .route("/_management/api/values", web::get().to(values))
         .route("/_management/api/values", web::post().to(add_values))
         .route("/_management/api/tags", web::post().to(set_tags))
@@ -1008,6 +1135,20 @@ mod tests {
         };
     }
 
+    /// The management routes *and* the data routes, for tests that drive a
+    /// write and then ask the management interface what it made of it.
+    macro_rules! app_with_data {
+        ($state:expr) => {
+            test::init_service(
+                App::new()
+                    .app_data($state.clone())
+                    .configure(routes)
+                    .configure(crate::handlers::routes),
+            )
+            .await
+        };
+    }
+
     /// A GET with an optional key; a macro rather than a function so the
     /// service type does not have to be named.
     macro_rules! get {
@@ -1061,6 +1202,247 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    /// A paste reports what each value now stands at, so the interface does not
+    /// have to read the values back to say what it just did.
+    #[actix_web::test]
+    async fn adding_values_reports_each_running_count() {
+        let st = state();
+        let app = app!(st);
+
+        // `1.2.3.4` is already in `feeds/ips` once, from `state()`.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/values")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({
+                    "namespace": "feeds/ips",
+                    "values": ["1.2.3.4", "fresh", "   "],
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+
+        // The blank line was dropped before anything was tried.
+        assert_eq!(body["written"], 2, "{body}");
+
+        let counts = body["counts"].as_array().unwrap();
+        assert_eq!(counts.len(), 2, "{body}");
+        assert_eq!(counts[0]["value"], "1.2.3.4");
+        assert_eq!(counts[0]["count"], 2, "an existing value was not added to");
+        assert_eq!(counts[1]["value"], "fresh");
+        assert_eq!(counts[1]["count"], 1, "{body}");
+
+        // And the counts are what the database actually holds.
+        assert_eq!(st.db.count("feeds/ips", "1.2.3.4"), 2);
+        assert_eq!(st.db.count("feeds/ips", "fresh"), 1);
+    }
+
+    /// Every write path feeds the rejection log, and the log is what answers
+    /// "which values errored" after the response has gone.
+    #[actix_web::test]
+    async fn rejections_are_listed_newest_first() {
+        let st = state();
+        let app = app_with_data!(st);
+
+        // A rejection from the single-value route, and two from a bulk write.
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/ips?val=x&timestamp=99999999999999")
+                .to_request(),
+        )
+        .await;
+        test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .set_json(serde_json::json!({"items": [
+                    {"namespace": "feeds/ips", "value": ""},
+                    {"namespace": "_config/acl/apikeys/mine", "value": "sneaky"}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        let resp = get!(app, "/_management/api/rejections", Some(ADMIN));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+
+        let found = body["rejections"].as_array().unwrap();
+        assert_eq!(found.len(), 3, "{body}");
+        assert_eq!(body["total"], 3, "{body}");
+        assert_eq!(
+            body["capacity"],
+            crate::rejections::DEFAULT_CAPACITY,
+            "{body}"
+        );
+
+        // Newest first.
+        assert_eq!(found[0]["value"], "sneaky", "{body}");
+        assert_eq!(found[0]["source"], "bulkwrite", "{body}");
+        assert!(
+            found[0]["reason"].as_str().unwrap().contains("_config"),
+            "{body}"
+        );
+
+        // The empty value is kept as itself, which is the whole reason this is
+        // not a namespace of sightings.
+        assert_eq!(found[1]["value"], "", "{body}");
+
+        assert_eq!(found[2]["value"], "x", "{body}");
+        assert_eq!(found[2]["source"], "write", "{body}");
+        assert!(found[2]["when"].as_i64().unwrap() > 0, "{body}");
+    }
+
+    /// A dry run writes nothing, so it must leave no rejections behind either
+    /// — otherwise checking a batch would pollute the record of real failures,
+    /// and anyone could flood it without writing a thing.
+    #[actix_web::test]
+    async fn a_dry_run_records_no_rejections() {
+        let st = state();
+        let app = app_with_data!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/vwb")
+                .set_json(serde_json::json!({"items": [
+                    {"namespace": "feeds/ips", "value": ""}
+                ]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(
+            st.rejections.len(),
+            0,
+            "the dry run left a rejection behind"
+        );
+    }
+
+    /// The management add path guards its namespace before it writes, so it
+    /// cannot currently reach a rejection at all.
+    ///
+    /// Pinned because that is load-bearing for the claim above it: the
+    /// recording wired into `add_values` is unreachable today and kept only so
+    /// that loosening the guard does not silently lose the value. If this test
+    /// starts failing, that path has become live and wants a test of its own.
+    #[actix_web::test]
+    async fn the_management_add_path_rejects_before_it_writes() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/values")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({
+                    "namespace": "_config/acl/apikeys/mine",
+                    "values": ["sneaky"],
+                }))
+                .to_request(),
+        )
+        .await;
+
+        // Turned away by `clean_namespace`, not by the writer.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(st.rejections.len(), 0, "a rejection was recorded after all");
+        assert!(!st.db.namespace_exists("_config/acl/apikeys/mine"));
+    }
+
+    /// A rejection names a namespace and what someone tried to put in it, so a
+    /// key that could not read that namespace must not see it here.
+    #[actix_web::test]
+    async fn rejections_are_filtered_by_what_the_key_may_read() {
+        let st = state();
+        st.rejections
+            .record("feeds/ips", "a", "nope", crate::rejections::Source::Ingest);
+        st.rejections
+            .record("secrets", "b", "nope", crate::rejections::Source::Ingest);
+
+        // An admin key scoped to `feeds` only.
+        st.acl
+            .write()
+            .unwrap()
+            .set("scoped", parse_grants("admin, rw:feeds").unwrap());
+        let app = app!(st);
+
+        let resp = get!(app, "/_management/api/rejections", Some("scoped"));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        let found = body["rejections"].as_array().unwrap();
+
+        assert_eq!(found.len(), 1, "a scoped key saw another subtree: {body}");
+        assert_eq!(found[0]["namespace"], "feeds/ips", "{body}");
+
+        // The full-access key sees both.
+        let resp = get!(app, "/_management/api/rejections", Some(ADMIN));
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["rejections"].as_array().unwrap().len(), 2, "{body}");
+    }
+
+    /// Asking for one subtree must be authorized like any other read of it —
+    /// including the answer, which is `404` rather than `403` throughout the
+    /// management interface so that browsing cannot enumerate what is out of
+    /// reach. See [`require_read`].
+    #[actix_web::test]
+    async fn filtering_by_a_namespace_needs_read_access_to_it() {
+        let st = state();
+        st.acl
+            .write()
+            .unwrap()
+            .set("scoped", parse_grants("admin, rw:feeds").unwrap());
+        let app = app!(st);
+
+        let resp = get!(
+            app,
+            "/_management/api/rejections?namespace=secrets",
+            Some("scoped")
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn rejections_can_be_cleared() {
+        let st = state();
+        st.rejections
+            .record("feeds/ips", "a", "nope", crate::rejections::Source::Ingest);
+        st.acl
+            .write()
+            .unwrap()
+            .set("scoped", parse_grants("admin, rw:feeds").unwrap());
+        let app = app!(st);
+
+        // A scoped key cannot clear what it cannot wholly see.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/_management/api/rejections")
+                .insert_header(("Authorization", "scoped"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(st.rejections.len(), 1);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/_management/api/rejections")
+                .insert_header(("Authorization", ADMIN))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(st.rejections.len(), 0);
     }
 
     #[actix_web::test]

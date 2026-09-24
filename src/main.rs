@@ -11,6 +11,7 @@ mod handlers;
 mod ingest;
 mod maintenance;
 mod persistence;
+mod rejections;
 mod setup;
 mod sighting_reader;
 mod sighting_writer;
@@ -269,6 +270,7 @@ fn run() -> Result<()> {
         tiers_file: settings.tiers_file.clone(),
         stix: settings.stix.clone(),
         started: std::time::Instant::now(),
+        rejections: rejections::Rejections::new(settings.rejection_log),
     });
 
     let shutdown = Shutdown::new();

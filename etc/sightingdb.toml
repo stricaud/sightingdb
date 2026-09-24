@@ -60,6 +60,13 @@ stats_retention = 720
 # 2592000 is 30 days.
 shadow_ttl = 2_592_000
 
+# How many rejected values to keep in memory, so that
+# /_management/api/rejections can say which values were turned away and why.
+# Bounded on purpose: a misbehaving feed can reject as fast as it can send.
+# The oldest go first once the cap is reached, nothing survives a restart, and
+# 0 switches the record off.
+rejection_log = 1000
+
 # How long each top-level namespace stays in memory.
 #
 #   hot   never evicted

@@ -132,15 +132,35 @@ paths:
           schema: { type: string }
           example: 1.2.3.4
         - $ref: "#/components/parameters/NoShadow"
+        - name: count
+          in: query
+          allowEmptyValue: true
+          description: |
+            Present at any value to answer with how many values the namespace
+            holds instead of the values themselves. O(1): the value map already
+            knows its own length, so nothing is walked.
+
+            Read `exact` on the answer. It is false when the namespace has ever
+            held a TTL — a value stops being visible at expiry but is only
+            removed by the next sweep, so the stored count is an upper bound in
+            between. Nothing fires at the moment of expiry, so this is a
+            property of the design rather than a gap a tighter count would fix.
+
+            Raises no shadow sighting. Cannot be combined with `val`.
+          schema: { type: string }
       responses:
         "200":
-          description: The value, or the whole namespace
+          description: |
+            The value, the whole namespace, or — with `count` — how many values
+            it holds.
           content:
             application/json:
               schema:
                 oneOf:
                   - $ref: "#/components/schemas/Attribute"
                   - $ref: "#/components/schemas/NamespaceView"
+                  - $ref: "#/components/schemas/ValueCount"
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -191,9 +211,19 @@ paths:
       tags: [bulk]
       summary: Record many sightings
       description: |
-        Each item is authorized on its own. A mix of accepted and rejected
-        items answers `200` with `message: partial` and the failures listed;
-        everything failing answers `400`.
+        Each item is authorized and recorded on its own, and `items` reports
+        the outcome of every one of them in request order. An item that fails
+        does not discard the items beside it: the sightings that were accepted
+        are kept, and a successful item carries the value's resulting `count`.
+
+        An item your key may not write fails like any other item: its `status`
+        is `error`, and the items beside it are still recorded. A refusal is
+        therefore reported in `items`, not in the status code, so read `items`
+        rather than the status to find out what happened.
+
+        The status describes the batch: `200` with `message: ok` when every
+        item landed, `200` with `message: partial` when some did, and — when
+        nothing did — `403` if every item was refused, or `400` otherwise.
       requestBody:
         required: true
         content:
@@ -215,11 +245,74 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/BulkWriteResponse" }
         "400":
-          description: Nothing could be recorded
+          description: |
+            Nothing could be recorded, for reasons that were not all refusals.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/BulkWriteResponse" }
-        "403": { $ref: "#/components/responses/Forbidden" }
+        "403":
+          description: |
+            Nothing was recorded and every item was refused. A batch in which
+            only *some* items were refused answers `200`, with the refusals in
+            `items`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BulkWriteResponse" }
+
+  /vwb:
+    post:
+      tags: [bulk]
+      summary: Check a bulk write without recording it
+      description: |
+        A dry run of `/wb`. Takes the same body and answers what `/wb` would
+        have answered for it — the same status code, the same `message`, and
+        the same `status` and `error` on every item — without recording a
+        single sighting.
+
+        Use it to check a batch before committing to it: `message: ok` here
+        means the same batch sent to `/wb` is accepted in full. The response
+        field is `writable` rather than `written`, because nothing was.
+
+        Both routes decide each item with the same code, so the preview cannot
+        drift from the writer. It is a report, not a reservation: the ACL can
+        be rewritten between the two calls, so a batch that validates can still
+        be refused when it is written. Read the `items` that `/wb` itself
+        returns to learn what actually happened.
+
+        Items report no `count`, since nothing was counted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BulkRequest" }
+            example:
+              items:
+                - namespace: feeds/misp/ips
+                  value: 1.2.3.4
+                  tags: stix-type:ipv4-addr,tlp:amber
+                - namespace: feeds/misp/domains
+                  value: evil.example
+      responses:
+        "200":
+          description: |
+            The batch was checked. Every item is writable (`message: ok`), or
+            only some are (`message: partial`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BulkValidateResponse" }
+        "400":
+          description: |
+            No item is writable, for reasons that were not all refusals.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BulkValidateResponse" }
+        "403":
+          description: |
+            No item is writable and every one of them was refused.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BulkValidateResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
   /rb:
     post:
@@ -551,6 +644,70 @@ paths:
                         type: array
                         items: { $ref: "#/components/schemas/TreeEntry" }
 
+  /_management/api/rejections:
+    get:
+      tags: [management]
+      summary: Values that were not written
+      description: |
+        Every write path records what it turned away here — `/w`, `/wb`, the
+        management interface, and the ZMQ ingest, which has no caller of its
+        own to tell. It answers "which values errored?" after the response that
+        reported them has gone.
+
+        Newest first. Entries are filtered by what the key may *read*: a
+        rejection names a namespace and a value someone tried to put in it.
+
+        The record is bounded and held in memory: once `total` reaches
+        `capacity`, the oldest entries are being dropped to make room. It does
+        not survive a restart and is not written to snapshots — it is for
+        diagnosis, not evidence. The cap is `rejection_log` in `[daemon]`, and
+        0 switches it off.
+
+        `/vwb` records nothing here, since it writes nothing.
+      parameters:
+        - name: namespace
+          in: query
+          description: |
+            Only rejections under this namespace, matched as a subtree. Needs
+            read access to it, and answers `404` if the key has none.
+          schema: { type: string }
+          example: feeds/misp
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        "200":
+          description: The most recent rejections this key may see
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rejections:
+                    type: array
+                    items: { $ref: "#/components/schemas/Rejection" }
+                  total:
+                    type: integer
+                    description: How many are held in all, not just on this page.
+                  capacity:
+                    type: integer
+                    description: |
+                      The cap. Once `total` reaches it, the oldest rejections
+                      are being lost.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [management]
+      summary: Forget every rejection
+      description: |
+        Clears the record, which is how an operator marks a feed as dealt with.
+        All-or-nothing, so it needs a key with unscoped read access.
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
   /_management/api/values:
     get:
       tags: [management]
@@ -608,8 +765,24 @@ paths:
                 properties:
                   namespace: { type: string }
                   written: { type: integer }
+                  counts:
+                    type: array
+                    description: |
+                      Each value that was recorded, with its running total
+                      afterwards — the same number `/w` answers with. Omitted
+                      when nothing was recorded.
+                    items:
+                      type: object
+                      properties:
+                        value: { type: string }
+                        count: { type: integer, format: int64 }
                   errors:
                     type: array
+                    description: |
+                      The values that were rejected; omitted when there are
+                      none. Blank lines are dropped before anything is tried,
+                      so in practice a rejection here is a property of the
+                      namespace and applies to every value in the request.
                     items:
                       type: object
                       properties:
@@ -1001,14 +1174,115 @@ components:
           type: string
           enum: [ok, partial, failed]
         written: { type: integer }
+        items:
+          type: array
+          description: |
+            One entry per request item, in request order, so an outcome can be
+            matched back onto what was sent even when a value repeats.
+          items: { $ref: "#/components/schemas/BulkWriteItem" }
         errors:
           type: array
+          description: |
+            The failures alone. Predates `items` and is kept for clients that
+            read it; every entry here also appears in `items`. Omitted when
+            there are none.
           items:
             type: object
             properties:
               namespace: { type: string }
               value: { type: string }
               error: { type: string }
+
+    ValueCount:
+      type: object
+      description: How many values a namespace holds, for `/r/{namespace}?count`.
+      properties:
+        namespace: { type: string }
+        values:
+          type: integer
+          description: How many values are stored.
+        exact:
+          type: boolean
+          description: |
+            Whether `values` is the number a reader would see. False when the
+            namespace has ever held a TTL, in which case `values` is an upper
+            bound: expired values stay stored until the next sweep. Sticky —
+            once a TTL has been seen this stays false, so it errs towards
+            claiming less.
+        paged_in:
+          type: boolean
+          description: |
+            Whether answering had to read an evicted shard back into memory.
+
+    Rejection:
+      type: object
+      description: One value that was not written, and why.
+      properties:
+        when:
+          type: integer
+          format: int64
+          description: Unix seconds.
+        namespace: { type: string }
+        value:
+          type: string
+          description: |
+            The value as it arrived — which, for the commonest rejection of
+            all, is the empty string.
+        reason:
+          type: string
+          description: Why it was turned away, in the words the caller was given.
+        source:
+          type: string
+          enum: [write, bulkwrite, management, ingest]
+          description: Which write path turned it away.
+
+    BulkValidateResponse:
+      type: object
+      description: |
+        What `/vwb` found. The same shape as `BulkWriteResponse`, except that
+        `written` is `writable` — a count of what *would* be recorded — and no
+        item carries a `count`, because nothing was counted.
+      properties:
+        message:
+          type: string
+          enum: [ok, partial, failed]
+        writable:
+          type: integer
+          description: How many items would be recorded. Nothing has been.
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/BulkWriteItem" }
+        errors:
+          type: array
+          description: The unwritable items alone; omitted when there are none.
+          items:
+            type: object
+            properties:
+              namespace: { type: string }
+              value: { type: string }
+              error: { type: string }
+
+    BulkWriteItem:
+      type: object
+      properties:
+        index:
+          type: integer
+          description: Position of this item in the request.
+        namespace: { type: string }
+        value: { type: string }
+        status:
+          type: string
+          enum: [ok, error]
+        count:
+          type: integer
+          format: int64
+          description: |
+            The running total for this value after the sighting, taken under
+            the same lock that incremented it. Present only when `status` is
+            `ok`, and it removes the need for a follow-up read.
+        error:
+          type: string
+          description: Present only when `status` is `error`.
 
     ExportRequest:
       type: object

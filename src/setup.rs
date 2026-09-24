@@ -177,6 +177,11 @@ impl Plan {
         let _ = writeln!(out, "# 30 days of hourly statistics per value.");
         let _ = writeln!(out, "stats_retention = 720");
         let _ = writeln!(out, "shadow_ttl = 2_592_000");
+        let _ = writeln!(
+            out,
+            "# Rejected values kept for /_management/api/rejections."
+        );
+        let _ = writeln!(out, "rejection_log = 1000");
         let _ = writeln!(out, "\nacl_file = \"{}\"", self.acl_path.display());
         let _ = writeln!(out, "\n[storage]");
         let _ = writeln!(out, "default_tier = \"hot\"");

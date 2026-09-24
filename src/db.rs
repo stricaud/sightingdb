@@ -186,6 +186,25 @@ impl EvictReport {
     }
 }
 
+/// How many values a namespace holds.
+///
+/// Answered from the map's own length rather than by walking it, so the cost
+/// does not grow with the namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ValueCount {
+    pub values: usize,
+    /// Whether `values` is the number a reader would see.
+    ///
+    /// False when the namespace has ever held a TTL. A value stops being
+    /// visible the moment it expires, but is only removed when the sweeper
+    /// next runs, so between those two moments the stored count is an upper
+    /// bound. Nothing fires at the moment of expiry, so this is a property of
+    /// the design rather than something a tighter count could fix.
+    pub exact: bool,
+    /// Whether answering this had to read the shard back into memory.
+    pub paged_in: bool,
+}
+
 /// What a sweep reclaimed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -399,6 +418,27 @@ impl Namespace {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .is_empty()
+    }
+
+    /// How many values are stored here.
+    ///
+    /// O(1): the map already keeps this, so nothing has to be counted. It is
+    /// the number *stored*, which is the number visible only when nothing here
+    /// can expire — see [`Namespace::has_ttl`].
+    fn len(&self) -> usize {
+        self.values
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether anything here was ever given a TTL.
+    ///
+    /// Sticky: it stays set once a TTL has been seen, even if that value has
+    /// since gone. Erring this way is deliberate — it makes [`Namespace::len`]
+    /// claim to be exact only when it certainly is.
+    fn has_ttl(&self) -> bool {
+        self.has_ttl.load(Ordering::Relaxed)
     }
 }
 
@@ -1045,6 +1085,29 @@ impl Database {
     /// Only the page's attributes are cloned. The sort is still O(n log n) over
     /// the namespace, which is the price of stable paging over a hash map — a
     /// namespace with millions of values will feel it.
+    /// How many values `namespace` holds, without walking them.
+    ///
+    /// Returns `None` if there is no such namespace. A resident namespace is
+    /// answered from memory; an evicted one is read back in first, and says so
+    /// in [`ValueCount::paged_in`] so a caller can see what the answer cost.
+    pub fn value_count(&self, namespace: &str) -> Option<ValueCount> {
+        // Asking about a namespace is a use of it, the same as reading one.
+        self.touch(crate::persistence::shard_of(namespace));
+
+        let (ns, paged_in) = match self.resident(namespace) {
+            Some(ns) => (ns, false),
+            // Not in memory: `namespace` pages the shard in, or answers None
+            // if the catalogue has never heard of it.
+            None => (self.namespace(namespace)?, true),
+        };
+
+        Some(ValueCount {
+            values: ns.len(),
+            exact: !ns.has_ttl(),
+            paged_in,
+        })
+    }
+
     pub fn value_page(
         &self,
         namespace: &str,
@@ -1847,6 +1910,56 @@ mod tests {
         let found = db.sightings_of("1.2.3.4", 2, |_| true);
         assert_eq!(found.items.len(), 2);
         assert!(found.truncated);
+    }
+
+    /// The count must not grow more expensive as the namespace does — that is
+    /// the whole reason it reads the map's length instead of walking it.
+    ///
+    /// A timing test rather than an assertion about the code, because the
+    /// property that matters is the cost, and a later change could reintroduce
+    /// a walk without changing any of the values this returns.
+    #[test]
+    fn counting_does_not_get_slower_as_a_namespace_grows() {
+        let db = Database::default();
+
+        for n in 0..1_000 {
+            db.write("small", &format!("v{n}"), Utc::now(), WriteOpts::default());
+        }
+        for n in 0..200_000 {
+            db.write("big", &format!("v{n}"), Utc::now(), WriteOpts::default());
+        }
+
+        assert_eq!(db.value_count("small").unwrap().values, 1_000);
+        assert_eq!(db.value_count("big").unwrap().values, 200_000);
+
+        // Warm both paths before timing either.
+        for _ in 0..100 {
+            db.value_count("small");
+            db.value_count("big");
+        }
+
+        let small = {
+            let at = std::time::Instant::now();
+            for _ in 0..1_000 {
+                std::hint::black_box(db.value_count("small"));
+            }
+            at.elapsed()
+        };
+        let big = {
+            let at = std::time::Instant::now();
+            for _ in 0..1_000 {
+                std::hint::black_box(db.value_count("big"));
+            }
+            at.elapsed()
+        };
+
+        // 200x the values. A walk would show it plainly; the generous bound is
+        // there so that a loaded machine cannot fail this spuriously.
+        assert!(
+            big < small * 10,
+            "counting 200000 values took {big:?} against {small:?} for 1000 — \
+             this looks like a walk, not a length"
+        );
     }
 
     #[test]
