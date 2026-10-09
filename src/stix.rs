@@ -52,6 +52,42 @@ impl Default for Settings {
     }
 }
 
+/// What to do with a value whose observable type cannot be worked out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Untyped {
+    /// Leave it out and report it in [`Export::skipped`].
+    ///
+    /// The default, and what every release before this one did: an indicator
+    /// whose pattern a consumer cannot match on is worse than a short bundle.
+    #[default]
+    Skip,
+    /// Export it as [`UNTYPED_TYPE`], flagged so a consumer can tell it from a
+    /// value whose type is actually known.
+    Include,
+}
+
+/// The observable type an untyped value is exported as.
+///
+/// STIX 2.1 has no "just text" observable, and the specification requires a
+/// custom type to carry an `x-` prefix. Naming our own rather than borrowing
+/// something close — `artifact`, say — is what keeps the bundle honest: a
+/// consumer is told this is a value SightingDB could not classify, instead of
+/// being handed a pattern that claims something false about it.
+///
+/// [`pattern_for`] needs no special case: an unrecognised type already matches
+/// on `value`, which gives `[x-sightingdb-value:value = '...']`.
+pub const UNTYPED_TYPE: &str = "x-sightingdb-value";
+
+/// A value's observable type, and whether it had to be guessed at.
+struct Typing {
+    observable: String,
+    /// True when nothing identified this value and [`UNTYPED_TYPE`] was used.
+    /// An explicit `stix-type:x-sightingdb-value` tag is *not* a fallback —
+    /// someone said that on purpose.
+    fallback: bool,
+}
+
 /// A finished bundle, with what had to be left out of it.
 #[derive(Debug, Clone)]
 pub struct Export {
@@ -59,7 +95,13 @@ pub struct Export {
     pub exported: usize,
     /// Values whose observable type could not be worked out. A STIX indicator
     /// is a pattern, and there is no pattern without a type.
+    ///
+    /// Always empty under [`Untyped::Include`], which exports these instead.
     pub skipped: Vec<String>,
+    /// How many of `exported` went out as [`UNTYPED_TYPE`] because nothing
+    /// identified them. Reported so a caller can say what it actually got
+    /// rather than implying every indicator is a recognised observable.
+    pub untyped: usize,
     /// The namespace holds more values than the export was allowed to read.
     pub truncated: bool,
     /// Namespaces asked for that do not exist.
@@ -126,6 +168,18 @@ pub fn bundle(
     default_type: Option<&str>,
     settings: &Settings,
 ) -> Export {
+    bundle_with(namespace, values, default_type, settings, Untyped::Skip)
+}
+
+/// The same, choosing what happens to values nothing could identify.
+#[cfg(test)]
+pub fn bundle_with(
+    namespace: &str,
+    values: &[AttributeView],
+    default_type: Option<&str>,
+    settings: &Settings,
+    untyped: Untyped,
+) -> Export {
     bundle_of(
         &[Part {
             namespace,
@@ -133,6 +187,7 @@ pub fn bundle(
             default_type,
         }],
         settings,
+        untyped,
     )
 }
 
@@ -142,7 +197,7 @@ pub fn bundle(
 /// same value in two namespaces has one indicator between them and a sighting
 /// each, so a consumer sees a value sighted twice rather than two unrelated
 /// indicators.
-pub fn bundle_of(parts: &[Part<'_>], settings: &Settings) -> Export {
+pub fn bundle_of(parts: &[Part<'_>], settings: &Settings, untyped: Untyped) -> Export {
     let author = identity(&settings.identity, &settings.identity_class);
     let author_id = author["id"].as_str().unwrap_or_default().to_string();
 
@@ -153,11 +208,16 @@ pub fn bundle_of(parts: &[Part<'_>], settings: &Settings) -> Export {
     let mut markings: Vec<&str> = Vec::new();
     let mut skipped = Vec::new();
     let mut exported = 0;
+    let mut untyped_count = 0;
 
     for part in parts {
         let (namespace, default_type) = (part.namespace, part.default_type);
         for view in part.values {
-            let Some(observable) = observable_type(view, default_type) else {
+            let Some(Typing {
+                observable,
+                fallback,
+            }) = observable_type(view, default_type, untyped)
+            else {
                 skipped.push(view.value.clone());
                 continue;
             };
@@ -201,6 +261,7 @@ pub fn bundle_of(parts: &[Part<'_>], settings: &Settings) -> Export {
                 &pattern,
                 &author_id,
                 &marking_refs,
+                fallback,
             ));
             objects.push(sighting(
                 namespace,
@@ -212,6 +273,9 @@ pub fn bundle_of(parts: &[Part<'_>], settings: &Settings) -> Export {
                 &marking_refs,
             ));
             exported += 1;
+            if fallback {
+                untyped_count += 1;
+            }
         }
     }
 
@@ -247,6 +311,7 @@ pub fn bundle_of(parts: &[Part<'_>], settings: &Settings) -> Export {
             "id": format!("bundle--{}", uuid_for(&format!("bundle:{}", key.join(",")))),
             "objects": objects,
         }),
+        untyped: untyped_count,
         exported,
         skipped,
     }
@@ -262,8 +327,16 @@ pub fn export_namespace(
     settings: &crate::config::StixSettings,
     namespace: &str,
     limit: usize,
+    untyped: Untyped,
 ) -> Option<Export> {
-    let mut export = export_namespaces(db, settings, std::slice::from_ref(&namespace), "", limit);
+    let mut export = export_namespaces(
+        db,
+        settings,
+        std::slice::from_ref(&namespace),
+        "",
+        limit,
+        untyped,
+    );
     (export.missing.is_empty()).then(|| {
         export.missing = Vec::new();
         export
@@ -282,6 +355,7 @@ pub fn export_namespaces(
     namespaces: &[&str],
     filter: &str,
     limit: usize,
+    untyped: Untyped,
 ) -> Export {
     let mut pages = Vec::with_capacity(namespaces.len());
     let mut missing = Vec::new();
@@ -306,7 +380,7 @@ pub fn export_namespaces(
         })
         .collect();
 
-    let mut export = bundle_of(&parts, &settings.export);
+    let mut export = bundle_of(&parts, &settings.export, untyped);
     export.truncated = truncated;
     export.missing = missing;
     export
@@ -314,14 +388,33 @@ pub fn export_namespaces(
 
 /// What kind of observable a value is: what its tags say, else what the
 /// namespace is configured to hold, else what the value looks like.
-fn observable_type(view: &AttributeView, default_type: Option<&str>) -> Option<String> {
+fn observable_type(
+    view: &AttributeView,
+    default_type: Option<&str>,
+    untyped: Untyped,
+) -> Option<Typing> {
+    let known = |observable: String| Typing {
+        observable,
+        fallback: false,
+    };
+
     if let Some(tagged) = tag_value(&view.tags, "stix-type") {
-        return Some(tagged.to_string());
+        return Some(known(tagged.to_string()));
     }
     if let Some(configured) = default_type {
-        return Some(configured.to_string());
+        return Some(known(configured.to_string()));
     }
-    infer_type(&view.value).map(str::to_string)
+    if let Some(inferred) = infer_type(&view.value) {
+        return Some(known(inferred.to_string()));
+    }
+
+    match untyped {
+        Untyped::Skip => None,
+        Untyped::Include => Some(Typing {
+            observable: UNTYPED_TYPE.to_string(),
+            fallback: true,
+        }),
+    }
 }
 
 /// Recognise the common observables by shape.
@@ -412,6 +505,7 @@ fn indicator(
     pattern: &str,
     author: &str,
     markings: &[Value],
+    fallback: bool,
 ) -> Value {
     let mut object = Map::new();
     object.insert("type".into(), "indicator".into());
@@ -437,6 +531,12 @@ fn indicator(
 
     object.insert("pattern".into(), pattern.into());
     object.insert("pattern_type".into(), "stix".into());
+
+    // Said on the object rather than left to be inferred from the type: a
+    // consumer filtering these out should not have to know our type name.
+    if fallback {
+        object.insert("x_sightingdb_untyped".into(), true.into());
+    }
     object.insert("valid_from".into(), rfc3339(view.first_seen).into());
 
     // A TTL is exactly a validity window: the value stops being visible here
@@ -859,6 +959,104 @@ mod tests {
             patterns.contains(&"[ipv4-addr:value = '1.2.3.4']"),
             "{patterns:?}"
         );
+    }
+
+    /// Asked to export everything, a value nothing could identify goes out as
+    /// our own custom type rather than being left behind or misfiled as
+    /// something it is not.
+    #[test]
+    fn untyped_values_are_exported_as_a_custom_type_when_asked_for() {
+        let export = bundle_with(
+            "feeds/notes",
+            &[view("whatever this is", ""), view("1.2.3.4", "")],
+            None,
+            &Settings::default(),
+            Untyped::Include,
+        );
+
+        assert_eq!(export.exported, 2);
+        assert!(export.skipped.is_empty(), "{:?}", export.skipped);
+        // Only the unidentifiable one counts as untyped.
+        assert_eq!(export.untyped, 1);
+
+        let indicators = objects_of(&export, "indicator");
+        let patterns: Vec<&str> = indicators
+            .iter()
+            .map(|object| object["pattern"].as_str().unwrap())
+            .collect();
+        assert!(
+            patterns.contains(&"[x-sightingdb-value:value = 'whatever this is']"),
+            "{patterns:?}"
+        );
+        // The recognised value is untouched by the mode.
+        assert!(
+            patterns.contains(&"[ipv4-addr:value = '1.2.3.4']"),
+            "{patterns:?}"
+        );
+
+        // A consumer filtering these out should not need to know our type
+        // name, so the flag is on the object.
+        let untyped: Vec<&Value> = indicators
+            .iter()
+            .filter(|object| object["x_sightingdb_untyped"] == Value::Bool(true))
+            .copied()
+            .collect();
+        assert_eq!(untyped.len(), 1, "{indicators:#?}");
+        assert_eq!(
+            untyped[0]["pattern"],
+            "[x-sightingdb-value:value = 'whatever this is']"
+        );
+
+        // And the identified one carries no such flag at all.
+        let typed: Vec<&Value> = indicators
+            .iter()
+            .filter(|object| object["pattern"] == "[ipv4-addr:value = '1.2.3.4']")
+            .copied()
+            .collect();
+        assert!(
+            typed[0]["x_sightingdb_untyped"].is_null(),
+            "{:#?}",
+            typed[0]
+        );
+    }
+
+    /// Saying `stix-type:x-sightingdb-value` on purpose is not a fallback, and
+    /// must not be reported as one — otherwise the count of "things we could
+    /// not identify" includes things someone identified deliberately.
+    #[test]
+    fn an_explicit_custom_type_is_not_counted_as_a_fallback() {
+        let export = bundle_with(
+            "feeds/notes",
+            &[view("deliberate", "stix-type:x-sightingdb-value")],
+            None,
+            &Settings::default(),
+            Untyped::Include,
+        );
+
+        assert_eq!(export.exported, 1);
+        assert_eq!(export.untyped, 0, "an explicit type was called a fallback");
+        let indicators = objects_of(&export, "indicator");
+        assert!(
+            indicators[0]["x_sightingdb_untyped"].is_null(),
+            "{:#?}",
+            indicators[0]
+        );
+    }
+
+    /// The default must not change: a caller that has always got a short
+    /// bundle keeps getting one.
+    #[test]
+    fn skipping_is_still_the_default() {
+        let values = [view("whatever this is", "")];
+        let settings = Settings::default();
+
+        let default = bundle("feeds/notes", &values, None, &settings);
+        let explicit = bundle_with("feeds/notes", &values, None, &settings, Untyped::Skip);
+
+        assert_eq!(default.exported, 0);
+        assert_eq!(default.untyped, 0);
+        assert_eq!(default.skipped, explicit.skipped);
+        assert_eq!(default.bundle, explicit.bundle);
     }
 
     #[test]

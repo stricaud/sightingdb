@@ -150,6 +150,10 @@ pub struct ExportRequest {
     #[serde(default)]
     pub q: String,
     pub limit: Option<usize>,
+    /// What to do with values whose observable type cannot be worked out.
+    /// Defaults to leaving them out, which is what this route has always done.
+    #[serde(default)]
+    pub untyped: crate::stix::Untyped,
 }
 
 impl ExportRequest {
@@ -173,9 +177,20 @@ impl ExportRequest {
 #[derive(Debug, Deserialize)]
 pub struct ExportQuery {
     limit: Option<usize>,
+    /// `include` exports values nothing could identify; anything else, or
+    /// absent, leaves them out. Absent is the default so that an existing
+    /// caller's bundle does not change shape under it.
+    untyped: Option<String>,
 }
 
 impl ExportQuery {
+    fn untyped(&self) -> crate::stix::Untyped {
+        match self.untyped.as_deref() {
+            Some("include") => crate::stix::Untyped::Include,
+            _ => crate::stix::Untyped::Skip,
+        }
+    }
+
     /// Two objects per value plus the identities: a bundle is read by a
     /// machine, but it is still one response held in memory.
     fn limit(&self) -> usize {
@@ -647,9 +662,13 @@ pub async fn export_stix(
         return error_response(&ApiError::ConfigNamespace);
     }
 
-    let Some(export) =
-        crate::stix::export_namespace(&state.db, &state.stix, &namespace, query.limit())
-    else {
+    let Some(export) = crate::stix::export_namespace(
+        &state.db,
+        &state.stix,
+        &namespace,
+        query.limit(),
+        query.untyped(),
+    ) else {
         return error_response(&ApiError::NotFound(NotFound::namespace(&namespace, "")));
     };
 
@@ -683,8 +702,14 @@ pub async fn export_stix_api(
     }
 
     let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
-    let export =
-        crate::stix::export_namespaces(&state.db, &state.stix, &names, &body.q, body.limit());
+    let export = crate::stix::export_namespaces(
+        &state.db,
+        &state.stix,
+        &names,
+        &body.q,
+        body.limit(),
+        body.untyped,
+    );
 
     // Nothing asked for exists: that is a mistake worth reporting rather than
     // an empty bundle to be puzzled over.
@@ -702,6 +727,7 @@ fn stix_response(export: crate::stix::Export) -> HttpResponse {
     response
         .insert_header(("X-SightingDB-Exported", export.exported.to_string()))
         .insert_header(("X-SightingDB-Skipped", export.skipped.len().to_string()))
+        .insert_header(("X-SightingDB-Untyped", export.untyped.to_string()))
         .insert_header(("X-SightingDB-Truncated", export.truncated.to_string()))
         .content_type("application/stix+json;version=2.1");
     if !export.missing.is_empty() {
@@ -1383,6 +1409,67 @@ mod tests {
         assert!(
             body["message"].as_str().unwrap().contains("namespace"),
             "{body}"
+        );
+    }
+
+    /// The export routes must honour the choice, and say what they did in the
+    /// headers the page reads.
+    #[actix_web::test]
+    async fn the_stix_routes_can_be_asked_to_export_untyped_values() {
+        let st = state(false);
+        let app = app!(st);
+
+        for uri in ["/w/notes?val=1.2.3.4", "/w/notes?val=whatever%20this%20is"] {
+            test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        }
+
+        // Default: the unidentifiable value is left out and reported.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/stix/notes").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("X-SightingDB-Exported").unwrap(),
+            "1",
+            "default should export only the recognised value"
+        );
+        assert_eq!(resp.headers().get("X-SightingDB-Skipped").unwrap(), "1");
+        assert_eq!(resp.headers().get("X-SightingDB-Untyped").unwrap(), "0");
+
+        // Asked for everything: both go, and the fallback is counted.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/notes?untyped=include")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "2");
+        assert_eq!(resp.headers().get("X-SightingDB-Skipped").unwrap(), "0");
+        assert_eq!(resp.headers().get("X-SightingDB-Untyped").unwrap(), "1");
+
+        // And the same through the POST route, which takes it in the body.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespace": "notes", "untyped": "include"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.headers().get("X-SightingDB-Untyped").unwrap(), "1");
+        let body: Value = test::read_body_json(resp).await;
+        let patterns: Vec<&str> = body["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["pattern"].as_str())
+            .collect();
+        assert!(
+            patterns.contains(&"[x-sightingdb-value:value = 'whatever this is']"),
+            "{patterns:?}"
         );
     }
 

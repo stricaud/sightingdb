@@ -380,6 +380,15 @@ paths:
         response headers say how many that was.
       parameters:
         - $ref: "#/components/parameters/Namespace"
+        - name: untyped
+          in: query
+          description: |
+            `include` also exports values whose observable type could not be
+            worked out, as `x-sightingdb-value` and flagged
+            `x_sightingdb_untyped`. Absent, or anything else, leaves them out
+            and counts them in `X-SightingDB-Skipped` — which is what this
+            route has always done.
+          schema: { type: string, enum: [skip, include] }
         - name: limit
           in: query
           description: Values read, 10000 by default and 100000 at most.
@@ -1294,6 +1303,16 @@ components:
         namespaces:
           type: array
           items: { type: string }
+        untyped:
+          type: string
+          enum: [skip, include]
+          default: skip
+          description: |
+            What to do with a value whose observable type cannot be worked out.
+            `skip` leaves it out and reports it; `include` exports it as
+            `x-sightingdb-value`, flagged `x_sightingdb_untyped` so a consumer
+            can filter. STIX 2.1 has no plain-text observable, so this is a
+            custom type rather than a standard one.
         q:
           type: string
           description: Substring filter over values.

@@ -21,7 +21,7 @@ Contents
 - [Conventions](#conventions)
 - [Sightings](#sightings) — `/w` `/r` `/r?count` `/rs` `/d`
 - [Bulk](#bulk) — `/wb` `/vwb` `/rb` `/rbs`
-- [STIX export](#stix-export) — `/stix` `/_api/stix`
+- [STIX export](#stix-export) — `/stix` `/_api/stix`, and [untyped values](#values-with-no-observable-type)
 - [Storage](#storage) — `/_api/tier`
 - [Service](#service) — `/health` `/i` `/` `/_api/openapi.yaml` `/c`
 - [Management interface](#management-interface) — `/_management/*`
@@ -382,6 +382,62 @@ namespace travels as `x_sightingdb_namespace`. A `tlp:` tag becomes a
 `?limit=<n>` caps how many values go into the bundle — default 10000, clamped
 to 100000. A bundle is read by a machine, but it is still one response held in
 memory.
+
+### Values with no observable type
+
+A STIX indicator *is* a pattern, and there is no pattern without a type. By
+default a value whose type cannot be worked out — not an address, domain, URL,
+hash or email address, and carrying no `stix-type:` tag — is left out and
+counted:
+
+	$ curl -D- -o /dev/null -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X POST http://127.0.0.1:9999/_api/stix \
+	    -d '{"namespace":"feeds/mixed","untyped":"skip"}'
+	x-sightingdb-exported: 2
+	x-sightingdb-skipped: 2
+	x-sightingdb-untyped: 0
+
+`untyped: include` (or `?untyped=include` on `GET /stix/<namespace>`) exports
+them too:
+
+	$ curl -D- -o /dev/null -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X POST http://127.0.0.1:9999/_api/stix \
+	    -d '{"namespace":"feeds/mixed","untyped":"include"}'
+	x-sightingdb-exported: 4
+	x-sightingdb-skipped: 0
+	x-sightingdb-untyped: 2
+
+Those go out as the custom observable `x-sightingdb-value`, each indicator
+carrying `x_sightingdb_untyped: true`:
+
+	{"type":"indicator", "pattern":"[x-sightingdb-value:value = 'whatever this is']",
+	 "pattern_type":"stix", "x_sightingdb_untyped":true, ...}
+
+**Why a custom type.** STIX 2.1 has no plain-text observable, and the
+specification requires a custom type to carry an `x-` prefix. Naming our own
+rather than borrowing something close — `artifact`, say — keeps the bundle
+honest: a consumer is told this is a value SightingDB could not classify,
+instead of being handed a pattern that claims something false about it. Read
+`x_sightingdb_untyped` rather than matching on the type name, so filtering
+does not depend on knowing it.
+
+`skip` stays the default, so an existing caller's bundle does not change shape.
+
+The better fix for a value you care about is to tell SightingDB what it is,
+which also gets you a standard type instead of ours:
+
+	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X POST http://127.0.0.1:9999/_management/api/tags \
+	    -d '{"namespace":"feeds/mixed","value":"whatever this is","tags":"stix-type:x-threat-note, tlp:green"}'
+	{"value":"whatever this is",...,"tags":"stix-type:x-threat-note,tlp:green",...}
+
+It is then exported even in `skip` mode, under the type you gave it, and is
+*not* counted as untyped — someone said what it was on purpose:
+
+	   [x-threat-note:value = 'whatever this is'] | untyped flag: None
+
+The management interface has a Tags column on the values list for exactly this,
+and an Observable column beside it showing which values currently have no type.
 
 ### `POST /_api/stix` — export several namespaces into one bundle
 

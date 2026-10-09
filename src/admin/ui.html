@@ -152,7 +152,7 @@
     <div class="scroll"><table>
       <thead><tr>
         <th>Value</th><th>Count</th><th>First seen</th><th>Last seen</th>
-        <th>Consensus</th><th>TTL</th>
+        <th>Consensus</th><th>TTL</th><th>Observable</th><th>Tags</th>
       </tr></thead>
       <tbody id="v-rows"></tbody>
     </table></div>
@@ -237,6 +237,32 @@
     <div class="row">
       <button type="submit">Create</button>
       <button type="button" id="nn-cancel">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="export-editor">
+  <form method="dialog" id="export-form">
+    <h2 style="margin-top:0;font-size:1.05rem">Export STIX</h2>
+    <p class="muted" id="x-where"></p>
+
+    <p><label><input type="radio" name="x-untyped" value="skip" checked>
+      <strong>Observables only</strong></label><br>
+      <span class="muted">Values SightingDB can type — addresses, domains,
+      URLs, hashes, email addresses — plus anything carrying a
+      <code>stix-type:</code> tag. Anything else is left out and counted.</span></p>
+
+    <p><label><input type="radio" name="x-untyped" value="include">
+      <strong>Everything</strong></label><br>
+      <span class="muted">The same, plus every remaining value as
+      <code>x-sightingdb-value</code>, flagged <code>x_sightingdb_untyped</code>
+      so a consumer can filter them. STIX 2.1 has no plain-text observable, so
+      this is a custom type rather than a standard one.</span></p>
+
+    <p class="err" id="x-error"></p>
+    <div class="row">
+      <button type="submit">Export</button>
+      <button type="button" id="x-cancel">Cancel</button>
     </div>
   </form>
 </dialog>
@@ -714,6 +740,22 @@ async function loadValues() {
         }
         tr.append(td);
       }
+
+      // What the export will make of this value, and the tags that decide it.
+      // Side by side on purpose: the column that tells you a value has no
+      // observable type is next to the one you fix it in.
+      const observable = document.createElement("td");
+      const showObservable = () => {
+        const kind = stixTypeOf(item);
+        observable.textContent = kind || "untyped";
+        observable.className = kind ? "kind" : "muted";
+        observable.title = kind
+          ? `Exports as ${kind}`
+          : "No observable type: left out of an observables-only export. "
+            + "Add a stix-type: tag, or export everything.";
+      };
+      showObservable();
+      tr.append(observable, tagCell(item, showObservable));
       return tr;
     }));
 
@@ -970,6 +1012,88 @@ function tagValue(tags, key) {
   return null;
 }
 
+/**
+ * One row's tags, editable in place.
+ *
+ * The same `POST /_management/api/tags` the detail view uses, so a tag set from
+ * the list and one set from the value page cannot behave differently. Replaces
+ * rather than merges, as that route does: this is where a wrong tag comes off.
+ *
+ * `onSaved` redraws whatever else the tags decide — the observable column, so
+ * that tagging a value shows immediately in what the export will call it.
+ */
+function tagCell(item, onSaved) {
+  const td = document.createElement("td");
+  td.className = "actions";
+
+  const show = () => {
+    td.replaceChildren();
+    const shown = document.createElement("span");
+    if (item.tags) {
+      shown.textContent = item.tags;
+      shown.className = "crumbs";
+    } else {
+      shown.textContent = "none";
+      shown.className = "muted";
+    }
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.textContent = "Edit";
+    edit.onclick = form;
+    td.append(shown, " ", edit);
+  };
+
+  const form = () => {
+    td.replaceChildren();
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = item.tags || "";
+    input.size = 26;
+    input.placeholder = "stix-type:ipv4-addr, tlp:amber";
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.textContent = "Save";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "Cancel";
+    cancel.onclick = show;
+
+    const commit = async () => {
+      save.disabled = true;
+      try {
+        const updated = await api("/_management/api/tags", "POST", {
+          namespace: state.namespace,
+          value: item.value,
+          tags: input.value,
+        });
+        // Taken from the response rather than the input, so the row shows what
+        // was actually stored: the server drops repeats and tidies spacing.
+        item.tags = updated.tags || "";
+        setError("");
+        show();
+        onSaved();
+      } catch (e) {
+        setError(e.message);
+        save.disabled = false;
+      }
+    };
+
+    save.onclick = commit;
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commit(); }
+      if (e.key === "Escape") { e.preventDefault(); show(); }
+    };
+
+    td.append(input, " ", save, " ", cancel);
+    input.focus();
+    input.select();
+  };
+
+  show();
+  return td;
+}
+
 /** Replace the tags on the value being shown. */
 async function saveTags() {
   if (!state.namespace || !state.value) return;
@@ -997,18 +1121,27 @@ async function saveTags() {
  * script cannot drift apart. Fetched rather than linked because the export
  * needs the API key, which a plain link cannot carry.
  */
-async function exportStix() {
+function askExportStix() {
   if (!state.namespace) {
     setError("Open a namespace first; the export is per namespace.");
     return;
   }
+  $("x-where").textContent = `/${state.namespace}`;
+  $("x-error").textContent = "";
+  // Observables only each time: the narrower bundle is the one that is always
+  // valid STIX, so choosing the wider one stays a deliberate act.
+  $("export-form").elements["x-untyped"].value = "skip";
+  $("export-editor").showModal();
+}
+
+async function exportStix(untyped) {
   const button = $("ns-export");
   button.disabled = true;
   try {
     const res = await fetch("/_api/stix", {
       method: "POST",
       headers: { Authorization: state.key, "Content-Type": "application/json" },
-      body: JSON.stringify({ namespace: state.namespace }),
+      body: JSON.stringify({ namespace: state.namespace, untyped }),
     });
     if (res.status === 401 || res.status === 403) {
       signOut("That key was not accepted.");
@@ -1021,6 +1154,7 @@ async function exportStix() {
 
     const exported = res.headers.get("X-SightingDB-Exported");
     const skipped = Number(res.headers.get("X-SightingDB-Skipped") || 0);
+    const untypedOut = Number(res.headers.get("X-SightingDB-Untyped") || 0);
     const truncated = res.headers.get("X-SightingDB-Truncated") === "true";
 
     const blob = new Blob([await res.text()], { type: "application/json" });
@@ -1034,7 +1168,12 @@ async function exportStix() {
     // leaving to be noticed in the file.
     const notes = [`Exported ${exported} value(s).`];
     if (skipped) {
-      notes.push(`${skipped} skipped: no observable type, so no pattern — tag them with stix-type:`);
+      notes.push(`${skipped} skipped: no observable type, so no pattern — tag them ` +
+                 `with stix-type: in the Tags column, or export everything.`);
+    }
+    if (untypedOut) {
+      notes.push(`${untypedOut} had no recognisable type and went out as ` +
+                 `x-sightingdb-value.`);
     }
     if (truncated) notes.push("the namespace holds more than one export can carry.");
     setError(notes.length > 1 ? notes.join(" ") : "");
@@ -1327,7 +1466,11 @@ $("nav-config").onclick = showConfig;
 $("ns-up").onclick = () => go(parentOf(state.namespace));
 $("ns-new").onclick = openNamespaceEditor;
 $("ns-add").onclick = openValueEditor;
-$("ns-export").onclick = exportStix;
+$("ns-export").onclick = askExportStix;
+$("x-cancel").onclick = () => $("export-editor").close();
+$("export-form").onsubmit = () => {
+  exportStix($("export-form").elements["x-untyped"].value);
+};
 $("d-save-tags").onclick = saveTags;
 $("nn-cancel").onclick = () => $("ns-editor").close();
 $("nn-name").addEventListener("input", previewNamespace);

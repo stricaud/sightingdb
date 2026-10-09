@@ -780,12 +780,44 @@ was, rather than leaving it to be noticed:
 
 	X-SightingDB-Exported: 412
 	X-SightingDB-Skipped: 3
+	X-SightingDB-Untyped: 0
 	X-SightingDB-Truncated: false
 
 Tag those values with `stix-type:`, or map the namespace in `[stix.types]` so
-the whole namespace has a type. `limit=` caps how many values one export reads
-(10,000 by default, 100,000 at most); `X-SightingDB-Truncated` says when the
-namespace held more.
+the whole namespace has a type. The management interface has a Tags column on
+the values list for this, and an Observable column beside it showing which
+values currently have none.
+
+`limit=` caps how many values one export reads (10,000 by default, 100,000 at
+most); `X-SightingDB-Truncated` says when the namespace held more.
+
+### Exporting everything anyway
+
+To take the whole namespace regardless, add `untyped=include` — `?untyped=include`
+on `GET /stix/<namespace>`, or `"untyped": "include"` in the `POST /_api/stix`
+body. The management interface asks which you want when you press **Export
+STIX**.
+
+Values nothing could identify then go out as the custom observable
+`x-sightingdb-value`, each indicator carrying `x_sightingdb_untyped: true`:
+
+	{"type":"indicator","pattern":"[x-sightingdb-value:value = 'whatever this is']",
+	 "pattern_type":"stix","x_sightingdb_untyped":true, ...}
+
+	X-SightingDB-Exported: 415
+	X-SightingDB-Skipped: 0
+	X-SightingDB-Untyped: 3
+
+STIX 2.1 has no plain-text observable, and the specification requires a custom
+type to carry an `x-` prefix, so this is our own rather than a standard one.
+Naming it rather than borrowing something close — `artifact`, say — is what
+keeps the bundle honest: a consumer is told this is a value SightingDB could
+not classify, instead of being handed a pattern that claims something false
+about it. Filter on `x_sightingdb_untyped` rather than on the type name.
+
+A value carrying `stix-type:` explicitly is never counted as untyped, even
+where that type is `x-sightingdb-value`: someone said what it was on purpose.
+Skipping stays the default, so an existing export does not change shape.
 
 Round trip
 ----------
