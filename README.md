@@ -606,6 +606,20 @@ is translated to a `stix-type:` where there is a one-to-one mapping, so the STIX
 export can build a pattern without knowing anything about MISP. See
 [Tags](#tags).
 
+**Tags on the event are inherited by its attributes**, which is where MISP
+keeps the TLP marking and usually the galaxy and OSINT tags. Reading attribute
+tags alone would lose the marking: a sighting from a `tlp:amber` event would
+arrive unmarked and export unmarked, which is the one kind of loss here that
+could mislead someone about how a value may be shared.
+
+Where the two would contradict each other, the attribute wins and the event's
+is dropped rather than added beside it — a value tagged both `tlp:amber` and
+`tlp:white` says nothing useful. That applies only to taxonomies where one
+value can be true at a time, which today means `tlp:`; most are genuinely
+multi-valued, so an event and an attribute can each contribute a
+`misp-galaxy:` tag and both are kept. An attribute that does not name its own
+event gets `misp-event:` from the event it arrived in.
+
 Attributes are read from `misp_json_attribute`, and from whole events on
 `misp_json` including attributes nested inside objects. Only mapped types are
 ingested unless `default_namespace` is set, MISP's own timestamps are preserved,

@@ -1315,6 +1315,11 @@ impl Database {
     }
 
     /// Whether this server stores `namespace`. See [`StoragePolicy`].
+    /// What this server was configured to store.
+    pub fn stores(&self) -> &StoragePolicy {
+        &self.stores
+    }
+
     pub fn holds(&self, namespace: &str) -> bool {
         self.stores.holds(namespace)
     }

@@ -99,6 +99,71 @@ struct NativeItem {
     timestamp: Option<i64>,
 }
 
+/// What an event says that its attributes inherit.
+///
+/// MISP puts the things that describe a whole report on the *event* — above
+/// all the TLP marking, and usually the galaxy and OSINT tags — and the
+/// attributes underneath carry only what is specific to them. An importer that
+/// reads attribute tags alone therefore loses the marking: a sighting from a
+/// `tlp:amber` event arrives unmarked and exports unmarked, which is the one
+/// kind of data loss here that could mislead someone about how a value may be
+/// shared.
+#[derive(Debug, Default, Clone)]
+struct EventContext {
+    /// The event's own tags, already sanitized.
+    tags: Vec<String>,
+    /// The event id, for attributes that do not name it themselves.
+    id: Option<String>,
+}
+
+impl EventContext {
+    fn of(event: &Value) -> Self {
+        let tags = match event.get("Tag") {
+            Some(Value::Array(tags)) => tags
+                .iter()
+                .filter_map(|tag| tag.get("name").and_then(Value::as_str))
+                .map(sanitize_tag)
+                .collect(),
+            _ => Vec::new(),
+        };
+        // The uuid is stable across servers where a numeric id is not, so it
+        // is preferred when both are present.
+        let id = event
+            .get("uuid")
+            .and_then(id_like)
+            .or_else(|| event.get("id").and_then(id_like));
+        Self { tags, id }
+    }
+}
+
+/// Taxonomies where exactly one value can be true at a time.
+///
+/// An attribute that carries its own `tlp:` must not also inherit the event's:
+/// a value tagged both `tlp:amber` and `tlp:white` says nothing useful about
+/// how it may be shared, and the STIX export would pick whichever came first.
+/// MISP's own model is that the more specific tag wins, so the attribute's is
+/// kept and the event's dropped.
+///
+/// Only TLP for now. Most taxonomies are genuinely multi-valued — an event and
+/// an attribute can each contribute a different `misp-galaxy:` tag and both are
+/// worth having — so this is a list of exceptions rather than a rule.
+const SINGLE_VALUED: &[&str] = &["tlp"];
+
+/// Does `candidate` belong to a single-valued taxonomy that `tags` already
+/// has an entry for?
+fn conflicts(tags: &[String], candidate: &str) -> bool {
+    let Some((namespace, _)) = candidate.split_once(':') else {
+        return false;
+    };
+    if !SINGLE_VALUED.contains(&namespace) {
+        return false;
+    }
+    tags.iter().any(|tag| {
+        tag.split_once(':')
+            .is_some_and(|(known, _)| known == namespace)
+    })
+}
+
 /// Remove the `<topic> ` prefix MISP puts in front of the JSON body.
 ///
 /// Publishers that put the topic in its own frame are handled by the caller, so
@@ -119,21 +184,27 @@ pub fn parse(json: &str, mapping: &Mapping) -> Result<Vec<Sighting>, serde_json:
     let value: Value = serde_json::from_str(json)?;
     let mut sightings = Vec::new();
 
+    // Read first, because a single-attribute publication carries the event as
+    // context beside the attribute rather than around it — so the attribute
+    // below inherits the marking too.
+    let event = value.get("Event");
+    let context = event.map(EventContext::of).unwrap_or_default();
+
     // A single attribute, which is what `misp_json_attribute` carries.
     if let Some(attribute) = value.get("Attribute") {
-        collect(attribute, mapping, &mut sightings);
+        collect(attribute, mapping, &context, &mut sightings);
     }
 
     // A whole event, which is what `misp_json` carries on publish.
-    if let Some(event) = value.get("Event") {
+    if let Some(event) = event {
         if let Some(attributes) = event.get("Attribute") {
-            collect(attributes, mapping, &mut sightings);
+            collect(attributes, mapping, &context, &mut sightings);
         }
         // Attributes can also hang off objects within the event.
         if let Some(Value::Array(objects)) = event.get("Object") {
             for object in objects {
                 if let Some(attributes) = object.get("Attribute") {
-                    collect(attributes, mapping, &mut sightings);
+                    collect(attributes, mapping, &context, &mut sightings);
                 }
             }
         }
@@ -153,15 +224,15 @@ pub fn parse_native(json: &str) -> Result<Vec<Sighting>, serde_json::Error> {
 }
 
 /// Accepts either one attribute object or an array of them.
-fn collect(node: &Value, mapping: &Mapping, out: &mut Vec<Sighting>) {
+fn collect(node: &Value, mapping: &Mapping, context: &EventContext, out: &mut Vec<Sighting>) {
     match node {
         Value::Array(items) => {
             for item in items {
-                collect(item, mapping, out);
+                collect(item, mapping, context, out);
             }
         }
         Value::Object(_) => {
-            if let Some(sighting) = attribute_to_sighting(node, mapping) {
+            if let Some(sighting) = attribute_to_sighting(node, mapping, context) {
                 out.push(sighting);
             }
         }
@@ -169,7 +240,11 @@ fn collect(node: &Value, mapping: &Mapping, out: &mut Vec<Sighting>) {
     }
 }
 
-fn attribute_to_sighting(attribute: &Value, mapping: &Mapping) -> Option<Sighting> {
+fn attribute_to_sighting(
+    attribute: &Value,
+    mapping: &Mapping,
+    context: &EventContext,
+) -> Option<Sighting> {
     if mapping.require_to_ids && !truthy(attribute.get("to_ids")) {
         return None;
     }
@@ -189,7 +264,7 @@ fn attribute_to_sighting(attribute: &Value, mapping: &Mapping) -> Option<Sightin
 
     Some(
         Sighting::once(namespace, value, timestamp_of(attribute))
-            .with_tags(tags_of(attribute, misp_type)),
+            .with_tags(tags_of(attribute, misp_type, context)),
     )
 }
 
@@ -198,7 +273,7 @@ fn attribute_to_sighting(attribute: &Value, mapping: &Mapping) -> Option<Sightin
 /// The MISP type is kept as it was published *and* translated to the STIX
 /// observable type where there is one, so the STIX export can build a pattern
 /// without having to know anything about MISP.
-fn tags_of(attribute: &Value, misp_type: &str) -> Vec<String> {
+fn tags_of(attribute: &Value, misp_type: &str, context: &EventContext) -> Vec<String> {
     let mut tags = vec![format!("misp-type:{misp_type}")];
 
     if let Some(stix_type) = stix_type_for_misp(misp_type) {
@@ -207,7 +282,13 @@ fn tags_of(attribute: &Value, misp_type: &str) -> Vec<String> {
     if let Some(category) = attribute.get("category").and_then(Value::as_str) {
         tags.push(format!("misp-category:{}", sanitize_tag(category)));
     }
-    if let Some(event) = attribute.get("event_id").and_then(id_like) {
+    // The attribute's own event id, falling back to the event it arrived in:
+    // attributes published as part of an event do not always name it.
+    if let Some(event) = attribute
+        .get("event_id")
+        .and_then(id_like)
+        .or_else(|| context.id.clone())
+    {
         tags.push(format!("misp-event:{event}"));
     }
     if let Some(comment) = attribute
@@ -229,6 +310,29 @@ fn tags_of(attribute: &Value, misp_type: &str) -> Vec<String> {
             tags.push(sanitize_tag(name));
         }
     }
+
+    // Then what the event says, which is where MISP keeps the marking and
+    // usually the galaxy tags. Added *after* the attribute's own, so the more
+    // specific tag is the one the export finds first — and skipped entirely
+    // where the two would contradict each other. See [`SINGLE_VALUED`].
+    for tag in &context.tags {
+        if conflicts(&tags, tag) {
+            continue;
+        }
+        tags.push(tag.clone());
+    }
+
+    // An event and an attribute can carry the same tag, and a set should not
+    // hold it twice.
+    tags.dedup_by(|a, b| a == b);
+    let mut seen: Vec<String> = Vec::with_capacity(tags.len());
+    tags.retain(|tag| {
+        let first = !seen.contains(tag);
+        if first {
+            seen.push(tag.clone());
+        }
+        first
+    });
 
     tags
 }
@@ -486,6 +590,215 @@ mod tests {
         assert_eq!(sightings.len(), 2);
         assert_eq!(sightings[0].value, "1.2.3.4");
         assert_eq!(sightings[1].namespace, "misp/domains");
+    }
+
+    /// The marking lives on the event, and it has to reach the values.
+    ///
+    /// It did not: only attribute tags were read, so every sighting from a
+    /// `tlp:amber` event arrived unmarked and exported unmarked. That is the
+    /// one kind of loss here that could mislead someone about how a value may
+    /// be shared, which is worse than losing it outright.
+    #[test]
+    fn an_events_marking_reaches_its_attributes() {
+        let body = r#"{"Event": {"id": "7", "Tag": [
+                {"name": "tlp:amber"},
+                {"name": "misp-galaxy:threat-actor=\"Callisto\""},
+                {"name": "type:OSINT"}
+            ], "Attribute": [{"type": "ip-src", "value": "1.2.3.4"}]}}"#;
+
+        let sightings = parse(body, &mapping()).unwrap();
+        assert_eq!(sightings.len(), 1);
+        let tags = &sightings[0].tags;
+        assert!(tags.contains(&"tlp:amber".to_string()), "{tags:?}");
+        assert!(
+            tags.contains(&"misp-galaxy:threat-actor=\"Callisto\"".to_string()),
+            "{tags:?}"
+        );
+        assert!(tags.contains(&"type:OSINT".to_string()), "{tags:?}");
+        // And what the attribute itself says is still there.
+        assert!(tags.contains(&"misp-type:ip-src".to_string()), "{tags:?}");
+    }
+
+    /// Attributes inside objects inherit it too, which is where most of a
+    /// modern MISP event's attributes live.
+    #[test]
+    fn an_events_marking_reaches_attributes_inside_objects() {
+        let body = r#"{"Event": {"Tag": [{"name": "tlp:green"}],
+            "Object": [
+              {"name": "file", "Attribute": [
+                {"type": "md5", "value": "d41d8cd98f00b204e9800998ecf8427e"}]}
+            ]}}"#;
+
+        let sightings = parse(body, &mapping()).unwrap();
+        assert_eq!(sightings.len(), 1);
+        assert!(sightings[0].tags.contains(&"tlp:green".to_string()));
+    }
+
+    /// A single-attribute publication carries its event as context beside the
+    /// attribute rather than around it, and the marking is in that context.
+    #[test]
+    fn a_lone_attribute_inherits_from_the_event_beside_it() {
+        let body = r#"{"Attribute": {"type": "domain", "value": "evil.com"},
+            "Event": {"id": "9", "Tag": [{"name": "tlp:red"}]}}"#;
+
+        let sightings = parse(body, &mapping()).unwrap();
+        assert_eq!(sightings.len(), 1);
+        assert!(sightings[0].tags.contains(&"tlp:red".to_string()));
+        assert!(sightings[0].tags.contains(&"misp-event:9".to_string()));
+    }
+
+    /// The attribute's own marking wins, and the event's is not added beside
+    /// it. A value tagged both amber and white says nothing useful about how
+    /// it may be shared.
+    #[test]
+    fn an_attributes_own_marking_is_not_contradicted_by_the_events() {
+        let body = r#"{"Event": {"Tag": [{"name": "tlp:white"}], "Attribute": [
+                {"type": "ip-src", "value": "1.2.3.4",
+                 "Tag": [{"name": "tlp:amber"}]}
+            ]}}"#;
+
+        let tags = &parse(body, &mapping()).unwrap()[0].tags;
+        assert!(tags.contains(&"tlp:amber".to_string()), "{tags:?}");
+        assert!(
+            !tags.contains(&"tlp:white".to_string()),
+            "the event's marking overrode the attribute's own: {tags:?}"
+        );
+        // The stricter one is also the one the export will find first.
+        let joined = tags.join(",");
+        assert_eq!(crate::attribute::tag_value(&joined, "tlp"), Some("amber"));
+    }
+
+    /// A taxonomy that genuinely takes several values keeps them all: an event
+    /// and an attribute can each contribute one worth having.
+    #[test]
+    fn a_multi_valued_taxonomy_keeps_both_contributions() {
+        let body = r#"{"Event": {"Tag": [{"name": "misp-galaxy:country=\"ukraine\""}],
+            "Attribute": [{"type": "ip-src", "value": "1.2.3.4",
+                "Tag": [{"name": "misp-galaxy:threat-actor=\"Callisto\""}]}]}}"#;
+
+        let tags = &parse(body, &mapping()).unwrap()[0].tags;
+        assert!(
+            tags.contains(&"misp-galaxy:country=\"ukraine\"".to_string()),
+            "{tags:?}"
+        );
+        assert!(
+            tags.contains(&"misp-galaxy:threat-actor=\"Callisto\"".to_string()),
+            "{tags:?}"
+        );
+    }
+
+    /// The same tag on the event and on the attribute is one tag, not two.
+    #[test]
+    fn a_tag_on_both_is_not_duplicated() {
+        let body = r#"{"Event": {"Tag": [{"name": "type:OSINT"}], "Attribute": [
+                {"type": "ip-src", "value": "1.2.3.4",
+                 "Tag": [{"name": "type:OSINT"}]}]}}"#;
+
+        let tags = &parse(body, &mapping()).unwrap()[0].tags;
+        assert_eq!(
+            tags.iter().filter(|t| *t == "type:OSINT").count(),
+            1,
+            "{tags:?}"
+        );
+    }
+
+    /// An event with no tags changes nothing, which is what every message from
+    /// a publisher that does not tag looks like.
+    #[test]
+    fn an_untagged_event_adds_nothing() {
+        let body = r#"{"Event": {"id": "1", "Attribute": [
+                {"type": "ip-src", "value": "1.2.3.4"}]}}"#;
+
+        let tags = &parse(body, &mapping()).unwrap()[0].tags;
+        assert!(!tags.iter().any(|t| t.starts_with("tlp:")), "{tags:?}");
+    }
+
+    /// Against the real thing: an event from CIRCL's public OSINT feed, with
+    /// its tag block and one object attribute copied verbatim.
+    ///
+    /// The shapes here are the ones that actually turn up and that a
+    /// hand-written fixture gets wrong — a quoted value inside a machine tag,
+    /// `local` and `colour` fields beside the name, a timestamp as a string,
+    /// and an attribute inside an object with no `event_id` of its own.
+    #[test]
+    fn a_real_event_from_the_circl_feed_keeps_its_marking() {
+        let body = r##"{"Event": {
+            "uuid": "cf909fc3-0e55-4962-b462-2219981ea53c",
+            "info": "OSINT - PhantomCaptcha",
+            "Tag": [
+              {"colour": "#0088cc", "local": false,
+               "name": "misp-galaxy:country=\"ukraine\"",
+               "relationship_type": "targets"},
+              {"colour": "#004646", "local": false, "name": "type:OSINT",
+               "relationship_type": ""},
+              {"colour": "#ffffff", "local": false, "name": "tlp:white",
+               "relationship_type": ""},
+              {"colour": "#0071c3", "local": false,
+               "name": "osint:certainty=\"50\"", "relationship_type": ""}
+            ],
+            "Object": [
+              {"name": "domain-ip", "Attribute": [
+                {"type": "domain", "value": "bsnowcommunications.com",
+                 "category": "Network activity", "timestamp": "1762792503"}
+              ]}
+            ]}}"##;
+
+        let sightings = parse(body, &mapping()).unwrap();
+        assert_eq!(sightings.len(), 1);
+        let s = &sightings[0];
+
+        assert_eq!(s.namespace, "misp/domains");
+        assert_eq!(s.value, "bsnowcommunications.com");
+        // A string timestamp is still a timestamp.
+        assert_eq!(s.timestamp, Some(1_762_792_503));
+
+        // What the attribute says about itself.
+        assert!(
+            s.tags.contains(&"misp-type:domain".to_string()),
+            "{:?}",
+            s.tags
+        );
+        assert!(
+            s.tags.contains(&"stix-type:domain-name".to_string()),
+            "{:?}",
+            s.tags
+        );
+        assert!(
+            s.tags
+                .contains(&"misp-category:Network activity".to_string()),
+            "{:?}",
+            s.tags
+        );
+        // The event it came from, which the attribute does not name itself.
+        assert!(
+            s.tags
+                .contains(&"misp-event:cf909fc3-0e55-4962-b462-2219981ea53c".to_string()),
+            "{:?}",
+            s.tags
+        );
+        // And the marking, which is the whole point.
+        assert!(s.tags.contains(&"tlp:white".to_string()), "{:?}", s.tags);
+        assert!(s.tags.contains(&"type:OSINT".to_string()), "{:?}", s.tags);
+        assert!(
+            s.tags.contains(&"osint:certainty=\"50\"".to_string()),
+            "{:?}",
+            s.tags
+        );
+        assert!(
+            s.tags
+                .contains(&"misp-galaxy:country=\"ukraine\"".to_string()),
+            "{:?}",
+            s.tags
+        );
+
+        // The tag set is written as one comma-separated field, so it has to
+        // survive being joined and read back.
+        let joined = s.tags.join(",");
+        assert_eq!(crate::attribute::tag_value(&joined, "tlp"), Some("white"));
+        assert_eq!(
+            crate::attribute::tag_value(&joined, "stix-type"),
+            Some("domain-name")
+        );
     }
 
     /// Attributes hang off objects as well as off the event directly, and

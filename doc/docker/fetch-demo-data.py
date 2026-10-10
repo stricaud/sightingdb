@@ -16,10 +16,9 @@ type, and the tags are `misp-type:`, `stix-type:`, `misp-category:`,
 So the demo data is shaped like data that really arrived from MISP, rather than
 like something invented for a screenshot.
 
-It differs in one way, deliberately. The ingest reads tags from the
-*attribute*; this also carries down the tags on the *event*, which is where
-CIRCL puts the TLP marking. Without that the sightings would arrive unmarked,
-and a marking is the thing you least want to lose.
+That includes carrying down the tags on the *event* — which is where CIRCL puts
+the TLP marking — exactly as the ingest does, with the attribute's own marking
+winning where the two would contradict each other.
 """
 
 import argparse

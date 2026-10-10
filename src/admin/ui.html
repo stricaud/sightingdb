@@ -1522,8 +1522,11 @@ function renderTags() {
   $("t-count").textContent =
     `${defined} defined${seen ? `, ${seen} seen on values but not defined` : ""}`;
   $("t-empty").textContent = shown.length ? "" : "Nothing matches that filter.";
-  $("t-readonly").textContent = vocab.editable ? "" :
+  const readonly = vocab.editable ? "" :
     "Colours are read-only: no tags_file is configured. Set tags_file in [daemon] and restart.";
+  // Whose counts these are. On a router they are nearly empty, and the
+  // namespace ratio looks complete, so the page has to say so itself.
+  $("t-readonly").textContent = [vocab.scope, readonly].filter(Boolean).join(" ");
   const counted = vocab.counted_namespaces, total = vocab.total_namespaces;
   if (total && counted < total) {
     $("t-empty").textContent += (shown.length ? "" : " ") +

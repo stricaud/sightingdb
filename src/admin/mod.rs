@@ -1298,18 +1298,35 @@ pub async fn set_tags(state: State, body: web::Json<TagChange>, req: HttpRequest
     }
 
     // Where the value actually lives decides how the change gets there. A
-    // server that holds the namespace changes its own copy and tells the
-    // mirrors; one that does not — a router — has no copy to change, so it
-    // asks a mirror for the value, applies the change to that, and offers the
-    // result back to all of them.
+    // server that holds the namespace changes its own copy; one that does not
+    // — a router — has no copy to change, so it asks a mirror for the value
+    // and applies the change to *that*, without keeping it.
+    //
+    // Not keeping it matters: a router stores nothing on purpose, and writing
+    // every retagged value into it would leave it accumulating values it has
+    // no business holding, which nothing would ever read — reads of those
+    // namespaces are forwarded, since what a server holds is its configured
+    // policy and not whatever happens to be in memory.
     let held = state.db.holds(&namespace);
-    if held {
+    let payload = if held {
         if !state.db.set_tags(&namespace, &change.value, &change.tags) {
             return HttpResponse::NotFound().json(Message::new("No such value."));
         }
-    } else if let Err(resp) = retag_through_galaxy(&state, &namespace, &change).await {
-        return resp;
-    }
+        match state.db.merge_payload(&namespace, &change.value) {
+            Some(payload) => payload,
+            // Written a moment ago, so this cannot happen; reported rather
+            // than unwrapped.
+            None => {
+                return HttpResponse::InternalServerError()
+                    .json(Message::new("The value disappeared while being retagged."));
+            }
+        }
+    } else {
+        match retagged_elsewhere(&state, &namespace, &change).await {
+            Ok(payload) => payload,
+            Err(resp) => return resp,
+        }
+    };
 
     log::info!(
         "Tags of '{}' in '{namespace}' set by '{caller}'",
@@ -1320,20 +1337,25 @@ pub async fn set_tags(state: State, body: web::Json<TagChange>, req: HttpRequest
     // the mirrors: without this it would sit here until someone noticed the
     // two copies disagreed. Pushed rather than waited for, because the whole
     // point of editing a tag is that it is wrong *now*.
-    let spread = spread_tags(&state, &namespace, &change.value).await;
+    let spread = spread_tags(&state, &namespace, &change.value, &payload).await;
 
     let consensus = state.db.count(crate::db::ALL_NAMESPACE, &change.value);
-    match state.db.view(&namespace, &change.value, consensus, false) {
-        Some(view) => match spread {
-            // The common case: nothing to say beyond the value itself, which
-            // is the shape every existing client already reads.
-            None => HttpResponse::Ok().json(view),
-            Some(report) => HttpResponse::Ok().json(TaggedAcross {
-                value: view,
-                mirrors: report,
-            }),
-        },
-        None => HttpResponse::Ok().json(Message::new("ok")),
+    // The value as it now stands. From this server when it holds it, and
+    // otherwise from the copy that was just pushed — a router has nothing of
+    // its own to report, and answering "ok" would leave the interface unable
+    // to redraw the row it just changed.
+    let view = state
+        .db
+        .view(&namespace, &change.value, consensus, false)
+        .unwrap_or_else(|| view_of(&change.value, &payload, consensus));
+    match spread {
+        // The common case: nothing to say beyond the value itself, which is
+        // the shape every existing client already reads.
+        None => HttpResponse::Ok().json(view),
+        Some(report) => HttpResponse::Ok().json(TaggedAcross {
+            value: view,
+            mirrors: report,
+        }),
     }
 }
 
@@ -1364,11 +1386,11 @@ async fn spread_tags(
     state: &SharedState,
     namespace: &str,
     value: &str,
+    payload: &crate::attribute::Merge,
 ) -> Option<Vec<MirrorOutcome>> {
     let galaxy = state.galaxy.as_ref()?;
-    let payload = state.db.merge_payload(namespace, value)?;
     let outcomes = galaxy
-        .push_value(namespace, value, &payload, galaxy.max_hops())
+        .push_value(namespace, value, payload, galaxy.max_hops())
         .await;
     if outcomes.is_empty() {
         return None;
@@ -1404,11 +1426,11 @@ async fn spread_tags(
 /// the local copy the thing that was agreed on; it is held in the router's
 /// database like any other merge, and the router's own storage policy decides
 /// whether it is kept beyond that.
-async fn retag_through_galaxy(
+async fn retagged_elsewhere(
     state: &SharedState,
     namespace: &str,
     change: &TagChange,
-) -> Result<(), HttpResponse> {
+) -> Result<crate::attribute::Merge, HttpResponse> {
     let Some(galaxy) = state.galaxy.as_ref() else {
         return Err(HttpResponse::NotFound().json(Message::new("No such value.")));
     };
@@ -1446,9 +1468,25 @@ async fn retag_through_galaxy(
 
     payload.tags = change.tags.clone();
     payload.tags_at = chrono::Utc::now().timestamp_millis();
+    Ok(payload)
+}
 
-    state.db.merge(namespace, &change.value, &payload);
-    Ok(())
+/// A value as a merge payload describes it, for a server that holds no copy.
+fn view_of(
+    value: &str,
+    payload: &crate::attribute::Merge,
+    consensus: u64,
+) -> crate::attribute::AttributeView {
+    crate::attribute::AttributeView {
+        value: value.to_string(),
+        first_seen: payload.first_seen,
+        last_seen: payload.last_seen,
+        count: payload.counts.values().sum(),
+        tags: payload.tags.clone(),
+        ttl: payload.ttl,
+        consensus,
+        stats: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,6 +1529,15 @@ pub struct TagsView {
     /// — see [`crate::db::Database::tag_usage`].
     pub counted_namespaces: usize,
     pub total_namespaces: usize,
+    /// Why the counts cover less than the galaxy, when they do.
+    ///
+    /// The counts are of what **this server** holds, and a server in front of
+    /// a galaxy holds little or none of it. Without saying so, a router's Tags
+    /// page reads as "the galaxy has six tags" when it means "I have six" —
+    /// and `counted_namespaces` equal to `total_namespaces` makes that look
+    /// complete rather than local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 pub async fn list_tags(state: State, req: HttpRequest) -> HttpResponse {
@@ -1567,12 +1614,44 @@ pub async fn list_tags(state: State, req: HttpRequest) -> HttpResponse {
 
     rows.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // Counts are of what this server holds. Say so when that is not the
+    // galaxy — a reader cannot tell from the numbers alone.
+    let scope = if !everywhere {
+        Some(
+            concat!(
+                "Counts are hidden because this key cannot read every namespace. ",
+                "The vocabulary itself is not scoped.",
+            )
+            .to_string(),
+        )
+    } else if state.db.stores().is_router() {
+        Some(
+            concat!(
+                "This server stores nothing of its own, so these counts cover only ",
+                "what it has locally — which on a router is next to nothing. The tags ",
+                "in use are on the nodes; open a node's interface to count them there.",
+            )
+            .to_string(),
+        )
+    } else if !state.db.stores().stores_everything() {
+        Some(format!(
+            concat!(
+                "Counts cover the namespaces this server stores ({}). Tags in ",
+                "namespaces held elsewhere in the galaxy are not counted here.",
+            ),
+            state.db.stores().prefixes().join(", ")
+        ))
+    } else {
+        None
+    };
+
     HttpResponse::Ok().json(TagsView {
         tags: rows,
         unknown_colour: crate::tags::UNKNOWN_COLOUR.to_string(),
         editable: state.tags_file.is_some(),
         counted_namespaces: counted,
         total_namespaces: total,
+        scope,
     })
 }
 
@@ -1847,9 +1926,10 @@ pub async fn replace_keys(
     };
 
     if !state.acl_replaceable {
-        return HttpResponse::Forbidden().json(Message::new(
-            "This server does not let another replace its keys. Set acl_replaceable              in [galaxy] if it should.",
-        ));
+        return HttpResponse::Forbidden().json(Message::new(concat!(
+            "This server does not let another replace its keys. Set ",
+            "acl_replaceable in [galaxy] if it should.",
+        )));
     }
 
     let wanted = body.into_inner().keys;
@@ -1870,9 +1950,10 @@ pub async fn replace_keys(
         ));
     }
     if !acl.contains(&caller) {
-        return HttpResponse::Conflict().json(Message::new(
-            "That set does not include the key making this request, which would lock              the caller out of the server it is replacing.",
-        ));
+        return HttpResponse::Conflict().json(Message::new(concat!(
+            "That set does not include the key making this request, which would ",
+            "lock the caller out of the server it is replacing.",
+        )));
     }
 
     // What is going away, before it does, so the drift view can say which
@@ -3297,6 +3378,139 @@ mod tests {
         );
         // The vocabulary itself is not a secret.
         assert_eq!(row(&body, "tlp:green")["defined"], true);
+    }
+
+    /// A router's Tags page must say that its counts are its own.
+    ///
+    /// They are of what this server holds, and a router holds nothing — while
+    /// `counted_namespaces == total_namespaces` makes that look complete
+    /// rather than local. Without a word of explanation the page reads as
+    /// "the galaxy has these tags".
+    #[actix_web::test]
+    async fn a_router_says_its_tag_counts_are_local() {
+        let dir = TempDir::new("tags-scope");
+        let mut inner = SharedState::new(true);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner.tags_file = Some(dir.0.join("tags.toml"));
+        inner.db = crate::db::Database::with_storage(
+            crate::db::DatabasePolicy::default(),
+            crate::db::StoragePolicy::from_prefixes(Vec::<&str>::new()),
+        );
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        let scope = body["scope"].as_str().unwrap_or_default();
+        assert!(
+            scope.contains("stores nothing of its own"),
+            "a router did not say its counts are local: {body}"
+        );
+    }
+
+    /// A partial mirror says which namespaces its counts cover.
+    #[actix_web::test]
+    async fn a_partial_mirror_says_which_namespaces_it_counted() {
+        let dir = TempDir::new("tags-partial");
+        let mut inner = SharedState::new(true);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner.tags_file = Some(dir.0.join("tags.toml"));
+        inner.db = crate::db::Database::with_storage(
+            crate::db::DatabasePolicy::default(),
+            crate::db::StoragePolicy::from_prefixes(["feeds"]),
+        );
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        let scope = body["scope"].as_str().unwrap_or_default();
+        assert!(scope.contains("feeds"), "{body}");
+    }
+
+    /// A server that stores everything has nothing to explain, so it says
+    /// nothing — a note on every page would stop being read.
+    #[actix_web::test]
+    async fn a_full_mirror_has_no_scope_note() {
+        let dir = TempDir::new("tags-full");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        assert!(body.get("scope").is_none(), "{body}");
+    }
+
+    /// No message this server sends has a run of spaces baked into it.
+    ///
+    /// A long string written with `\` line continuations reads fine in the
+    /// source and then `cargo fmt` joins the lines, keeping the indentation
+    /// inside the literal — so the text that reaches a user has twelve spaces
+    /// in the middle of a sentence. That has happened three times in this
+    /// file alone, and it is invisible in review because the source still
+    /// looks right. `concat!` of one-line pieces is the way to write them.
+    ///
+    /// Scoped to the two modules that produce HTTP messages. `setup.rs` is
+    /// excluded on purpose: its output is a column-aligned summary where runs
+    /// of spaces are the point.
+    // `#[test]` resolves to actix-web's attribute in this module, because
+    // `test` is imported above — so this is async like every other test here,
+    // even though it touches nothing async.
+    #[actix_web::test]
+    async fn no_message_has_collapsed_whitespace_in_it() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = Vec::new();
+
+        for name in ["src/admin/mod.rs", "src/handlers.rs"] {
+            let text = std::fs::read_to_string(root.join(name)).expect(name);
+            for (number, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // Every string literal on the line. Odd pieces of a split on
+                // the quote are the contents.
+                for piece in line.split('"').skip(1).step_by(2) {
+                    let chars: Vec<char> = piece.chars().collect();
+                    let mut at = 0;
+                    while at < chars.len() {
+                        if chars[at] != ' ' {
+                            at += 1;
+                            continue;
+                        }
+                        // Measure the whole run. A fixed-size window would
+                        // only ever catch a run of exactly that size, which
+                        // is how the first two versions of this test passed
+                        // on the very damage they were written to find — the
+                        // real cases are six spaces, not three.
+                        let from = at;
+                        while at < chars.len() && chars[at] == ' ' {
+                            at += 1;
+                        }
+                        if at - from < 3 {
+                            continue;
+                        }
+                        // Punctuation counts as the end of a word: the
+                        // real cases wrap after a full stop.
+                        let before = from.checked_sub(1).map(|j| chars[j]);
+                        let after = chars.get(at).copied();
+                        if before.is_some_and(|c| c.is_alphanumeric() || ".,;:!?)]".contains(c))
+                            && after.is_some_and(|c| c.is_alphabetic())
+                        {
+                            found.push(format!("{name}:{}: {piece}", number + 1));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            found.is_empty(),
+            "these messages have whitespace baked in, almost certainly from a \n\
+             line continuation that cargo fmt joined. Write them with concat! of \n\
+             one-line pieces instead:\n{}",
+            found.join("\n")
+        );
     }
 
     #[actix_web::test]
