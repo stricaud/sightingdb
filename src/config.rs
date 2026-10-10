@@ -124,6 +124,18 @@ pub struct GalaxySettings {
     /// cascade can be miswired into a cycle, and a cycle inflates every count
     /// it carries, so this is a limit rather than a tuning knob.
     pub max_hops: u8,
+    /// File holding peers added through the management interface, which it
+    /// rewrites. Without one, the galaxy is read-only there.
+    ///
+    /// A separate file for the same reason the ACL has one: the main
+    /// configuration is hand-maintained and comment-rich, and a program that
+    /// rewrites it destroys those comments. Peers listed in `[galaxy] peers`
+    /// are therefore *not* editable here — the interface shows them and says
+    /// where they came from.
+    pub peers_file: Option<PathBuf>,
+    /// URLs of the peers that came from the main configuration, and so cannot
+    /// be changed or removed by the interface.
+    pub fixed: Vec<String>,
 }
 
 /// One peer, and the key this server authenticates to it with.
@@ -281,6 +293,7 @@ struct RawDaemon {
 struct RawGalaxy {
     #[serde(default)]
     peers: Vec<RawPeer>,
+    peers_file: Option<PathBuf>,
     #[serde(default = "default_max_hops")]
     max_hops: u8,
     #[serde(default = "default_health_interval")]
@@ -615,58 +628,176 @@ impl RawConfig {
     }
 }
 
+/// Check one peer and normalise it, wherever it was declared.
+///
+/// Shared by `[galaxy] peers`, the peers file and the management interface, so
+/// that a peer added through the interface is held to exactly the rules a
+/// hand-written one is. `namespaces` of `None` means a full mirror, which is
+/// the common case and the one a reader should assume.
+pub fn validated_peer(
+    url: &str,
+    key: &str,
+    namespaces: Option<&[String]>,
+) -> std::result::Result<Peer, String> {
+    let url = url.trim().trim_end_matches('/').to_string();
+    let key = key.trim().to_string();
+
+    if url.is_empty() {
+        return Err("a peer has no url".to_string());
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("peer '{url}' needs an http:// or https:// url"));
+    }
+    // A peer we cannot authenticate to is a peer we cannot use, and finding
+    // that out at the first forward is worse than at startup.
+    if key.is_empty() {
+        return Err(format!(
+            "peer '{url}' has no key. The key is what bounds what this server may do there."
+        ));
+    }
+
+    let stores = match namespaces {
+        Some(list) => crate::db::StoragePolicy::from_prefixes(list),
+        None => crate::db::StoragePolicy::everything(),
+    };
+    for prefix in stores.prefixes() {
+        crate::acl::validate_namespace(prefix)
+            .map_err(|e| format!("in the namespaces for peer '{url}': {e}"))?;
+    }
+    if stores.is_router() {
+        // A peer that stores nothing can still be forwarded *through*, but
+        // saying so here would be saying it holds nothing, which is not what a
+        // routing table is for. Let it be a full mirror or a named subtree.
+        return Err(format!(
+            "peer '{url}' declares an empty namespaces list. Leave it out for a full \
+             mirror, or name what it holds."
+        ));
+    }
+    Ok(Peer { url, key, stores })
+}
+
+/// The shape of the peers file the management interface writes.
+#[derive(Debug, Default, Deserialize)]
+pub struct PeersFile {
+    #[serde(default)]
+    pub peers: Vec<FilePeer>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FilePeer {
+    pub url: String,
+    pub key: String,
+    #[serde(default)]
+    pub namespaces: Option<Vec<String>>,
+}
+
+impl PeersFile {
+    /// Render the peers for writing, with the comment saying who owns the file.
+    pub fn to_toml(peers: &[Peer]) -> String {
+        let mut out = String::from(
+            "# Written by the SightingDB management interface. Comments added\n\
+             # here are replaced the next time a peer is saved.\n\
+             #\n\
+             # Peers listed in [galaxy] peers in the main configuration are not\n\
+             # here and are not editable from the interface.\n\
+             \n",
+        );
+        for peer in peers {
+            out.push_str("[[peers]]\n");
+            out.push_str(&format!("url = \"{}\"\n", peer.url));
+            out.push_str(&format!("key = \"{}\"\n", peer.key));
+            if !peer.stores.stores_everything() {
+                let list: Vec<String> = peer
+                    .stores
+                    .prefixes()
+                    .iter()
+                    .map(|p| format!("\"{p}\""))
+                    .collect();
+                out.push_str(&format!("namespaces = [{}]\n", list.join(", ")));
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Peers the management interface added, from their file.
+///
+/// A missing file is normal: it is written the first time a peer is added. A
+/// malformed one is reported and skipped rather than fatal, for the same
+/// reason as the tag vocabulary — a server that will not start is worse than a
+/// galaxy missing a mirror it can be told about again.
+fn load_file_peers(file: Option<&Path>) -> Vec<Peer> {
+    let Some(path) = file else {
+        return Vec::new();
+    };
+    if !path.exists() {
+        log::info!(
+            "[galaxy] peers_file {} does not exist yet; it will be created when a \
+             peer is added",
+            path.display()
+        );
+        return Vec::new();
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            log::error!("reading [galaxy] peers_file {}: {e}", path.display());
+            return Vec::new();
+        }
+    };
+    let parsed: PeersFile = match toml::from_str(&text) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            log::error!("parsing [galaxy] peers_file {}: {e}", path.display());
+            return Vec::new();
+        }
+    };
+    let mut peers = Vec::new();
+    for entry in parsed.peers {
+        match validated_peer(&entry.url, &entry.key, entry.namespaces.as_deref()) {
+            Ok(peer) => peers.push(peer),
+            Err(e) => log::error!("in {}: {e}", path.display()),
+        }
+    }
+    peers
+}
+
 impl RawGalaxy {
     fn into_settings(self, path: &Path) -> Result<GalaxySettings> {
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        let peers_file = self.peers_file.as_ref().map(|file| resolve(base, file));
+
         let mut peers: Vec<Peer> = Vec::new();
         for raw in self.peers {
-            let url = raw.url.trim().trim_end_matches('/').to_string();
-            let key = raw.key.trim().to_string();
+            let peer = validated_peer(&raw.url, &raw.key, raw.namespaces.as_deref())
+                .map_err(|e| anyhow::anyhow!("[galaxy] {e}, in {}", path.display()))?;
+            if peers.iter().any(|known| known.url == peer.url) {
+                bail!(
+                    "[galaxy] lists peer '{}' twice, in {}",
+                    peer.url,
+                    path.display()
+                );
+            }
+            peers.push(peer);
+        }
+        // What the main configuration declared, which the interface may show
+        // but not change.
+        let fixed: Vec<String> = peers.iter().map(|peer| peer.url.clone()).collect();
 
-            if url.is_empty() {
-                bail!("a [galaxy] peer has no url, in {}", path.display());
-            }
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                bail!(
-                    "[galaxy] peer '{url}' needs an http:// or https:// url, in {}",
-                    path.display()
+        // Added through the interface. A URL already declared in the main
+        // configuration wins there, because that is the file a human is
+        // maintaining.
+        for peer in load_file_peers(peers_file.as_deref()) {
+            if peers.iter().any(|known| known.url == peer.url) {
+                log::warn!(
+                    "peer '{}' is in both the configuration and the peers file; the \
+                     configuration wins",
+                    peer.url
                 );
+                continue;
             }
-            // A peer we cannot authenticate to is a peer we cannot use, and
-            // finding that out at the first forward is worse than at startup.
-            if key.is_empty() {
-                bail!(
-                    "[galaxy] peer '{url}' has no key, in {}. The key is what bounds \
-                     what this server may do there.",
-                    path.display()
-                );
-            }
-            if peers.iter().any(|peer| peer.url == url) {
-                bail!("[galaxy] lists peer '{url}' twice, in {}", path.display());
-            }
-            let stores = match raw.namespaces.as_ref() {
-                Some(list) => crate::db::StoragePolicy::from_prefixes(list),
-                None => crate::db::StoragePolicy::everything(),
-            };
-            for prefix in stores.prefixes() {
-                crate::acl::validate_namespace(prefix).with_context(|| {
-                    format!(
-                        "in the [galaxy] namespaces for peer '{url}' in {}",
-                        path.display()
-                    )
-                })?;
-            }
-            if stores.is_router() {
-                // A peer that stores nothing can still be forwarded *through*,
-                // but saying so here would be saying it holds nothing, which
-                // is not what a routing table is for. Let it be a full mirror
-                // or a named subtree.
-                bail!(
-                    "[galaxy] peer '{url}' declares an empty namespaces list, in {}. \
-                     Leave it out for a full mirror, or name what it holds.",
-                    path.display()
-                );
-            }
-            peers.push(Peer { url, key, stores });
+            peers.push(peer);
         }
 
         if self.max_hops == 0 {
@@ -694,6 +825,8 @@ impl RawGalaxy {
 
         Ok(GalaxySettings {
             peers,
+            peers_file,
+            fixed,
             max_hops: self.max_hops,
             health_interval: self.health_interval,
             sync_interval: self.sync_interval,

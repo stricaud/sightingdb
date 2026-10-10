@@ -103,6 +103,12 @@ pub struct Plan {
     pub config_path: PathBuf,
     pub acl_path: PathBuf,
     pub tiers_path: PathBuf,
+    /// Where tag colours are written, so the interface can edit them.
+    pub tags_path: PathBuf,
+    /// Where peers added from the interface are written. Only written into the
+    /// configuration for a mode that forwards, since a server with no galaxy
+    /// has no peers to manage.
+    pub peers_path: PathBuf,
     pub log_config_path: PathBuf,
     pub dbdir: PathBuf,
     pub tls: Option<TlsSettings>,
@@ -215,12 +221,14 @@ impl Plan {
         if self.mode.forwards() {
             let _ = writeln!(
                 out,
-                "\nIts peers are left commented out in the configuration: a peer's key comes\n\
-                 from that peer's own ACL, which does not exist until it is set up. Install\n\
-                 the other servers, create a key on each for this one, then fill in the\n\
-                 [galaxy] section and restart.\n\n\
+                "\nIt starts with no peers, because a peer's key comes from that peer's own\n\
+                 ACL, which does not exist until it is set up. Install the other servers,\n\
+                 create a key on each for this one, then add them under Galaxy in the\n\
+                 management interface — they take effect at once and are remembered in\n\
+                 {}.\n\n\
                  Until then it has no peers, so it reports itself as a node rather than\n\
-                 {} — which is what it is until they are filled in.",
+                 {} — which is what it is until they are added.",
+                self.peers_path.display(),
                 self.mode.label()
             );
         }
@@ -242,13 +250,20 @@ impl Plan {
         w(&mut out, "#");
         w(
             &mut out,
-            "# Edit freely: the program rewrites only the acl_file and tiers_file",
+            "# Edit freely: the program rewrites only the separate files named",
         );
         w(
             &mut out,
-            "# named below, and only when a key or a tier is changed through the",
+            "# below -- acl_file, tiers_file, tags_file and peers_file -- and only",
         );
-        w(&mut out, "# management interface.");
+        w(
+            &mut out,
+            "# when the matching thing is changed through the management interface.",
+        );
+        w(
+            &mut out,
+            "# Anything set directly here is read-only there, which it will say.",
+        );
         w(&mut out, "#");
         let _ = writeln!(out, "# This server is set up as {}.", self.mode.label());
         w(&mut out, "");
@@ -409,6 +424,29 @@ impl Plan {
         );
         w(&mut out, "# restart.");
         let _ = writeln!(out, "acl_file = \"{}\"", self.acl_path.display());
+
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# How tags are shown in the management interface: a colour and a",
+        );
+        w(
+            &mut out,
+            "# description each. Rewritten there when a tag is edited.",
+        );
+        w(
+            &mut out,
+            "# Presentation only -- a value can carry a tag nothing here",
+        );
+        w(
+            &mut out,
+            "# defines, and the interface lists those too so they can be",
+        );
+        w(
+            &mut out,
+            "# adopted. A name ending in ':' colours a whole family.",
+        );
+        let _ = writeln!(out, "tags_file = \"{}\"", self.tags_path.display());
 
         w(&mut out, "");
         w(&mut out, "[storage]");
@@ -579,7 +617,36 @@ impl Plan {
                 &mut out,
                 "# ---------------------------------------------------------------",
             );
-            w(&mut out, "#[galaxy]");
+            w(
+                &mut out,
+                "# The section is live with no peers in it, which is a valid galaxy:",
+            );
+            w(
+                &mut out,
+                "# peers can then be added from the management interface, without",
+            );
+            w(
+                &mut out,
+                "# editing this file and without a restart. The settings below are",
+            );
+            w(
+                &mut out,
+                "# their defaults, shown commented so they can be changed.",
+            );
+            w(&mut out, "[galaxy]");
+            w(
+                &mut out,
+                "# Peers added from the management interface are written here and",
+            );
+            w(
+                &mut out,
+                "# take effect at once. Its own file because this one is yours: a",
+            );
+            w(
+                &mut out,
+                "# program that rewrote it would destroy these comments.",
+            );
+            let _ = writeln!(out, "peers_file = \"{}\"", self.peers_path.display());
             w(&mut out, "#max_hops = 4");
             w(&mut out, "#health_interval = 30");
             w(
@@ -667,6 +734,19 @@ impl Plan {
             );
             w(&mut out, "# --setup produces.");
             w(&mut out, "#verify_tls = true");
+            w(&mut out, "");
+            w(
+                &mut out,
+                "# A peer written into the list below is shown in the interface but",
+            );
+            w(
+                &mut out,
+                "# not editable there, since a change made there would last only",
+            );
+            w(
+                &mut out,
+                "# until the next restart. Prefer adding them above.",
+            );
             w(&mut out, "#peers = [");
             w(
                 &mut out,
@@ -1944,6 +2024,8 @@ fn build_plan(platform: Platform, scope: Scope, root: bool) -> Result<Plan> {
         config_path: config_dir.join("sightingdb.toml"),
         acl_path: config_dir.join("acl.toml"),
         tiers_path: config_dir.join("tiers.toml"),
+        tags_path: config_dir.join("tags.toml"),
+        peers_path: config_dir.join("peers.toml"),
         log_config_path: config_dir.join("log4rs.yml"),
         config_dir,
         dbdir,
@@ -2700,13 +2782,53 @@ mod tests {
                         );
                     }
                 }
+
+                // Tag colours are editable, which needs the file to exist as a
+                // setting rather than as a comment.
+                assert_eq!(
+                    settings.tags_file.as_deref(),
+                    Some(plan.tags_path.as_path()),
+                    "{name} cannot edit tag colours:\n{toml}"
+                );
+
+                // A mode that forwards gets a galaxy it can manage: the
+                // section loads with no peers, and names where peers added
+                // from the interface go. Without both, adding one means
+                // editing this file and restarting.
+                if mode.forwards() {
+                    let galaxy = settings
+                        .galaxy
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{name} has no galaxy:\n{toml}"));
+                    assert!(
+                        galaxy.peers.is_empty(),
+                        "{name} was given peers whose keys nobody has yet:\n{toml}"
+                    );
+                    assert_eq!(
+                        galaxy.peers_file.as_deref(),
+                        Some(plan.peers_path.as_path()),
+                        "{name} cannot be given peers from the interface:\n{toml}"
+                    );
+                } else {
+                    assert!(
+                        settings.galaxy.is_none(),
+                        "{name} was given a galaxy it did not ask for:\n{toml}"
+                    );
+                }
             }
         }
     }
 
     /// A galaxy section is offered to the modes that forward and not to the
-    /// others, and it is commented out — a peer's key comes from that peer's
-    /// own ACL, which does not exist yet when this file is written.
+    /// others.
+    ///
+    /// It is *live* with no peers in it, which is a valid galaxy, and carries a
+    /// `peers_file` — so peers can be added from the management interface once
+    /// the other servers exist, rather than by editing this file and
+    /// restarting. A peer's key comes from that peer's own ACL, which does not
+    /// exist when this file is written, so the list cannot be filled in here
+    /// however it is formatted; what this avoids is having to come back to the
+    /// file at all.
     #[test]
     fn a_galaxy_template_is_offered_only_where_it_is_wanted() {
         let dir = TempDir::new("galaxytemplate");
@@ -2727,19 +2849,47 @@ mod tests {
                 Some(vec!["feeds".to_string()])
             };
             let toml = plan_as(&dir.0, Platform::Linux, true, mode, namespaces).config_toml();
+
+            // Live, not commented: the interface can only manage peers if the
+            // section it writes them to exists.
             assert!(
-                toml.contains("#[galaxy]"),
-                "{} has no galaxy template:\n{toml}",
+                toml.lines().any(|line| line.trim_end() == "[galaxy]"),
+                "{} has no live galaxy section:\n{toml}",
                 mode.label()
             );
-            // Commented, so the file still loads before the peers exist.
             assert!(
-                !toml
-                    .lines()
-                    .any(|line| line.trim_start().starts_with("[galaxy]")),
-                "the galaxy section is live and will fail to load:\n{toml}"
+                toml.lines().any(|line| line.starts_with("peers_file = ")),
+                "{} was given no peers_file, so its galaxy is read-only in the \
+                 interface:\n{toml}",
+                mode.label()
+            );
+            // The example list stays commented: a peer written there is not
+            // editable from the interface, and its key is not known yet anyway.
+            assert!(
+                toml.contains("#peers = ["),
+                "the example peer list should stay commented:\n{toml}"
+            );
+            assert!(
+                !toml.lines().any(|line| line.starts_with("peers = [")),
+                "a live peer list was written with keys nobody has yet:\n{toml}"
             );
             assert!(toml.contains("namespaces = [\"feeds\"]"), "{toml}");
+        }
+    }
+
+    /// The generated configuration names a tags_file, so tag colours are
+    /// editable in the interface rather than read-only.
+    #[test]
+    fn the_generated_configuration_can_edit_tag_colours() {
+        let dir = TempDir::new("tagsfile");
+        for mode in [Mode::Standalone, Mode::Node, Mode::Router, Mode::Both] {
+            let namespaces = matches!(mode, Mode::Router).then(Vec::new);
+            let toml = plan_as(&dir.0, Platform::Linux, true, mode, namespaces).config_toml();
+            assert!(
+                toml.lines().any(|line| line.starts_with("tags_file = ")),
+                "{} was given no tags_file:\n{toml}",
+                mode.label()
+            );
         }
     }
 
@@ -2824,6 +2974,8 @@ mod tests {
             config_path: config_dir.join("sightingdb.toml"),
             acl_path: config_dir.join("acl.toml"),
             tiers_path: config_dir.join("tiers.toml"),
+            tags_path: config_dir.join("tags.toml"),
+            peers_path: config_dir.join("peers.toml"),
             log_config_path: config_dir.join("log4rs.yml"),
             dbdir: dir.join("db"),
             tls: tls.then(|| TlsSettings {

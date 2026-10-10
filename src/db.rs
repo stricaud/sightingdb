@@ -616,7 +616,7 @@ impl Namespace {
         if attr.is_expired(now) {
             return false;
         }
-        attr.set_tags(tags);
+        attr.set_tags(tags, now.timestamp_millis());
         true
     }
 

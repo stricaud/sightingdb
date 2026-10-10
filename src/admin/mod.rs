@@ -266,6 +266,9 @@ pub struct ServerInfo {
     pub version: &'static str,
     pub authenticate: bool,
     pub http_enabled: bool,
+    /// Where the HTTP API listens, as `host:port`. Shown in the configuration
+    /// view, and used to notice a peer being added that is this server itself.
+    pub listen: String,
     pub config_path: String,
     pub dbdir: Option<String>,
     pub snapshot_interval: u64,
@@ -629,6 +632,281 @@ pub async fn galaxy(state: State, req: HttpRequest) -> HttpResponse {
     }))
 }
 
+/// One peer as the interface lists it.
+///
+/// The key is **not** included. It is a credential this server holds, and a
+/// topology view is not a reason to hand it back out; the interface shows that
+/// one is set and lets it be replaced, which is all editing needs.
+#[derive(Debug, Serialize)]
+pub struct PeerRow {
+    pub url: String,
+    /// What the peer stores: `null` for a full mirror, else the prefixes.
+    pub namespaces: Option<Vec<String>>,
+    /// Whether this peer came from the configuration file, and so cannot be
+    /// changed here.
+    pub fixed: bool,
+    pub health: crate::galaxy::PeerHealth,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PeersView {
+    pub peers: Vec<PeerRow>,
+    /// Whether peers can be added or removed here. False without a
+    /// `peers_file`, or with no `[galaxy]` section at all.
+    pub editable: bool,
+    /// Why not, when they cannot be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// `GET /_management/api/galaxy/peers` — the peer list, for editing.
+///
+/// Separate from `/_management/api/galaxy`, which walks the whole cascade to
+/// draw it. This is one server's own list and answers without touching the
+/// network, so the editor stays responsive while a peer is down.
+pub async fn list_peers(state: State, req: HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_admin(&state, &req) {
+        return resp;
+    }
+
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return HttpResponse::Ok().json(PeersView {
+            peers: Vec::new(),
+            editable: false,
+            note: Some(
+                "This server has no [galaxy] section, so it has no peers to manage. Add \
+                 one with a peers_file and restart; `sightingdb --setup` writes both."
+                    .to_string(),
+            ),
+        });
+    };
+
+    let health: std::collections::HashMap<String, crate::galaxy::PeerHealth> = galaxy
+        .health()
+        .into_iter()
+        .map(|known| (known.url.clone(), known))
+        .collect();
+
+    let peers = galaxy
+        .peers()
+        .into_iter()
+        .map(|peer| PeerRow {
+            namespaces: (!peer.stores.stores_everything()).then(|| peer.stores.prefixes().to_vec()),
+            fixed: galaxy.is_fixed(&peer.url),
+            health: health
+                .get(&peer.url)
+                .cloned()
+                .unwrap_or_else(|| crate::galaxy::PeerHealth::unprobed(&peer.url)),
+            url: peer.url,
+        })
+        .collect();
+
+    let editable = state.galaxy_peers_file.is_some();
+    HttpResponse::Ok().json(PeersView {
+        peers,
+        editable,
+        note: (!editable).then(|| {
+            "No peers_file is configured, so peers cannot be edited here. Set \
+             peers_file in [galaxy] and restart."
+                .to_string()
+        }),
+    })
+}
+
+/// A peer as the interface sends it.
+#[derive(Debug, Deserialize)]
+pub struct PeerChange {
+    url: String,
+    key: String,
+    /// Absent or empty means a full mirror.
+    #[serde(default)]
+    namespaces: Option<Vec<String>>,
+}
+
+/// Where UI-added peers are written, or why they cannot be.
+fn peers_file(state: &SharedState) -> Result<&PathBuf, HttpResponse> {
+    if state.galaxy.is_none() {
+        return Err(HttpResponse::Conflict().json(Message::new(
+            "This server has no [galaxy] section, so it has no galaxy to add to. Add one \
+             with a peers_file and restart.",
+        )));
+    }
+    state.galaxy_peers_file.as_ref().ok_or_else(|| {
+        HttpResponse::Conflict().json(Message::new(
+            "No peers_file is configured, so peers cannot be edited here. Set peers_file \
+             in [galaxy] and restart.",
+        ))
+    })
+}
+
+/// Write the peers the interface owns, then answer with the whole list.
+///
+/// Written after the change is already in effect, so a failed write is
+/// reported with the galaxy already using the new peer — which is the right
+/// way round: the peer works now and the file is what makes it survive a
+/// restart. The message says exactly that rather than implying the change
+/// did not happen.
+fn save_peers(state: &SharedState) -> Result<(), HttpResponse> {
+    let path = peers_file(state)?;
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return Ok(());
+    };
+    let rendered = crate::config::PeersFile::to_toml(&galaxy.editable_peers());
+
+    let write = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, rendered)?;
+        std::fs::rename(&temp, path)
+    };
+
+    if let Err(e) = write() {
+        log::error!("Could not write {}: {e}", path.display());
+        return Err(
+            HttpResponse::InternalServerError().json(Message::new(format!(
+                "The galaxy was changed and is in effect now, but {} could not be written, \
+             so the change will be lost on restart: {e}",
+                path.display()
+            ))),
+        );
+    }
+    Ok(())
+}
+
+/// `POST /_management/api/galaxy/peers` — add a peer this galaxy does not have.
+///
+/// Adding and changing are separate verbs on purpose. An upsert would mean
+/// that typing an address that already exists silently replaces its key, and
+/// the one thing a peer's key does is bound what this server may do there —
+/// replacing it by accident is not a mistake to make quietly.
+pub async fn add_peer(state: State, body: web::Json<PeerChange>, req: HttpRequest) -> HttpResponse {
+    save_peer(state, body, req, false).await
+}
+
+/// `PUT /_management/api/galaxy/peers` — change a peer this galaxy has.
+pub async fn update_peer(
+    state: State,
+    body: web::Json<PeerChange>,
+    req: HttpRequest,
+) -> HttpResponse {
+    save_peer(state, body, req, true).await
+}
+
+async fn save_peer(
+    state: State,
+    body: web::Json<PeerChange>,
+    req: HttpRequest,
+    replacing: bool,
+) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = peers_file(&state) {
+        return resp;
+    }
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return HttpResponse::Conflict().json(Message::new("This server has no galaxy."));
+    };
+
+    let change = body.into_inner();
+    // An empty namespaces list from a form means "everything" rather than
+    // "nothing": a peer that holds nothing is not a mirror, and the validator
+    // refuses it.
+    let namespaces = change
+        .namespaces
+        .as_ref()
+        .filter(|list| !list.is_empty())
+        .map(|list| list.as_slice());
+
+    let peer = match crate::config::validated_peer(&change.url, &change.key, namespaces) {
+        Ok(peer) => peer,
+        Err(e) => return HttpResponse::BadRequest().json(Message::new(e)),
+    };
+
+    if galaxy.is_fixed(&peer.url) {
+        return HttpResponse::Conflict().json(Message::new(format!(
+            "{} is declared in the configuration file. Change it there, or remove it \
+             from [galaxy] peers to manage it here.",
+            peer.url
+        )));
+    }
+
+    let url = peer.url.clone();
+    if replacing {
+        // Keeps its place in the order, so the list does not reshuffle under
+        // someone editing it.
+        if galaxy.update_peer(peer).is_none() {
+            return HttpResponse::NotFound().json(Message::new(format!(
+                "{url} is not in this galaxy. Add it instead."
+            )));
+        }
+    } else if let Err(e) = galaxy.add_peer(peer, &state.info.listen) {
+        return match e {
+            crate::galaxy::AddPeer::Invalid(message) => {
+                HttpResponse::BadRequest().json(Message::new(message))
+            }
+            crate::galaxy::AddPeer::AlreadyThere(message) => {
+                HttpResponse::Conflict().json(Message::new(message))
+            }
+        };
+    }
+
+    if let Err(resp) = save_peers(&state) {
+        return resp;
+    }
+    log::info!(
+        "Peer '{url}' {} by '{caller}'",
+        if replacing { "changed" } else { "added" }
+    );
+    list_peers(state, req).await
+}
+
+/// `DELETE /_management/api/galaxy/peers?url=...` — drop a peer.
+///
+/// By query rather than path segment because the value is a URL, which a path
+/// would have to encode and middleware is free to normalise.
+pub async fn delete_peer(
+    state: State,
+    query: web::Query<PeerQuery>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = peers_file(&state) {
+        return resp;
+    }
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return HttpResponse::Conflict().json(Message::new("This server has no galaxy."));
+    };
+
+    if galaxy.is_fixed(&query.url) {
+        return HttpResponse::Conflict().json(Message::new(format!(
+            "{} is declared in the configuration file, so removing it here would not \
+             last: it would come back at the next restart. Remove it from [galaxy] \
+             peers instead.",
+            query.url
+        )));
+    }
+    if !galaxy.remove_peer(&query.url) {
+        return HttpResponse::NotFound().json(Message::new("No such peer."));
+    }
+    if let Err(resp) = save_peers(&state) {
+        return resp;
+    }
+    log::info!("Peer '{}' removed by '{caller}'", query.url);
+    list_peers(state, req).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PeerQuery {
+    url: String,
+}
+
 /// This server, as a topology view needs it.
 fn describe(state: &SharedState) -> serde_json::Value {
     serde_json::json!({
@@ -955,19 +1233,158 @@ pub async fn set_tags(state: State, body: web::Json<TagChange>, req: HttpRequest
         return resp;
     }
 
-    if !state.db.set_tags(&namespace, &change.value, &change.tags) {
-        return HttpResponse::NotFound().json(Message::new("No such value."));
+    // Where the value actually lives decides how the change gets there. A
+    // server that holds the namespace changes its own copy and tells the
+    // mirrors; one that does not — a router — has no copy to change, so it
+    // asks a mirror for the value, applies the change to that, and offers the
+    // result back to all of them.
+    let held = state.db.holds(&namespace);
+    if held {
+        if !state.db.set_tags(&namespace, &change.value, &change.tags) {
+            return HttpResponse::NotFound().json(Message::new("No such value."));
+        }
+    } else if let Err(resp) = retag_through_galaxy(&state, &namespace, &change).await {
+        return resp;
     }
 
     log::info!(
         "Tags of '{}' in '{namespace}' set by '{caller}'",
         change.value
     );
+
+    // A tag change is not a sighting, so nothing else would ever carry it to
+    // the mirrors: without this it would sit here until someone noticed the
+    // two copies disagreed. Pushed rather than waited for, because the whole
+    // point of editing a tag is that it is wrong *now*.
+    let spread = spread_tags(&state, &namespace, &change.value).await;
+
     let consensus = state.db.count(crate::db::ALL_NAMESPACE, &change.value);
     match state.db.view(&namespace, &change.value, consensus, false) {
-        Some(view) => HttpResponse::Ok().json(view),
+        Some(view) => match spread {
+            // The common case: nothing to say beyond the value itself, which
+            // is the shape every existing client already reads.
+            None => HttpResponse::Ok().json(view),
+            Some(report) => HttpResponse::Ok().json(TaggedAcross {
+                value: view,
+                mirrors: report,
+            }),
+        },
         None => HttpResponse::Ok().json(Message::new("ok")),
     }
+}
+
+/// A tag change, and which mirrors it reached.
+#[derive(Debug, Serialize)]
+pub struct TaggedAcross {
+    #[serde(flatten)]
+    value: crate::attribute::AttributeView,
+    /// One entry per mirror that holds the namespace. Absent when this server
+    /// stands alone, so a lone server's answer is unchanged.
+    mirrors: Vec<MirrorOutcome>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MirrorOutcome {
+    url: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Offer this server's copy of a value to every mirror of its namespace.
+///
+/// `None` when there is nothing to offer it to. Reported rather than silent,
+/// because "the tag is off here but still on a mirror" is precisely the state
+/// someone editing tags needs to know about.
+async fn spread_tags(
+    state: &SharedState,
+    namespace: &str,
+    value: &str,
+) -> Option<Vec<MirrorOutcome>> {
+    let galaxy = state.galaxy.as_ref()?;
+    let payload = state.db.merge_payload(namespace, value)?;
+    let outcomes = galaxy
+        .push_value(namespace, value, &payload, galaxy.max_hops())
+        .await;
+    if outcomes.is_empty() {
+        return None;
+    }
+    Some(
+        outcomes
+            .into_iter()
+            .map(|(url, outcome)| match outcome {
+                Ok(_) => MirrorOutcome {
+                    url,
+                    ok: true,
+                    error: None,
+                },
+                Err(e) => {
+                    log::warn!("Could not send the tag change for '{value}' to {url}: {e}");
+                    MirrorOutcome {
+                        url,
+                        ok: false,
+                        error: Some(e),
+                    }
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Retag a value this server does not hold.
+///
+/// A router keeps no copy of the value, so there is nothing here to set tags
+/// on. It fetches the value as a mirror holds it, applies the replacement to
+/// that, and writes the result into its own database — from where
+/// [`spread_tags`] offers it to every mirror. Writing it here is what makes
+/// the local copy the thing that was agreed on; it is held in the router's
+/// database like any other merge, and the router's own storage policy decides
+/// whether it is kept beyond that.
+async fn retag_through_galaxy(
+    state: &SharedState,
+    namespace: &str,
+    change: &TagChange,
+) -> Result<(), HttpResponse> {
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return Err(HttpResponse::NotFound().json(Message::new("No such value.")));
+    };
+
+    let path = format!(
+        "/r/{}?val={}&noshadow&for_merge",
+        namespace,
+        crate::galaxy::urlencoding_of(&change.value)
+    );
+    let answer = galaxy
+        .forward_read(namespace, &change.value, &path, galaxy.max_hops(), "")
+        .await
+        .map_err(|e| {
+            HttpResponse::BadGateway().json(Message::new(format!(
+                "Could not reach a mirror holding '{namespace}': {e}"
+            )))
+        })?;
+
+    if !(200..300).contains(&answer.status) {
+        // Relayed, so "no such value" from the mirror reads as it would if the
+        // interface had asked the mirror directly.
+        return Err(HttpResponse::build(
+            actix_web::http::StatusCode::from_u16(answer.status)
+                .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY),
+        )
+        .content_type("application/json")
+        .body(answer.body));
+    }
+
+    let mut payload: crate::attribute::Merge =
+        serde_json::from_slice(&answer.body).map_err(|e| {
+            HttpResponse::BadGateway()
+                .json(Message::new(format!("A mirror answered unreadably: {e}")))
+        })?;
+
+    payload.tags = change.tags.clone();
+    payload.tags_at = chrono::Utc::now().timestamp_millis();
+
+    state.db.merge(namespace, &change.value, &payload);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,6 +2098,13 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         )
         .route("/_management/api/tree", web::get().to(tree))
         .route("/_management/api/galaxy", web::get().to(galaxy))
+        .route("/_management/api/galaxy/peers", web::get().to(list_peers))
+        .route("/_management/api/galaxy/peers", web::post().to(add_peer))
+        .route("/_management/api/galaxy/peers", web::put().to(update_peer))
+        .route(
+            "/_management/api/galaxy/peers",
+            web::delete().to(delete_peer),
+        )
         .route("/_management/api/rejections", web::get().to(rejections))
         .route(
             "/_management/api/rejections",
@@ -2288,6 +2712,285 @@ mod tests {
         // Capped rather than refused, so a careless caller still gets an answer.
         let body: Json = test::read_body_json(resp).await;
         assert_eq!(body["items"].as_array().unwrap().len(), 3);
+    }
+
+    // -- galaxy peers -------------------------------------------------------
+
+    /// A router with a peers file and one peer declared in the configuration,
+    /// so both the editable and the read-only case are present.
+    fn peered_state(dir: &std::path::Path) -> State {
+        let mut inner = SharedState::new(true);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner.info.listen = "127.0.0.1:9999".to_string();
+        inner.galaxy_peers_file = Some(dir.join("peers.toml"));
+        inner.galaxy = Some(crate::galaxy::Galaxy::new(&crate::config::GalaxySettings {
+            peers: vec![crate::config::Peer {
+                url: "http://from-the-file:9999".to_string(),
+                key: "k".to_string(),
+                stores: crate::db::StoragePolicy::everything(),
+            }],
+            peers_file: Some(dir.join("peers.toml")),
+            fixed: vec!["http://from-the-file:9999".to_string()],
+            max_hops: 4,
+            health_interval: 30,
+            sync_interval: 0,
+            reconcile_interval: 0,
+            gossip_interval: 0,
+            acl_authority: false,
+            acl_replaceable: false,
+            verify_tls: true,
+        }));
+        web::Data::new(inner)
+    }
+
+    macro_rules! peer {
+        ($app:expr, $method:ident, $body:expr) => {
+            test::call_service(
+                &$app,
+                test::TestRequest::$method()
+                    .uri("/_management/api/galaxy/peers")
+                    .insert_header(("Authorization", ADMIN))
+                    .set_json($body)
+                    .to_request(),
+            )
+            .await
+        };
+    }
+
+    /// A peer added here is in effect at once and written down, so it survives
+    /// a restart. Both halves matter: in effect but unwritten would vanish,
+    /// written but not in effect would need a restart.
+    #[actix_web::test]
+    async fn a_peer_added_here_takes_effect_and_is_written() {
+        let dir = TempDir::new("peers-add");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        let resp = peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://added:9999", "key": "secret"})
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // In effect: the galaxy will forward to it now.
+        assert!(
+            st.galaxy
+                .as_ref()
+                .unwrap()
+                .holders("feeds/ips")
+                .iter()
+                .any(|peer| peer.url == "http://added:9999"),
+            "the new peer is not being used for forwarding"
+        );
+
+        // Written down, with its key, which is what a restart needs.
+        let written = std::fs::read_to_string(dir.0.join("peers.toml")).expect("the file");
+        assert!(written.contains("http://added:9999"), "{written}");
+        assert!(written.contains("secret"), "{written}");
+        // And *without* the peer the configuration owns, which would otherwise
+        // be declared in two files.
+        assert!(
+            !written.contains("from-the-file"),
+            "a configured peer was copied into the machine-owned file: {written}"
+        );
+    }
+
+    /// Adding and changing are separate verbs: an address typed into the add
+    /// form must not silently replace an existing peer's key, which is the one
+    /// thing bounding what this server may do there.
+    #[actix_web::test]
+    async fn adding_a_peer_that_exists_is_refused_rather_than_an_upsert() {
+        let dir = TempDir::new("peers-twice");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://added:9999", "key": "first"})
+        );
+        let resp = peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://added:9999", "key": "second"})
+        );
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // The original key is intact.
+        let written = std::fs::read_to_string(dir.0.join("peers.toml")).unwrap();
+        assert!(written.contains("first"), "{written}");
+        assert!(!written.contains("second"), "{written}");
+    }
+
+    #[actix_web::test]
+    async fn changing_a_peer_keeps_one_entry() {
+        let dir = TempDir::new("peers-put");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://added:9999", "key": "first"})
+        );
+        let resp = peer!(
+            app,
+            put,
+            serde_json::json!({"url": "http://added:9999", "key": "second"})
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: Json = test::read_body_json(resp).await;
+        let urls: Vec<&str> = body["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["url"].as_str().unwrap())
+            .collect();
+        assert_eq!(urls, vec!["http://from-the-file:9999", "http://added:9999"]);
+
+        let written = std::fs::read_to_string(dir.0.join("peers.toml")).unwrap();
+        assert!(written.contains("second"), "{written}");
+    }
+
+    #[actix_web::test]
+    async fn changing_a_peer_that_is_not_there_is_not_an_add() {
+        let dir = TempDir::new("peers-put-missing");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        let resp = peer!(
+            app,
+            put,
+            serde_json::json!({"url": "http://nowhere:9999", "key": "k"})
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A peer from the hand-maintained configuration is shown but not
+    /// editable: "removing" it here would last until the next restart, which
+    /// is worse than refusing.
+    #[actix_web::test]
+    async fn a_configured_peer_cannot_be_changed_or_removed_here() {
+        let dir = TempDir::new("peers-fixed");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/galaxy/peers", Some(ADMIN))).await;
+        assert_eq!(body["peers"][0]["fixed"], true);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/_management/api/galaxy/peers?url=http://from-the-file:9999")
+                .insert_header(("Authorization", ADMIN))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: Json = test::read_body_json(resp).await;
+        assert!(
+            body["message"].as_str().unwrap().contains("configuration"),
+            "the refusal should say where it came from: {body}"
+        );
+
+        let resp = peer!(
+            app,
+            put,
+            serde_json::json!({"url": "http://from-the-file:9999", "key": "k"})
+        );
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    /// Its own address is refused, because a server mirroring itself is never
+    /// what was meant.
+    #[actix_web::test]
+    async fn a_server_cannot_be_added_to_its_own_galaxy() {
+        let dir = TempDir::new("peers-self");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        let resp = peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://127.0.0.1:9999", "key": "k"})
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Json = test::read_body_json(resp).await;
+        assert!(
+            body["message"].as_str().unwrap().contains("own address"),
+            "{body}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_peer_needs_a_key_and_a_real_url() {
+        let dir = TempDir::new("peers-bad");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        for body in [
+            serde_json::json!({"url": "http://ok:9999", "key": ""}),
+            serde_json::json!({"url": "ok:9999", "key": "k"}),
+            serde_json::json!({"url": "", "key": "k"}),
+        ] {
+            let resp = peer!(app, post, body.clone());
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "accepted {body}");
+        }
+    }
+
+    /// The key is a credential this server holds. A topology view is not a
+    /// reason to hand it back out.
+    #[actix_web::test]
+    async fn a_peers_key_is_never_sent_back() {
+        let dir = TempDir::new("peers-secret");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://added:9999", "key": "do-not-leak"})
+        );
+        let resp = get!(app, "/_management/api/galaxy/peers", Some(ADMIN));
+        let body = test::read_body(resp).await;
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("do-not-leak"),
+            "a peer key was returned: {text}"
+        );
+    }
+
+    /// Without a peers file the list is read-only, and the interface is told
+    /// so rather than finding out when a save fails.
+    #[actix_web::test]
+    async fn peers_are_read_only_without_a_peers_file() {
+        let st = state();
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/galaxy/peers", Some(ADMIN))).await;
+        assert_eq!(body["editable"], false);
+        assert!(body["note"].as_str().is_some(), "{body}");
+
+        let resp = peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://x:1", "key": "k"})
+        );
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[actix_web::test]
+    async fn the_peer_list_needs_a_key() {
+        let st = state();
+        let app = app!(st);
+        assert_eq!(
+            get!(app, "/_management/api/galaxy/peers", NO_KEY).status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     // -- the tag vocabulary -------------------------------------------------

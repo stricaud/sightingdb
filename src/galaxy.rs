@@ -84,7 +84,7 @@ pub struct PeerHealth {
 }
 
 impl PeerHealth {
-    fn unprobed(url: &str) -> Self {
+    pub fn unprobed(url: &str) -> Self {
         PeerHealth {
             url: url.to_string(),
             online: false,
@@ -102,7 +102,15 @@ impl PeerHealth {
 /// The peers, and what is known about them.
 #[derive(Debug)]
 pub struct Galaxy {
-    peers: Vec<Peer>,
+    /// The peers, which the management interface can add to and remove from
+    /// while the server runs. Behind a lock for that reason, like the ACL:
+    /// adding a mirror should not need a restart, and a restart of a router is
+    /// a gap in service for everything behind it.
+    ///
+    /// Read as a snapshot rather than held across a request, so a long
+    /// forward cannot block an edit. The cost is a handful of small clones
+    /// per request, which is nothing beside the HTTP call they are for.
+    peers: RwLock<Vec<Peer>>,
     /// How many hops a forwarded request may still take. Spent on each hop and
     /// refused at zero, which is what stops a miswired cycle.
     max_hops: u8,
@@ -123,6 +131,10 @@ pub struct Galaxy {
     /// self-signed instances, which is what `--setup` produces.
     verify_tls: bool,
     health: RwLock<HashMap<String, PeerHealth>>,
+    /// URLs declared in the main configuration, which the management
+    /// interface may show but not change. See
+    /// [`crate::config::GalaxySettings::peers_file`].
+    fixed: Vec<String>,
 }
 
 /// A forwarded response body is read into memory, so it needs a ceiling. Large
@@ -173,7 +185,8 @@ impl Galaxy {
             .collect();
 
         Galaxy {
-            peers: settings.peers.clone(),
+            peers: RwLock::new(settings.peers.clone()),
+            fixed: settings.fixed.clone(),
             max_hops: settings.max_hops,
             health_interval: settings.health_interval,
             sync_interval: settings.sync_interval,
@@ -189,11 +202,22 @@ impl Galaxy {
         self.max_hops
     }
 
-    /// Peers that store `namespace`, in configured order.
-    pub fn holders(&self, namespace: &str) -> Vec<&Peer> {
+    /// Every peer, as a snapshot.
+    pub fn peers(&self) -> Vec<Peer> {
         self.peers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Peers that store `namespace`, in configured order.
+    pub fn holders(&self, namespace: &str) -> Vec<Peer> {
+        self.peers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .filter(|peer| peer.stores.holds(namespace))
+            .cloned()
             .collect()
     }
 
@@ -202,7 +226,7 @@ impl Galaxy {
     /// A peer not yet probed counts as usable: refusing to forward for the
     /// first few seconds of a server's life would be worse than trying and
     /// finding out.
-    pub fn live_holders(&self, namespace: &str) -> Vec<&Peer> {
+    pub fn live_holders(&self, namespace: &str) -> Vec<Peer> {
         let health = self.health.read().unwrap_or_else(PoisonError::into_inner);
         self.holders(namespace)
             .into_iter()
@@ -231,7 +255,7 @@ impl Galaxy {
     /// catching up, one of them answers anyway: an under-reported count beats
     /// no answer at all, and refusing would make a whole galaxy unreadable
     /// for as long as it took to start.
-    pub fn reader_for<'a>(&'a self, namespace: &str, value: &str) -> Option<&'a Peer> {
+    pub fn reader_for(&self, namespace: &str, value: &str) -> Option<Peer> {
         let behind: Vec<String> = {
             let health = self.health.read().unwrap_or_else(PoisonError::into_inner);
             health
@@ -242,16 +266,15 @@ impl Galaxy {
         };
 
         let live = self.live_holders(namespace);
-        let current: Vec<&Peer> = live
+        let current: Vec<Peer> = live
             .iter()
-            .copied()
             .filter(|peer| !behind.contains(&peer.url))
+            .cloned()
             .collect();
 
-        let choose_from = if current.is_empty() { &live } else { &current };
+        let choose_from = if current.is_empty() { live } else { current };
         choose_from
-            .iter()
-            .copied()
+            .into_iter()
             .max_by_key(|peer| weigh(value, &peer.url))
     }
 
@@ -261,7 +284,7 @@ impl Galaxy {
     /// does not reshuffle itself between refreshes.
     pub fn health(&self) -> Vec<PeerHealth> {
         let health = self.health.read().unwrap_or_else(PoisonError::into_inner);
-        self.peers
+        self.peers()
             .iter()
             .map(|peer| {
                 health
@@ -310,6 +333,55 @@ impl Galaxy {
             }
         }
     }
+}
+
+/// Why a peer was not taken into the galaxy.
+///
+/// Two cases because they are two different answers: a peer that cannot be
+/// used however it is sent is a bad request, and one that is simply already
+/// known is a conflict. Collapsing them would make "you already have this"
+/// indistinguishable from "this is not a URL".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddPeer {
+    /// Not usable as a peer at all.
+    Invalid(String),
+    /// This galaxy already has it.
+    AlreadyThere(String),
+}
+
+impl std::fmt::Display for AddPeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddPeer::Invalid(message) | AddPeer::AlreadyThere(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+/// Does this URL point at the server doing the asking?
+///
+/// Best effort, and only for catching the obvious mistake of adding a server
+/// to its own galaxy. A hostname that resolves to the same machine, or a proxy
+/// in front of it, is not caught — which is why the hop count, not this, is
+/// what makes a loop safe.
+fn is_own_address(url: &str, own_listen: &str) -> bool {
+    let host_port = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    if host_port == own_listen {
+        return true;
+    }
+    // A server listening on every interface answers on localhost too, so
+    // "0.0.0.0:9999" and "127.0.0.1:9999" are the same server.
+    let Some((own_host, own_port)) = own_listen.rsplit_once(':') else {
+        return false;
+    };
+    let Some((host, port)) = host_port.rsplit_once(':') else {
+        return false;
+    };
+    port == own_port
+        && matches!(own_host, "0.0.0.0" | "[::]" | "::")
+        && matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
 }
 
 /// The rendezvous weight of one (value, peer) pair.
@@ -362,7 +434,7 @@ pub async fn run(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdow
     let Some(galaxy) = state.galaxy.as_ref() else {
         return;
     };
-    if galaxy.peers.is_empty() {
+    if galaxy.peers().is_empty() {
         return;
     }
 
@@ -374,7 +446,7 @@ pub async fn run(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdow
     log::info!(
         "Galaxy health checks every {}s for {} peer(s){}",
         galaxy.health_interval,
-        galaxy.peers.len(),
+        galaxy.peers().len(),
         if galaxy.verify_tls {
             ""
         } else {
@@ -384,7 +456,7 @@ pub async fn run(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdow
 
     let period = Duration::from_secs(galaxy.health_interval);
     loop {
-        for peer in &galaxy.peers {
+        for peer in &galaxy.peers() {
             if shutdown.is_stopped() {
                 return;
             }
@@ -477,8 +549,191 @@ impl Galaxy {
                 namespace: namespace.to_string(),
             })?;
 
-        self.send(peer, awc::http::Method::GET, path, None, hops_left, origin)
+        self.send(&peer, awc::http::Method::GET, path, None, hops_left, origin)
             .await
+    }
+
+    /// Was this peer declared in the main configuration?
+    ///
+    /// Such a peer is read-only here: it lives in a hand-maintained file that
+    /// this program does not rewrite, so letting the interface "remove" one
+    /// would mean it came back at the next restart.
+    pub fn is_fixed(&self, url: &str) -> bool {
+        let url = url.trim().trim_end_matches('/');
+        self.fixed.iter().any(|known| known == url)
+    }
+
+    /// The peers that belong in the peers file: everything the interface
+    /// added, and nothing the main configuration declared.
+    pub fn editable_peers(&self) -> Vec<Peer> {
+        self.peers()
+            .into_iter()
+            .filter(|peer| !self.is_fixed(&peer.url))
+            .collect()
+    }
+
+    /// Take a peer into the galaxy while the server runs.
+    ///
+    /// Returns the reason it was refused, if it was. Deliberately **does not**
+    /// require the peer to be reachable: a mirror that is down should still be
+    /// addable, or a galaxy could not be rebuilt after whatever took it down.
+    /// The health poller picks it up on its next pass and the interface shows
+    /// it offline until it answers.
+    ///
+    /// A loop is not checked for beyond the obvious case of this server's own
+    /// address. Two routers pointed at each other is legitimate — that is what
+    /// cascading is — and what makes it safe is the hop count, spent on every
+    /// forward and refused at zero.
+    pub fn add_peer(&self, peer: Peer, own_listen: &str) -> Result<Peer, AddPeer> {
+        let peer = Peer {
+            url: peer.url.trim().trim_end_matches('/').to_string(),
+            key: peer.key.trim().to_string(),
+            stores: peer.stores,
+        };
+        if !(peer.url.starts_with("http://") || peer.url.starts_with("https://")) {
+            return Err(AddPeer::Invalid(
+                "a peer URL starts with http:// or https://".to_string(),
+            ));
+        }
+        if peer
+            .url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .is_empty()
+        {
+            return Err(AddPeer::Invalid("a peer URL needs a host".to_string()));
+        }
+        if peer.key.is_empty() {
+            return Err(AddPeer::Invalid(
+                "a peer needs the key this server will authenticate with there".to_string(),
+            ));
+        }
+        if is_own_address(&peer.url, own_listen) {
+            return Err(AddPeer::Invalid(format!(
+                "{} is this server's own address, which would make it its own mirror",
+                peer.url
+            )));
+        }
+
+        let mut peers = self.peers.write().unwrap_or_else(PoisonError::into_inner);
+        if peers.iter().any(|known| known.url == peer.url) {
+            return Err(AddPeer::AlreadyThere(format!(
+                "{} is already in this galaxy",
+                peer.url
+            )));
+        }
+        if self.is_fixed(&peer.url) {
+            return Err(AddPeer::AlreadyThere(format!(
+                "{} is declared in the configuration file, so it cannot be changed here",
+                peer.url
+            )));
+        }
+        peers.push(peer.clone());
+        Ok(peer)
+    }
+
+    /// Drop a peer. Returns false if it was not there.
+    ///
+    /// Its health is forgotten with it, so re-adding the same URL starts
+    /// unprobed rather than inheriting a stale "offline".
+    pub fn remove_peer(&self, url: &str) -> bool {
+        let url = url.trim().trim_end_matches('/');
+        let mut peers = self.peers.write().unwrap_or_else(PoisonError::into_inner);
+        let before = peers.len();
+        peers.retain(|peer| peer.url != url);
+        let removed = peers.len() != before;
+        drop(peers);
+        if removed {
+            self.health
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(url);
+        }
+        removed
+    }
+
+    /// Replace a peer's key or namespace list, keeping its place in the order.
+    pub fn update_peer(&self, peer: Peer) -> Option<Peer> {
+        let peer = Peer {
+            url: peer.url.trim().trim_end_matches('/').to_string(),
+            key: peer.key.trim().to_string(),
+            stores: peer.stores,
+        };
+        if peer.key.is_empty() {
+            return None;
+        }
+        let mut peers = self.peers.write().unwrap_or_else(PoisonError::into_inner);
+        match peers.iter_mut().find(|known| known.url == peer.url) {
+            Some(known) => {
+                *known = peer.clone();
+                Some(peer)
+            }
+            None => None,
+        }
+    }
+
+    /// Push one value's state to every mirror that holds its namespace.
+    ///
+    /// For a change that is not a sighting and so has no other way to travel:
+    /// a tag set or removed in the management interface. Sent through
+    /// `/_api/merge`, the same channel the periodic catch-up uses, so the
+    /// mirrors apply it by the merge rules — it converges, it can be retried,
+    /// and it needs only the write grant a peer key already has. Forwarding
+    /// the management request instead would need `admin` on every peer key,
+    /// which is the opposite of keeping those keys narrow.
+    ///
+    /// A mirror that is down gets it at the next catch-up instead, because
+    /// what is pushed is state rather than an instruction: the mirror pulls
+    /// the same thing when it comes back. So a failure here is reported and
+    /// not retried.
+    pub async fn push_value(
+        &self,
+        namespace: &str,
+        value: &str,
+        state: &crate::attribute::Merge,
+        hops_left: u8,
+    ) -> Vec<(String, Result<u16, String>)> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "items": [{
+                "namespace": namespace,
+                "value": value,
+                "counts": state.counts,
+                "stats": state.stats,
+                "first_seen": state.first_seen,
+                "last_seen": state.last_seen,
+                "tags": state.tags,
+                "tags_at": state.tags_at,
+                "ttl": state.ttl,
+            }]
+        }))
+        .unwrap_or_default();
+
+        let mut outcomes = Vec::new();
+        for peer in self.live_holders(namespace) {
+            let sent = self
+                .send(
+                    &peer,
+                    awc::http::Method::POST,
+                    "/_api/merge",
+                    Some(&body),
+                    hops_left,
+                    "",
+                )
+                .await;
+            outcomes.push((
+                peer.url.clone(),
+                match sent {
+                    Ok(answer) if (200..300).contains(&answer.status) => Ok(answer.status),
+                    Ok(answer) => Err(format!(
+                        "answered {}: {}",
+                        answer.status,
+                        String::from_utf8_lossy(&answer.body)
+                    )),
+                    Err(e) => Err(e.to_string()),
+                },
+            ));
+        }
+        outcomes
     }
 
     /// Which live mirror should serve a read of `value`, by URL.
@@ -517,11 +772,12 @@ impl Galaxy {
             return Err(ForwardError::TooManyHops);
         }
         let peer = self
-            .peers
-            .iter()
+            .peers()
+            .into_iter()
             .find(|peer| peer.url == url)
             .ok_or_else(|| ForwardError::Unreachable(format!("{url} is not a configured peer")))?;
-        self.send(peer, method, path, body, hops_left, origin).await
+        self.send(&peer, method, path, body, hops_left, origin)
+            .await
     }
 
     /// Forward a write to every live mirror of the namespace.
@@ -549,7 +805,7 @@ impl Galaxy {
             return Err(ForwardError::NoHolder);
         }
 
-        let live: Vec<Peer> = self.live_holders(namespace).into_iter().cloned().collect();
+        let live: Vec<Peer> = self.live_holders(namespace);
         if live.is_empty() {
             return Err(ForwardError::AllDown {
                 namespace: namespace.to_string(),
@@ -656,7 +912,7 @@ impl Galaxy {
             return Vec::new();
         }
         let mut found = Vec::new();
-        for peer in &self.peers {
+        for peer in &self.peers() {
             match self
                 .send(
                     peer,
@@ -706,7 +962,7 @@ pub async fn sync(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdo
     let Some(galaxy) = state.galaxy.as_ref() else {
         return;
     };
-    if galaxy.peers.is_empty() || galaxy.sync_interval == 0 {
+    if galaxy.peers().is_empty() || galaxy.sync_interval == 0 {
         // Nothing to catch up from, or catching up is off. Either way this
         // server is as current as it is going to get.
         state.set_catching_up(false);
@@ -715,7 +971,7 @@ pub async fn sync(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdo
 
     log::info!(
         "Catching up from {} peer(s) every {}s",
-        galaxy.peers.len(),
+        galaxy.peers().len(),
         galaxy.sync_interval
     );
 
@@ -844,7 +1100,7 @@ impl Galaxy {
             return report;
         }
 
-        for peer in &self.peers {
+        for peer in &self.peers() {
             match self
                 .send(peer, method.clone(), path, body, hops_left, "")
                 .await
@@ -896,7 +1152,7 @@ pub struct Gossiped {
 ///
 /// An API key is whatever an operator typed, so it may hold a slash or a space
 /// and cannot be pasted into a URL as it stands.
-fn urlencoding_of(value: &str) -> String {
+pub fn urlencoding_of(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {
@@ -916,9 +1172,10 @@ impl Galaxy {
     /// this server holds an `admin` key — the same boundary that decides
     /// whether a change may be pushed.
     pub async fn peer_keys(&self) -> Vec<PeerKeys> {
-        let mut found = Vec::with_capacity(self.peers.len());
+        let known = self.peers();
+        let mut found = Vec::with_capacity(known.len());
 
-        for peer in &self.peers {
+        for peer in &self.peers() {
             let mut row = PeerKeys {
                 url: peer.url.clone(),
                 keys: Vec::new(),
@@ -994,7 +1251,7 @@ pub async fn gossip(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shut
     let Some(galaxy) = state.galaxy.as_ref() else {
         return;
     };
-    if galaxy.peers.is_empty() || galaxy.gossip_interval == 0 {
+    if galaxy.peers().is_empty() || galaxy.gossip_interval == 0 {
         return;
     }
     // Nothing to offer, and nothing to offer it with.
@@ -1100,7 +1357,7 @@ pub async fn reconcile(state: Arc<crate::handlers::SharedState>, shutdown: Arc<S
     let Some(galaxy) = state.galaxy.as_ref() else {
         return;
     };
-    if galaxy.peers.is_empty() || galaxy.reconcile_interval == 0 {
+    if galaxy.peers().is_empty() || galaxy.reconcile_interval == 0 {
         return;
     }
 
@@ -1160,7 +1417,7 @@ impl Galaxy {
         let mut report = Reconciled::default();
         let mut seen_namespaces: BTreeSet<String> = BTreeSet::new();
 
-        for peer in &self.peers {
+        for peer in &self.peers() {
             let names = self.namespaces_of(peer).await?;
             for namespace in names {
                 if !crate::db::counts_towards_consensus(&namespace) {
@@ -1239,7 +1496,7 @@ impl Galaxy {
     async fn catch_up(&self, state: &crate::handlers::SharedState, full: bool) -> CaughtUp {
         let mut report = CaughtUp::default();
 
-        for peer in &self.peers {
+        for peer in &self.peers() {
             // Namespaces the peer has that we are willing to store. Asked of
             // the peer rather than taken from our own catalogue, because a
             // server that was down does not know about namespaces created
@@ -1426,6 +1683,10 @@ struct MergeOfferItem {
     last_seen: i64,
     #[serde(default)]
     tags: String,
+    /// When the peer last replaced its tag set. Absent from a peer too old to
+    /// send it, which reads as zero and so loses to any replacement here.
+    #[serde(default)]
+    tags_at: i64,
     #[serde(default)]
     ttl: u64,
 }
@@ -1438,6 +1699,7 @@ impl MergeOfferItem {
             first_seen: self.first_seen,
             last_seen: self.last_seen,
             tags: self.tags.clone(),
+            tags_at: self.tags_at,
             ttl: self.ttl,
         }
     }
@@ -1554,6 +1816,8 @@ mod tests {
                 })
                 .collect(),
             max_hops: 4,
+            peers_file: None,
+            fixed: Vec::new(),
             health_interval: 30,
             sync_interval: 300,
             reconcile_interval: 3600,

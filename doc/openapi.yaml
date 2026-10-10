@@ -1092,6 +1092,66 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
 
   /_management/api/tags:
+    get:
+      tags: [management, tags]
+      summary: The tag vocabulary, and which tags are in use
+      description: |
+        Two things at once: the tags someone has given a colour and a
+        description, and the tags actually found on values. A feed brings
+        whatever tags it brings, so the second set is not a subset of the
+        first, and an undefined tag is listed with `defined: false` so it can
+        be adopted rather than discovered by accident.
+
+        A name ending in `:` is a *family* and colours every tag beneath it —
+        `stix-type:` covers `stix-type:ipv4-addr` and everything else under
+        it. Half of SightingDB's own vocabulary is `key:value` with an open set
+        of values, which could not be enumerated here even in principle.
+
+        `used` counts only the values loaded in memory, and
+        `counted_namespaces`/`total_namespaces` say how much that was. Reading
+        every tag otherwise means paging every cold shard back in, which would
+        make opening this page the most expensive thing the server does. A key
+        that cannot read every namespace gets no counts at all, since a count
+        would otherwise reveal what is in namespaces it has no access to.
+      responses:
+        "200":
+          description: The vocabulary and the tags in use
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tags:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string, example: "tlp:amber" }
+                        colour: { type: string, example: "#FFC000" }
+                        description: { type: string }
+                        family:
+                          type: boolean
+                          description: Whether this name colours a whole family.
+                        used:
+                          type: integer
+                          nullable: true
+                          description: >-
+                            Loaded values carrying it, or everything beneath it
+                            for a family. Null when it is defined but unused.
+                        defined:
+                          type: boolean
+                          description: >-
+                            Whether the vocabulary defines it, or it was only
+                            found on values.
+                  unknown_colour:
+                    type: string
+                    description: What an undefined tag is shown in.
+                  editable:
+                    type: boolean
+                    description: False without a `tags_file`.
+                  counted_namespaces: { type: integer }
+                  total_namespaces: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
     post:
       tags: [management]
       summary: Replace a value's tags
@@ -1099,6 +1159,17 @@ paths:
         Writes through `/w` merge tags; this replaces the set, which is the only
         way a wrong tag comes off. It is not a sighting: nothing is counted and
         no timestamp moves.
+
+        In a galaxy the change is **pushed to every mirror of the namespace**
+        as it is made, through `/_api/merge`, and the response gains a
+        `mirrors` array saying which took it. A tag change is not a sighting,
+        so nothing else would ever carry it; and because a replacement records
+        when it happened, a mirror that still has the old set does not put it
+        back at the next catch-up. A mirror that was down gets it then instead.
+
+        On a server that does not store the namespace — a router — the value is
+        fetched from a mirror, changed, and offered back to all of them, so the
+        interface works the same whether it is pointed at a router or a node.
       requestBody:
         required: true
         content:
@@ -1115,12 +1186,251 @@ paths:
                   example: stix-type:ipv4-addr,tlp:amber
       responses:
         "200":
-          description: The value as it now stands
+          description: |
+            The value as it now stands. In a galaxy it also carries `mirrors`,
+            one entry per mirror the change was sent to.
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/Attribute" }
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Attribute"
+                  - type: object
+                    properties:
+                      mirrors:
+                        type: array
+                        description: Present only when this server has peers.
+                        items:
+                          type: object
+                          properties:
+                            url: { type: string }
+                            ok: { type: boolean }
+                            error: { type: string }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: >-
+            No mirror holding the namespace could be reached, on a server that
+            does not store it itself.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+
+  /_management/api/tags/vocabulary:
+    post:
+      tags: [management, tags]
+      summary: Define or redefine one tag's colour
+      description: |
+        Needs a `tags_file`, which is machine-owned and rewritten whole — the
+        main configuration is hand-maintained and comment-rich, and a program
+        that rewrote it would destroy those comments. Takes effect at once,
+        without a restart.
+
+        A name ending in `:` defines a family. Answers with the whole table, so
+        the interface need not ask again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, colour]
+              properties:
+                name:
+                  type: string
+                  description: >-
+                    The tag, or a family if it ends in `:`. No commas — a comma
+                    is what separates tags on a value.
+                  example: "tlp:amber"
+                colour:
+                  type: string
+                  description: "`#rgb` or `#rrggbb`."
+                  example: "#FFC000"
+                description: { type: string }
+      responses:
+        "200":
+          description: The whole table, as the GET above returns it
+        "400":
+          description: The name or the colour is not usable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: No `tags_file` is configured, so colours are read-only
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+    delete:
+      tags: [management, tags]
+      summary: Forget a tag's colour
+      description: |
+        **Values keep the tag itself.** This is a presentation setting, and
+        deleting data from a colour picker would be a trap. The tag therefore
+        stays in the table, listed as undefined for as long as anything carries
+        it.
+
+        By query rather than path segment because a tag contains `:` and often
+        `/`, which a path would have to encode and middleware is free to
+        normalise.
+      parameters:
+        - name: tag
+          in: query
+          required: true
+          schema: { type: string }
+          example: "tlp:amber"
+      responses:
+        "200":
+          description: The whole table, as the GET above returns it
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: The vocabulary does not define that tag
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "409":
+          description: No `tags_file` is configured, so colours are read-only
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+
+  /_management/api/galaxy/peers:
+    get:
+      tags: [management, galaxy]
+      summary: This server's peers, for editing
+      description: |
+        Separate from `/_management/api/galaxy`, which walks the whole cascade
+        to draw it. This is one server's own list and answers without touching
+        the network, so the editor stays responsive while a peer is down.
+
+        **Keys are never returned.** A peer key is a credential this server
+        holds, and a topology view is not a reason to hand it back out.
+
+        A peer declared in `[galaxy] peers` has `fixed: true` and cannot be
+        changed here: that file is hand-maintained, so a change made here would
+        only last until the next restart.
+      responses:
+        "200":
+          description: The peer list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  peers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        url: { type: string }
+                        namespaces:
+                          type: array
+                          nullable: true
+                          description: Null for a full mirror.
+                          items: { type: string }
+                        fixed:
+                          type: boolean
+                          description: >-
+                            Declared in the configuration file, so read-only
+                            here.
+                        health: { $ref: "#/components/schemas/PeerHealth" }
+                  editable:
+                    type: boolean
+                    description: >-
+                      False without a `peers_file`, or with no `[galaxy]`
+                      section at all.
+                  note:
+                    type: string
+                    description: Why they cannot be edited, when they cannot.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [management, galaxy]
+      summary: Add a peer
+      description: |
+        In effect at once — no restart — and written to the `peers_file` so it
+        survives one. The peer need **not** be reachable: a mirror that is down
+        must still be addable, or a galaxy could not be rebuilt after whatever
+        took it down. The health poller picks it up on its next pass.
+
+        Adding and changing are separate verbs. An upsert would mean that
+        typing an address that already exists silently replaces its key, and
+        that key is the one thing bounding what this server may do there.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PeerChange" }
+      responses:
+        "200":
+          description: The peer list, as the GET above returns it
+        "400":
+          description: >-
+            Not usable as a peer: no key, not an http(s) URL, or this server's
+            own address.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: >-
+            Already in this galaxy, declared in the configuration file, or no
+            `peers_file` is configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+    put:
+      tags: [management, galaxy]
+      summary: Change a peer's key or namespaces
+      description: Keeps its place in the order, so the list does not reshuffle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PeerChange" }
+      responses:
+        "200":
+          description: The peer list, as the GET above returns it
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Not in this galaxy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "409":
+          description: >-
+            Declared in the configuration file, or no `peers_file` is
+            configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+    delete:
+      tags: [management, galaxy]
+      summary: Remove a peer
+      description: |
+        Nothing stored on the peer is deleted; this server simply stops using
+        it. Its health is forgotten with it, so re-adding the same URL starts
+        unprobed rather than inheriting a stale "offline".
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema: { type: string }
+          example: "https://node-b.example:9999"
+      responses:
+        "200":
+          description: The peer list, as the GET above returns it
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No such peer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "409":
+          description: >-
+            Declared in the configuration file, or no `peers_file` is
+            configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
 
   /_management/api/tier:
     post:
@@ -1659,6 +1969,41 @@ components:
           description: |
             Consecutive failures, so a flapping peer reads differently from one
             that has been gone all week.
+        catching_up:
+          type: boolean
+          description: |
+            Whether the peer said it is still pulling what it missed. Reads are
+            sent elsewhere while it is, because its data is incomplete and a
+            read would under-report. Writes still go to it.
+
+    PeerChange:
+      type: object
+      description: A peer as the management interface sends it.
+      required: [url, key]
+      properties:
+        url:
+          type: string
+          description: Trailing slashes are trimmed; `http://` or `https://`.
+          example: "https://node-b.example:9999"
+        key:
+          type: string
+          description: |
+            The key **this server** authenticates to that peer with. It is the
+            capability bound: the peer's own ACL decides what this server may
+            do there, so a key granted `rw:feeds` cannot write anywhere else
+            however this server is configured or compromised. Required on a
+            change as well as an add, because it is never read back.
+        namespaces:
+          type: array
+          nullable: true
+          description: |
+            What the peer stores. Absent, null or empty means a full mirror,
+            which is the common case. Declared rather than discovered: asking
+            the peer would need `admin` on the peer key, and the point of that
+            key is that it can be the narrowest thing that does the job. The
+            cost is that it must agree with the peer's own `[storage]`.
+          items: { type: string }
+          example: ["feeds", "myorg/ips"]
 
     MergeItem:
       type: object
@@ -1684,6 +2029,19 @@ components:
         first_seen: { type: integer, format: int64 }
         last_seen: { type: integer, format: int64 }
         tags: { type: string }
+        tags_at:
+          type: integer
+          format: int64
+          description: |
+            When the tag set was last *replaced* wholesale, in epoch
+            milliseconds; `0` means it never was. Tags otherwise merge as a
+            union, and a union cannot express a removal — a tag taken off one
+            server would be put back by the next peer that still had it. So a
+            replacement carries the moment it happened and the later one wins,
+            a last-write-wins register beside the grow-only set. Equal
+            timestamps fall back to the union, which keeps the rule
+            order-independent. Absent from a peer too old to send it, which
+            reads as `0` and so loses to any replacement.
         ttl: { type: integer, format: int64 }
 
     MergeResponse:

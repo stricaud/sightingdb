@@ -672,6 +672,14 @@ interface edits them by hand. Writes **merge**, so two feeds each contribute
 what they know; only the management interface's tag box replaces a set, which
 is how a wrong tag comes off.
 
+In a galaxy, a replacement is pushed to every mirror of the namespace as it is
+made, and the interface says which took it. A tag change is not a sighting, so
+nothing else would ever carry it — the copies would simply disagree until
+someone noticed. Removals converge too, which a union of tag sets could not
+manage alone: a tag taken off here would be put back by the next peer that
+still had it. See [Tag changes reach the
+mirrors](#tag-changes-reach-the-mirrors).
+
 Vocabulary
 ----------
 
@@ -696,6 +704,44 @@ they were published.
 
 Tags are visible wherever a value is: in `/r` and `/rs` responses, in the DNS
 TXT answer, and in the management interface.
+
+Colours, and what a tag means
+-----------------------------
+
+The management interface has a **Tags** page: every tag with its colour, what
+it means, how it renders, and how many values carry it. Editing one changes how
+it is shown everywhere — in the value list, on the value page, and in the box
+where tags are typed.
+
+It decides **presentation only**. A value can carry a tag nothing in the table
+defines, and that is not an error: a feed brings whatever tags it brings, and
+refusing them to keep a table tidy would lose data. Undefined tags are listed
+beside the defined ones, greyed, so adopting one is a click rather than a
+discovery.
+
+A name ending in `:` is a **family** and colours everything beneath it, so
+`stix-type:` covers `stix-type:ipv4-addr` and every other value of that key.
+Half the vocabulary above is `key:value` with an open set of values, which
+could not be enumerated even in principle. An exact entry beats its family, and
+the longest family wins. It is also the shape of a MISP machine tag,
+`namespace:predicate`, so a whole MISP taxonomy can be given one colour by its
+namespace.
+
+The TLP colours are MISP's own, taken from its `tlp` taxonomy rather than
+chosen here, so a tag exported to MISP and back looks the same in both.
+
+Typing a tag offers the ones already in use, completing the entry after the
+last comma — the point being to type a tag the same way twice. A family is
+offered with its colon kept, leaving the cursor ready for the value.
+
+Colours live in `tags_file`, which the interface rewrites whole. Without one
+they are read-only and the standard colours are used, which the page says
+rather than leaving a save to fail.
+
+`Used by` counts the values **loaded in memory**, and the page says how many
+namespaces that was out of how many exist. Counting the rest means paging every
+cold shard back in, which would make opening the page the most expensive thing
+the server does and would evict the working set to do it.
 
 Exporting
 =========
@@ -1373,8 +1419,83 @@ The `role` object reports which of the three a server is:
 its own, exists to forward) or `both`. It describes a configuration, not a type:
 any server can be any of them. Peer **keys are never in the response** — they
 are credentials.
-It needs write access to the namespace, and a configured `tiers_file` — without
-one the tiers are whatever the configuration says and cannot be changed here.
+
+### Adding a peer without editing a file
+
+The **Galaxy** page lists this server's own peers beside the graph, with each
+one's state, version and how long since it last answered, and adds, changes and
+removes them. A peer takes effect as soon as it is saved — no restart, which
+matters because restarting a router is a gap in service for everything behind
+it.
+
+It needs a `peers_file` in `[galaxy]`. That is a separate file because
+`sightingdb.toml` is yours: it is comment-rich and hand-maintained, and a
+program that rewrote it would destroy those comments. So a peer written into
+`[galaxy] peers` is shown on the page but **not editable there** — a change
+made there would last only until the next restart, which is worse than
+refusing. `sightingdb --setup` writes a live `[galaxy]` section with a
+`peers_file` and no peers in it, which is a valid galaxy: install the other
+servers, create a key on each for this one, and add them from the interface.
+
+The peer need not be reachable to be added. A mirror that is down must still be
+addable, or a galaxy could not be rebuilt after whatever took it down; the
+health poller picks it up on its next pass and the page shows it offline until
+it answers. Its own address is refused, since a server mirroring itself is
+never what was meant — but two routers pointing at each other is not, because
+cascading is legitimate and `max_hops` is what makes it safe.
+
+The key is required even when only the namespaces change, because it is never
+read back: it is a credential this server holds, and a topology view is not a
+reason to hand it out.
+
+### Tag changes reach the mirrors
+
+A tag is not a sighting, so nothing in the sync machinery would otherwise carry
+one: a tag set or removed on one server would sit there while the mirrors kept
+the old set. So a change made through `POST /_management/api/tags` is pushed to
+every mirror of the namespace as it is made, and the response says which took
+it:
+
+	{"value":"8.8.4.4", ..., "tags":"tlp:green",
+	 "mirrors":[{"url":"http://node-a:9999","ok":true},
+	            {"url":"http://node-b:9999","ok":true}]}
+
+It goes through `/_api/merge` — the channel the periodic catch-up already uses
+— for two reasons. The mirrors apply it by the merge rules, so it converges and
+can be retried; and it needs only the write grant a peer key already has, where
+forwarding the management request would need `admin` on every peer key, the
+opposite of keeping those keys narrow. A mirror that is down gets it at the next
+catch-up instead, because what is pushed is *state* rather than an instruction:
+the mirror pulls the same thing when it returns.
+
+**Removing a tag needs more than a union.** Tags merge as a grow-only set,
+which is right for two feeds each contributing what they know — but a union
+cannot express a removal, so a tag taken off one server would be put back by
+the next peer that still had it. A replacement therefore records the moment it
+happened, and the later replacement wins wherever two copies meet: a
+last-write-wins register beside the grow-only set. Equal timestamps fall back
+to the union, which keeps the rule order-independent. Ordinary tagging through
+`/w` and `/wb` leaves that timestamp alone and still accumulates.
+
+The timestamp is in milliseconds, not seconds, because two edits a moment apart
+are the normal case when someone is fixing tags by hand — at second
+granularity they tie, fall back to the union, and quietly fail to remove
+anything. That was measured rather than assumed.
+
+On a server that does not store the namespace — a router — there is no local
+copy to change, so the value is fetched from a mirror, changed, and offered back
+to all of them. The interface therefore behaves the same whether it is pointed
+at a router or at a node.
+
+### Bulk reads through a router
+
+`/rb` and `/rbs` are gathered from the mirrors that hold each item, grouped by
+mirror and sent as one sub-batch each. A write has to reach every mirror; a read
+has to reach exactly one — the one chosen by hashing the value — or two
+consecutive reads could be served by mirrors at different stages of catching up
+and show a count going *down*. Items keep their request index through the round
+trip, so a batch spanning namespaces held here, on two different mirrors, and
+nowhere at all still answers in the order it was asked.
 
 Containers and Kubernetes
 =========================

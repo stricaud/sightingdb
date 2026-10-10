@@ -41,6 +41,9 @@ pub struct SharedState {
     /// The other servers this one knows about, and whether they answer.
     /// `None` when it stands alone.
     pub galaxy: Option<crate::galaxy::Galaxy>,
+    /// Where peers added through the management interface are written.
+    /// `None` makes the galaxy read-only there.
+    pub galaxy_peers_file: Option<std::path::PathBuf>,
     /// Keys revoked on this server, so the interface can say which of them a
     /// peer still holds.
     ///
@@ -89,6 +92,7 @@ impl SharedState {
             started: std::time::Instant::now(),
             rejections: crate::rejections::Rejections::default(),
             galaxy: None,
+            galaxy_peers_file: None,
             revoked: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             acl_replaceable: false,
             joining: std::sync::atomic::AtomicBool::new(false),
@@ -422,6 +426,10 @@ pub struct MergeItem {
     pub last_seen: i64,
     #[serde(default)]
     pub tags: String,
+    /// When the peer last replaced its tag set. Absent from a peer too old to
+    /// send it, which reads as zero and so loses to any replacement here.
+    #[serde(default)]
+    pub tags_at: i64,
     #[serde(default)]
     pub ttl: u64,
 }
@@ -434,6 +442,7 @@ impl MergeItem {
             first_seen: self.first_seen,
             last_seen: self.last_seen,
             tags: self.tags.clone(),
+            tags_at: self.tags_at,
             ttl: self.ttl,
         }
     }
@@ -3052,6 +3061,8 @@ mod tests {
                 stores: crate::db::StoragePolicy::everything(),
             }],
             max_hops: 4,
+            peers_file: None,
+            fixed: Vec::new(),
             health_interval: 30,
             sync_interval: 300,
             reconcile_interval: 3600,
@@ -3098,6 +3109,8 @@ mod tests {
                 },
             }],
             max_hops: 4,
+            peers_file: None,
+            fixed: Vec::new(),
             health_interval: 30,
             sync_interval: 300,
             reconcile_interval: 3600,
@@ -3317,6 +3330,8 @@ mod tests {
                 stores: crate::db::StoragePolicy::everything(),
             }],
             max_hops: 4,
+            peers_file: None,
+            fixed: Vec::new(),
             health_interval: 30,
             sync_interval: 300,
             reconcile_interval: 3600,
@@ -3490,6 +3505,8 @@ mod tests {
                 stores: crate::db::StoragePolicy::everything(),
             }],
             max_hops: 4,
+            peers_file: None,
+            fixed: Vec::new(),
             health_interval: 30,
             sync_interval: 300,
             reconcile_interval: 3600,
@@ -3539,6 +3556,8 @@ mod tests {
                 stores: crate::db::StoragePolicy::from_prefixes(["feeds"]),
             }],
             max_hops: 4,
+            peers_file: None,
+            fixed: Vec::new(),
             health_interval: 30,
             sync_interval: 300,
             reconcile_interval: 3600,
@@ -4489,6 +4508,8 @@ mod tests {
             "/_management/api/value",
             "/_management/api/sightings",
             "/_management/api/tags",
+            "/_management/api/tags/vocabulary",
+            "/_management/api/galaxy/peers",
             "/_management/api/tier",
             "/_management/api/keys",
             "/_management/api/keys/drift",

@@ -195,6 +195,55 @@
     <div id="g-chart" style="width:100%;height:60vh"></div>
     <p class="muted" id="g-legend"></p>
     <p class="muted" id="g-empty"></p>
+
+    <!-- The peer list, editable. Separate from the graph above, which walks
+         the whole cascade; this is this server's own list. -->
+    <div style="margin-top:1rem">
+      <div class="row">
+        <h3 style="margin:0;font-size:.95rem">Peers</h3>
+        <span class="muted" id="p-count"></span>
+        <span class="spacer"></span>
+        <button id="p-new">Add a peer</button>
+      </div>
+
+      <div id="p-form" class="hidden" style="margin:.6rem 0;padding:.6rem;border:1px solid var(--line);border-radius:8px">
+        <div class="row">
+          <label style="flex:1">Address<br>
+            <input id="p-url" style="width:100%" placeholder="https://node-b.example:9999">
+          </label>
+          <label style="flex:1">API key to use there<br>
+            <input id="p-key" style="width:100%" placeholder="the key this server authenticates with">
+          </label>
+        </div>
+        <div class="row" style="margin-top:.4rem">
+          <label style="flex:1">
+            <span id="p-ns-label">Namespaces it holds</span><br>
+            <input id="p-ns" style="width:100%" placeholder="feeds, myorg/ips — blank for a full mirror">
+          </label>
+        </div>
+        <div class="row" style="margin-top:.4rem">
+          <button id="p-save">Save</button>
+          <button id="p-cancel">Cancel</button>
+          <span class="muted" id="p-form-note"></span>
+        </div>
+      </div>
+
+      <div class="scroll"><table>
+        <thead><tr>
+          <th>Address</th><th>Holds</th><th>State</th><th>Version</th><th>Last seen</th><th></th>
+        </tr></thead>
+        <tbody id="p-rows"></tbody>
+      </table></div>
+      <p class="muted" id="p-note"></p>
+      <p class="muted">The key is the bound on what this server may do there: the peer's
+         own ACL decides, so a key granted <code>rw:feeds</code> cannot write anywhere
+         else however this server is configured. A peer takes effect as soon as it is
+         saved — no restart — and is remembered in the <code>peers_file</code>. Peers
+         written into <code>[galaxy] peers</code> in the configuration are shown here
+         but not editable: that file is yours to maintain and this interface does not
+         rewrite it. <b>Holds</b> must agree with what the peer itself stores; it is
+         declared rather than discovered so a peer key can stay narrow.</p>
+    </div>
   </section>
 
   <!-- The tag vocabulary: what a tag means and what colour it is shown in -->
@@ -471,6 +520,10 @@ const state = {
   value: null,
   // The tag vocabulary, fetched once: every value row asks it for a colour.
   tags: null,
+  // This server's peer list, as the galaxy view last saw it.
+  peers: null,
+  // The peer being edited, or null when one is being added.
+  editingPeer: null,
 };
 
 const VIEWS = ["view-namespaces", "view-values", "view-value", "view-keys", "view-tags",
@@ -1818,7 +1871,165 @@ function galaxyGraph(view) {
 async function showGalaxy() {
   setError("");
   show("view-galaxy");
-  await loadGalaxy();
+  $("p-form").classList.add("hidden");
+  // Both, because they answer different questions: the graph walks the whole
+  // cascade and can be slow when a peer is down, the list is this server's own
+  // and answers at once.
+  await Promise.all([loadGalaxy(), loadPeers()]);
+}
+
+/* ------------------------------- the peers ------------------------------- */
+
+async function loadPeers() {
+  try {
+    const view = await api("/_management/api/galaxy/peers");
+    state.peers = view;
+    renderPeers();
+  } catch (e) {
+    setError(e.message);
+  }
+}
+
+function renderPeers() {
+  const view = state.peers;
+  const rows = $("p-rows");
+  rows.replaceChildren();
+  if (!view) return;
+
+  for (const peer of view.peers) {
+    const tr = document.createElement("tr");
+
+    const url = document.createElement("td");
+    const code = document.createElement("code");
+    code.textContent = peer.url;
+    url.append(code);
+    if (peer.fixed) {
+      const note = document.createElement("span");
+      note.className = "muted";
+      note.textContent = " from the config file";
+      note.title = "Declared in [galaxy] peers. Change it there.";
+      url.append(note);
+    }
+
+    const holds = document.createElement("td");
+    holds.textContent = peer.namespaces ? peer.namespaces.join(", ") : "everything";
+    if (!peer.namespaces) holds.className = "muted";
+
+    // "not asked yet" is not "offline", and the two must not look the same.
+    const health = peer.health || {};
+    const condition = document.createElement("td");
+    if (!health.probed) {
+      condition.textContent = "not probed yet";
+      condition.className = "muted";
+    } else if (health.online) {
+      condition.textContent = health.catching_up ? "catching up" : "online";
+      if (health.latency_ms != null) {
+        const latency = document.createElement("span");
+        latency.className = "muted";
+        latency.textContent = ` ${health.latency_ms}ms`;
+        condition.append(latency);
+      }
+    } else {
+      condition.textContent = "offline";
+      condition.title = health.error || "";
+      if (health.failures > 1) {
+        const failures = document.createElement("span");
+        failures.className = "muted";
+        failures.textContent = ` ${health.failures} failures`;
+        condition.append(failures);
+      }
+    }
+
+    const version = document.createElement("td");
+    version.textContent = health.version || "—";
+    if (!health.version) version.className = "muted";
+
+    const seen = document.createElement("td");
+    seen.textContent = health.last_seen ? fmtTime(health.last_seen) : "never";
+    if (!health.last_seen) seen.className = "muted";
+
+    const actions = document.createElement("td");
+    actions.className = "actions";
+    if (view.editable && !peer.fixed) {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.textContent = "Edit";
+      edit.onclick = () => openPeerForm(peer);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "Remove";
+      remove.onclick = () => removePeer(peer.url);
+      actions.append(edit, " ", remove);
+    }
+
+    tr.append(url, holds, condition, version, seen, actions);
+    rows.append(tr);
+  }
+
+  $("p-count").textContent = view.peers.length
+    ? `${view.peers.length} peer(s)` : "none yet";
+  $("p-note").textContent = view.note || "";
+  $("p-new").disabled = !view.editable;
+}
+
+/**
+ * Open the peer form, blank or on an existing peer.
+ *
+ * The key is never sent back by the server — it is a credential this server
+ * holds, not something a topology view should hand out — so editing one starts
+ * from an empty key field and says so rather than showing a fake value.
+ */
+function openPeerForm(peer) {
+  $("p-form").classList.remove("hidden");
+  // Which verb the save uses. Adding and changing are separate so that an
+  // address typed into the add form cannot silently replace an existing
+  // peer's key.
+  state.editingPeer = peer ? peer.url : null;
+  $("p-url").value = peer ? peer.url : "";
+  $("p-url").readOnly = !!peer;
+  $("p-key").value = "";
+  $("p-ns").value = peer && peer.namespaces ? peer.namespaces.join(", ") : "";
+  $("p-form-note").textContent = peer
+    ? "The key is not shown. Typing one replaces it; it is required to save."
+    : "";
+  (peer ? $("p-key") : $("p-url")).focus();
+}
+
+async function savePeer() {
+  $("p-save").disabled = true;
+  try {
+    const namespaces = $("p-ns").value.split(",").map((n) => n.trim()).filter(Boolean);
+    state.peers = await api("/_management/api/galaxy/peers",
+      state.editingPeer ? "PUT" : "POST", {
+      url: $("p-url").value.trim(),
+      key: $("p-key").value,
+      // Blank means a full mirror, which is what leaving the field alone
+      // should mean; an empty list would be a peer that holds nothing.
+      namespaces: namespaces.length ? namespaces : null,
+    });
+    setError("");
+    $("p-form").classList.add("hidden");
+    renderPeers();
+    // The graph is now wrong, and it is the thing on screen above this.
+    loadGalaxy();
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    $("p-save").disabled = false;
+  }
+}
+
+async function removePeer(url) {
+  if (!confirm(`Remove ${url} from this galaxy? Nothing stored there is deleted.`)) return;
+  try {
+    state.peers = await api(
+      `/_management/api/galaxy/peers?url=${encodeURIComponent(url)}`, "DELETE");
+    setError("");
+    renderPeers();
+    loadGalaxy();
+  } catch (e) {
+    setError(e.message);
+  }
 }
 
 async function loadGalaxy() {
@@ -2266,7 +2477,10 @@ $("signout").onclick = () => signOut("");
 $("nav-browse").onclick = () => render();
 $("nav-keys").onclick = () => { setError(""); show("view-keys"); loadKeys(); };
 $("nav-galaxy").onclick = showGalaxy;
-$("g-refresh").onclick = loadGalaxy;
+$("g-refresh").onclick = () => { loadGalaxy(); loadPeers(); };
+$("p-new").onclick = () => openPeerForm(null);
+$("p-cancel").onclick = () => $("p-form").classList.add("hidden");
+$("p-save").onclick = savePeer;
 $("g-auto").onchange = (e) => {
   clearInterval(state.galaxyTimer);
   // Only while the view is showing: a timer left running would keep asking a

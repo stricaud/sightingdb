@@ -316,6 +316,10 @@ fn run() -> Result<()> {
         started: std::time::Instant::now(),
         rejections: rejections::Rejections::new(settings.rejection_log),
         galaxy: settings.galaxy.as_ref().map(galaxy::Galaxy::new),
+        galaxy_peers_file: settings
+            .galaxy
+            .as_ref()
+            .and_then(|galaxy| galaxy.peers_file.clone()),
         // A server with peers starts behind until it has checked. One with no
         // peers has nothing to be behind.
         revoked: std::sync::RwLock::new(std::collections::BTreeMap::new()),
@@ -466,6 +470,7 @@ fn server_info(
         version: env!("CARGO_PKG_VERSION"),
         authenticate: settings.authenticate,
         http_enabled: settings.http_enabled,
+        listen: settings.listen.clone(),
         config_path: config_path.display().to_string(),
         dbdir: settings.dbdir.as_ref().map(|d| d.display().to_string()),
         snapshot_interval: settings.snapshot_interval,

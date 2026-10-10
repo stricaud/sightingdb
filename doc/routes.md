@@ -414,6 +414,26 @@ Results are positional: item *n* of the response answers item *n* of the
 request, and a value that was not found appears as an error object in place of
 an attribute.
 
+**Through a router**, a bulk read is gathered from the mirrors that hold each
+item. It is grouped by mirror and sent as one sub-batch each — a write has to
+reach every mirror, but a read has to reach exactly one, the one chosen by
+hashing the value, or two consecutive reads could be served by mirrors at
+different stages of catching up and show a count going *down*. Items are put
+back in request order, so a batch spanning namespaces held here, on two
+different mirrors, and nowhere at all still answers in the order it was asked:
+
+	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X POST http://127.0.0.1:9999/rb \
+	    -d '{"items":[{"namespace":"feeds/ips","value":"9.9.9.9"},
+	                  {"namespace":"other/thing","value":"nowhere"}]}'
+	{"items":[
+	  {"value":"9.9.9.9","first_seen":1791667739,"last_seen":1791667739,"count":1,
+	   "tags":"tlp:green","ttl":0,"consensus":1},
+	  {"message":"no server in this galaxy stores that namespace"}]}
+
+The search is recorded at the entry point — where the client actually is —
+and the forwarded copy asks for no shadow, so one search is not counted twice.
+
 ### `POST /rbs` — read many values with statistics
 
 	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
@@ -819,6 +839,155 @@ writes through `/w` and `/wb` merge instead.
 	    -d '{"namespace":"feeds/manual","value":"5.5.5.5","tags":"tlp:green,confidence:80"}'
 	{"value":"5.5.5.5","first_seen":1790264662,"last_seen":1790264662,"count":1,
 	 "tags":"tlp:green,confidence:80","ttl":0,"consensus":1}
+
+**In a galaxy the change is pushed to every mirror of the namespace as it is
+made**, and the response says which took it:
+
+	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X POST http://127.0.0.1:9999/_management/api/tags \
+	    -d '{"namespace":"sync/ips","value":"8.8.4.4","tags":"tlp:green"}'
+	{"value":"8.8.4.4","first_seen":1791668207,"last_seen":1791668207,"count":1,
+	 "tags":"tlp:green","ttl":0,"consensus":1,
+	 "mirrors":[{"url":"http://127.0.0.1:19841","ok":true},
+	            {"url":"http://127.0.0.1:19842","ok":true}]}
+
+It goes through `/_api/merge`, the same channel the periodic catch-up uses, for
+two reasons. The mirrors apply it by the merge rules, so it converges and can
+be retried; and it needs only the write grant a peer key already has, where
+forwarding the management request would need `admin` on every peer key — the
+opposite of keeping those keys narrow.
+
+A tag change is not a sighting, so without this nothing would ever carry it:
+the two copies would simply disagree until someone noticed. A mirror that is
+down gets it at the next catch-up instead, because what is pushed is *state*
+rather than an instruction — the mirror pulls the same thing when it returns.
+
+Removals converge too, which a union of tag sets could not manage on its own: a
+tag taken off here would be put back by the next peer that still had it. So a
+replacement records the moment it happened, in `tags_at`, and the later
+replacement wins wherever two copies meet — a last-write-wins register beside
+the grow-only set. Ordinary tagging through `/w` and `/wb` leaves `tags_at`
+alone and still accumulates.
+
+On a server that does **not** store the namespace — a router — the value is
+fetched from a mirror, changed, and offered back to all of them, so the
+interface behaves the same whether it is pointed at a router or a node.
+
+### `GET /_management/api/tags` — the tag vocabulary, and what is in use
+
+Both at once: the tags someone has given a colour, and the tags actually found
+on values. A feed brings whatever tags it brings, so the second set is not a
+subset of the first, and an undefined tag is listed with `defined: false` —
+which is what makes adopting one a click rather than a discovery.
+
+	$ curl -H 'Authorization: changeme' http://127.0.0.1:9999/_management/api/tags
+	{"tags":[
+	  {"name":"home-grown","colour":"#6b7280","description":"","family":false,
+	   "used":1,"defined":false},
+	  {"name":"stix-type:","colour":"#7c3aed",
+	   "description":"The STIX observable type this value exports as, overriding
+	                  what it looks like.","family":true,"used":1,"defined":true},
+	  {"name":"tlp:green","colour":"#33FF00",
+	   "description":"Limited disclosure, restricted to the community.",
+	   "family":false,"used":2,"defined":true}],
+	 "unknown_colour":"#6b7280","editable":true,
+	 "counted_namespaces":2,"total_namespaces":2}
+
+A name ending in `:` is a **family** and colours everything beneath it, so
+`stix-type:` covers `stix-type:ipv4-addr` and every other value of that key.
+Half of SightingDB's own vocabulary is `key:value` with an open set of values,
+which could not be enumerated here even in principle. An exact entry beats its
+family, and the longest family wins.
+
+`used` counts only the values **loaded in memory**, and
+`counted_namespaces`/`total_namespaces` say how much that was. Counting the
+rest means paging every cold shard back in, which would make opening this page
+the most expensive thing the server does and would evict the working set to do
+it. A key that cannot read every namespace gets no counts at all, since a count
+would otherwise say what is in namespaces it has no access to.
+
+The TLP colours are MISP's own, from its `tlp` taxonomy, so a tag exported to
+MISP and back looks the same in both.
+
+### `POST /_management/api/tags/vocabulary` — define a tag's colour
+
+	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X POST http://127.0.0.1:9999/_management/api/tags/vocabulary \
+	    -d '{"name":"home-grown","colour":"#AA33CC","description":"Ours, not from a feed."}'
+	{"tags":[...],"unknown_colour":"#6b7280","editable":true,...}
+
+Answers with the whole table, so the interface need not ask again. Takes effect
+at once; needs a `tags_file`, which is machine-owned and rewritten whole. A
+name may not contain a comma, since a comma is what separates tags on a value.
+
+### `DELETE /_management/api/tags/vocabulary?tag=<tag>` — forget a colour
+
+	$ curl -H 'Authorization: changeme' -X DELETE \
+	    'http://127.0.0.1:9999/_management/api/tags/vocabulary?tag=home-grown'
+
+**Values keep the tag itself.** This is a presentation setting, and deleting
+data from a colour picker would be a trap — so the tag stays in the table,
+listed as undefined, for as long as anything carries it. By query rather than
+path segment because a tag contains `:` and often `/`.
+
+### `GET /_management/api/galaxy/peers` — this server's peers
+
+Separate from `/_management/api/galaxy`, which walks the whole cascade to draw
+it. This is one server's own list and answers without touching the network, so
+the editor stays usable while a peer is down.
+
+	$ curl -H 'Authorization: changeme' http://127.0.0.1:9999/_management/api/galaxy/peers
+	{"peers":[
+	  {"url":"http://127.0.0.1:19841","namespaces":null,"fixed":true,
+	   "health":{"url":"http://127.0.0.1:19841","online":true,"probed":true,
+	             "last_seen":1791670776,"latency_ms":0,"version":"0.6.1",
+	             "error":null,"failures":0,"catching_up":false}},
+	  {"url":"http://127.0.0.1:19842","namespaces":["feeds"],"fixed":false,
+	   "health":{"url":"http://127.0.0.1:19842","online":false,"probed":false,
+	             "last_seen":0,"latency_ms":null,"version":null,"error":null,
+	             "failures":0,"catching_up":false}}],
+	 "editable":true}
+
+`namespaces` is `null` for a full mirror. **Keys are never returned**: a peer
+key is a credential this server holds, and a topology view is not a reason to
+hand it back out.
+
+`fixed: true` means the peer was declared in `[galaxy] peers` in the
+configuration file and cannot be changed here. That file is hand-maintained and
+comment-rich, and this program does not rewrite it — so a change made here
+would only last until the next restart, which is worse than refusing.
+`probed: false` with `online: false` means "not asked yet", which is not the
+same as down.
+
+### `POST /_management/api/galaxy/peers` — add a peer
+
+	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X POST http://127.0.0.1:9999/_management/api/galaxy/peers \
+	    -d '{"url":"https://node-b.example:9999","key":"the-key-to-use-there",
+	         "namespaces":["feeds"]}'
+
+In effect at once — no restart — and written to the `peers_file` so it survives
+one. Leave `namespaces` out for a full mirror.
+
+The peer need **not** be reachable. A mirror that is down must still be
+addable, or a galaxy could not be rebuilt after whatever took it down; the
+health poller picks it up on its next pass and the interface shows it offline
+until it answers.
+
+Adding and changing are separate verbs — `PUT` changes one, keeping its place
+in the order. An upsert would mean that typing an address that already exists
+silently replaces its key, and that key is the one thing bounding what this
+server may do there. Its own address is refused; a loop between two routers is
+not, because cascading is legitimate and the hop count is what makes it safe.
+
+### `DELETE /_management/api/galaxy/peers?url=<url>` — remove a peer
+
+	$ curl -H 'Authorization: changeme' -X DELETE \
+	    'http://127.0.0.1:9999/_management/api/galaxy/peers?url=https%3A%2F%2Fnode-b.example%3A9999'
+
+Nothing stored on the peer is deleted; this server stops using it. Its health
+is forgotten with it, so re-adding the same URL starts unprobed rather than
+inheriting a stale "offline".
 
 ### `GET /_management/api/rejections` — values that were not written
 

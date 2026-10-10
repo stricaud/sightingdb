@@ -34,6 +34,29 @@ pub struct Attribute {
     #[serde(default)]
     pub counts: BTreeMap<String, u64>,
     pub tags: String,
+    /// When the tag set was last *replaced* wholesale, in milliseconds since
+    /// the Unix epoch. Zero means it never was, and every tag on it arrived
+    /// by merging.
+    ///
+    /// Milliseconds rather than seconds because two edits a moment apart are
+    /// the normal case when someone is fixing tags by hand, and at second
+    /// granularity they tie — which falls back to the union and so quietly
+    /// fails to remove anything. Measured, not assumed: two retags in the
+    /// same second left the first one's tag in place.
+    ///
+    /// Here because tags otherwise merge as a union, and a union cannot
+    /// express a removal: taking a wrong tag off one server would be undone
+    /// the next time a peer that still had it synced. So a replacement
+    /// carries the moment it happened, and the later replacement wins
+    /// wherever two copies meet — a last-write-wins register beside the
+    /// grow-only set, which is exactly the shape of the problem. A plain
+    /// write never touches it, so ordinary tagging still accumulates.
+    ///
+    /// Ties fall back to the union. Two servers that replaced a set in the
+    /// same second would otherwise converge on whichever copy moved last,
+    /// which is not convergence at all.
+    #[serde(default)]
+    pub tags_at: i64,
     pub ttl: u64,
     /// Hourly buckets, per node, for the same reason as `counts`. The inner key
     /// is a Unix timestamp because `DateTime::timestamp()` returns an `i64`.
@@ -69,6 +92,9 @@ pub struct Merge {
     pub last_seen: i64,
     #[serde(default)]
     pub tags: String,
+    /// When the peer last replaced its tag set. See [`Attribute::tags_at`].
+    #[serde(default)]
+    pub tags_at: i64,
     #[serde(default)]
     pub ttl: u64,
 }
@@ -138,6 +164,7 @@ impl Attribute {
             last_seen: DateTime::UNIX_EPOCH,
             counts: BTreeMap::new(),
             tags: String::new(),
+            tags_at: 0,
             ttl: 0,
             stats: BTreeMap::new(),
             legacy_count: 0,
@@ -254,6 +281,7 @@ impl Attribute {
             first_seen: self.first_seen.timestamp(),
             last_seen: self.last_seen.timestamp(),
             tags: self.tags.clone(),
+            tags_at: self.tags_at,
             ttl: self.ttl,
         }
     }
@@ -269,7 +297,11 @@ impl Attribute {
     ///  * **stats** — the same, per bucket.
     ///  * **first_seen** — the earlier. **last_seen** — the later.
     ///  * **tags** — the union, which is what [`Attribute::add_tags`] already
-    ///    does.
+    ///    does, unless one side replaced its set more recently: then that
+    ///    replacement is taken whole, empty included. A union cannot express a
+    ///    removal, and `tags_at` says which replacement is later. Equal
+    ///    timestamps fall back to the union, so the rule stays
+    ///    order-independent.
     ///  * **ttl** — the shortest of the non-zero ones, with zero meaning never.
     ///    Order-independent, and it errs towards expiring: a value is kept only
     ///    as long as the most cautious server says.
@@ -332,12 +364,24 @@ impl Attribute {
             self.last_seen = theirs;
         }
 
-        if !incoming.tags.is_empty() {
-            let before = self.tags.clone();
+        // Tags: a union, except where one side has been replaced more
+        // recently, in which case that replacement is the whole answer. See
+        // `tags_at` for why a union alone cannot be right.
+        let before = self.tags.clone();
+        if incoming.tags_at > self.tags_at {
+            // Taken verbatim, including an empty set: that is what removing
+            // the last tag looks like, and merging it as a union would be
+            // exactly the bug this exists to fix.
+            self.tags = incoming.tags.clone();
+            self.tags_at = incoming.tags_at;
+        } else if incoming.tags_at < self.tags_at {
+            // Ours is the newer replacement, so theirs is history. Not even
+            // unioned: the tags they still carry may be the ones we removed.
+        } else if !incoming.tags.is_empty() {
             self.add_tags(&incoming.tags);
-            if self.tags != before {
-                changed = true;
-            }
+        }
+        if self.tags != before {
+            changed = true;
         }
 
         let merged_ttl = match (self.ttl, incoming.ttl) {
@@ -358,7 +402,11 @@ impl Attribute {
     }
 
     /// Replace the whole set, which is the only way a wrong tag comes off.
-    pub fn set_tags(&mut self, tags: &str) {
+    ///
+    /// `at` is when the replacement happened, in epoch milliseconds, which
+    /// travels with it so that peers still holding the old set do not put it
+    /// back. See `tags_at`.
+    pub fn set_tags(&mut self, tags: &str, at: i64) {
         let cleaned: Vec<&str> = {
             let mut seen: Vec<&str> = Vec::new();
             for tag in split_tags(tags) {
@@ -369,6 +417,9 @@ impl Attribute {
             seen
         };
         self.tags = cleaned.join(",");
+        // Never goes backwards: two replacements in the same second must not
+        // let the earlier one win somewhere else.
+        self.tags_at = self.tags_at.max(at);
     }
 
     /// When this attribute stops being visible, or `None` if it never does.
@@ -483,7 +534,10 @@ mod tests {
         );
 
         // Replacing is the only way something comes off again.
-        attribute.set_tags("tlp:red,,  tlp:red ,identity:Beta Cyber Intelligence Company");
+        attribute.set_tags(
+            "tlp:red,,  tlp:red ,identity:Beta Cyber Intelligence Company",
+            0,
+        );
         assert_eq!(
             attribute.tags,
             "tlp:red,identity:Beta Cyber Intelligence Company"
@@ -569,8 +623,149 @@ mod tests {
             first_seen: first,
             last_seen: last,
             tags: tags.to_string(),
+            // Unset, so these merges exercise the union rule. The
+            // last-write-wins path has its own tests below.
+            tags_at: 0,
             ttl,
         }
+    }
+
+    /// The bug this exists to fix: a tag removed on one server came back the
+    /// next time a peer that still had it synced, because tags merge as a
+    /// union and a union cannot express a removal.
+    #[test]
+    fn a_removed_tag_is_not_resurrected_by_a_peer_that_still_has_it() {
+        let mut mine = Attribute::new("1.2.3.4");
+        mine.add_tags("tlp:green,wrong-tag");
+
+        // The peer's copy, from before the removal.
+        let theirs = mine.as_merge();
+
+        // The wrong tag comes off here, at a known moment.
+        mine.set_tags("tlp:green", 1_000);
+        assert_eq!(mine.tags, "tlp:green");
+
+        // The peer syncs its older copy in.
+        mine.merge(&theirs, "me");
+        assert_eq!(
+            mine.tags, "tlp:green",
+            "the removed tag was put back by a peer that still had it"
+        );
+    }
+
+    /// The other direction: a replacement made on a peer reaches us, even
+    /// though a union of the two sets would have kept what it dropped.
+    #[test]
+    fn a_peers_newer_replacement_wins_here_too() {
+        let mut mine = Attribute::new("1.2.3.4");
+        mine.add_tags("tlp:green,wrong-tag");
+
+        let mut theirs = Attribute::new("1.2.3.4");
+        theirs.add_tags("tlp:green,wrong-tag");
+        theirs.set_tags("tlp:green", 2_000);
+
+        mine.merge(&theirs.as_merge(), "me");
+        assert_eq!(mine.tags, "tlp:green");
+        assert_eq!(
+            mine.tags_at, 2_000,
+            "the timestamp has to travel, or the next merge undoes this one"
+        );
+    }
+
+    /// Removing every tag is a replacement with an empty set, which must not
+    /// be mistaken for "nothing to say".
+    #[test]
+    fn clearing_every_tag_propagates() {
+        let mut mine = Attribute::new("1.2.3.4");
+        mine.add_tags("tlp:green");
+
+        let mut theirs = Attribute::new("1.2.3.4");
+        theirs.add_tags("tlp:green");
+        theirs.set_tags("", 2_000);
+
+        mine.merge(&theirs.as_merge(), "me");
+        assert_eq!(mine.tags, "", "an emptied set was treated as no change");
+    }
+
+    /// A stale replacement does not undo a newer one, whichever order they
+    /// arrive in.
+    #[test]
+    fn the_later_replacement_wins_in_either_order() {
+        let mut older = Attribute::new("v");
+        older.set_tags("old", 1_000);
+        let mut newer = Attribute::new("v");
+        newer.set_tags("new", 2_000);
+
+        let mut a = older.clone();
+        a.merge(&newer.as_merge(), "me");
+        let mut b = newer.clone();
+        b.merge(&older.as_merge(), "me");
+
+        assert_eq!(a.tags, "new");
+        assert_eq!(b.tags, "new", "the older replacement won by arriving later");
+        assert_eq!(a.tags, b.tags, "the two did not converge");
+    }
+
+    /// An ordinary write still accumulates tags from several sources, which is
+    /// what makes them useful across feeds. Only a *replacement* is a
+    /// last-write-wins event.
+    #[test]
+    fn ordinary_tagging_still_merges_as_a_union() {
+        let mut mine = Attribute::new("v");
+        mine.add_tags("from-feed-a");
+
+        let mut theirs = Attribute::new("v");
+        theirs.add_tags("from-feed-b");
+
+        mine.merge(&theirs.as_merge(), "me");
+        assert!(mine.tags.contains("from-feed-a"));
+        assert!(mine.tags.contains("from-feed-b"));
+    }
+
+    /// Two replacements in the same second fall back to the union, because
+    /// preferring either would depend on which copy moved last.
+    #[test]
+    fn replacements_in_the_same_second_fall_back_to_the_union() {
+        let mut a = Attribute::new("v");
+        a.set_tags("one", 1_000);
+        let mut b = Attribute::new("v");
+        b.set_tags("two", 1_000);
+
+        let mut left = a.clone();
+        left.merge(&b.as_merge(), "me");
+        let mut right = b.clone();
+        right.merge(&a.as_merge(), "me");
+
+        assert_eq!(left.tags, "one,two");
+        assert_eq!(right.tags, "two,one");
+        // Order differs, the set does not -- which is what convergence means
+        // for a set rendered as a string.
+        let set = |tags: &str| {
+            let mut parts: Vec<&str> = split_tags(tags).collect();
+            parts.sort_unstable();
+            parts.join(",")
+        };
+        assert_eq!(set(&left.tags), set(&right.tags));
+    }
+
+    /// Merging the same replacement twice changes nothing the second time,
+    /// which is what lets a sync be retried.
+    #[test]
+    fn a_replacement_merges_idempotently() {
+        let mut mine = Attribute::new("v");
+        mine.add_tags("old");
+
+        let mut theirs = Attribute::new("v");
+        theirs.set_tags("new", 2_000);
+
+        let first = mine.merge(&theirs.as_merge(), "me");
+        let second = mine.merge(&theirs.as_merge(), "me");
+        assert!(first.changed);
+        assert!(
+            !second.changed,
+            "the second merge claimed to change something"
+        );
+        assert_eq!(mine.tags, "new");
     }
 
     /// Applying the same merge twice must be the same as applying it once.

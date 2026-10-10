@@ -1,7 +1,10 @@
 # SightingDB configuration.
 #
 # Comments here are preserved: the management interface never rewrites this
-# file. It writes only the separate acl_file below.
+# file. It writes only the separate files named below — acl_file, tiers_file,
+# tags_file and [galaxy] peers_file — each of which it owns and rewrites whole.
+# Anything set directly in this file is therefore read-only in the interface,
+# which will say so rather than appearing to accept a change.
 
 [daemon]
 # Set to false to run without the HTTP API (DNS or ZMQ ingest only).
@@ -116,6 +119,21 @@ rejection_log = 1000
 # whenever a key is created or revoked. Without this, keys can be declared in an
 # [acl] table below, but the interface will not be able to edit them.
 acl_file = "acl.toml"
+
+# How tags are shown in the management interface: a colour and a description
+# each. Its own file for the same reason as the keys — the interface rewrites it
+# whenever a tag is edited.
+#
+# This decides presentation only. A value can carry a tag nothing here defines,
+# and that is not an error: a feed brings whatever tags it brings, and refusing
+# them to keep a table tidy would lose data. Undefined tags are listed in the
+# interface alongside the defined ones so they can be adopted.
+#
+# A name ending in ":" is a family and colours everything beneath it, so
+# "stix-type:" covers stix-type:ipv4-addr and every other value of that key.
+# Without this setting, MISP's own TLP colours plus a colour per family of
+# SightingDB's vocabulary are used, and colours are read-only in the interface.
+tags_file = "tags.toml"
 
 # Eviction needs somewhere to write, so it only happens when dbdir is set.
 [storage]
@@ -254,9 +272,6 @@ tiers_file = "tiers.toml"
 # [galaxy] — the other servers this one knows about
 # ---------------------------------------------------------------------------
 #
-# Configuration only at this stage: the peers are parsed, validated and
-# reported at /_management/api/info, and nothing is forwarded to them yet.
-#
 # Each peer carries the key this server authenticates to it with, and that key
 # is the bound on what this server may do there: a key granted "rw:feeds" on
 # the peer cannot write anywhere else, however this server is configured or
@@ -313,6 +328,17 @@ tiers_file = "tiers.toml"
 #acl_authority = false
 #acl_replaceable = false
 #verify_tls = true
+#
+# Peers added from the management interface are written here, and are in effect
+# as soon as they are saved — adding a mirror should not need a restart, since
+# restarting a router is a gap in service for everything behind it.
+#
+# A file of its own, again because this one is yours: peers written into the
+# `peers` list below are shown in the interface but not editable there, as a
+# change made there would only last until the next restart. Set this and the
+# interface can manage its own peers; leave it out and the galaxy is read-only
+# there.
+#peers_file = "peers.toml"
 #peers = [
 #  { url = "https://node-a.example:9999", key = "..." },
 #  { url = "https://node-b.example:9999", key = "...", namespaces = ["feeds"] },
