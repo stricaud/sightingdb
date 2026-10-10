@@ -434,25 +434,31 @@ pub async fn run(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdow
     let Some(galaxy) = state.galaxy.as_ref() else {
         return;
     };
-    if galaxy.peers().is_empty() {
-        return;
-    }
-
+    // No check for an empty peer list. Peers can be added while the server
+    // runs — see [`Galaxy::add_peer`] — and a poller that gave up at startup
+    // would leave every one of them for ever unprobed, which the interface
+    // shows as "not asked yet" rather than as a server it knows nothing
+    // about. An idle round over an empty list costs nothing.
     let Some(client) = client(galaxy.verify_tls) else {
         log::error!("Galaxy health checks disabled: no HTTP client could be built");
         return;
     };
 
-    log::info!(
-        "Galaxy health checks every {}s for {} peer(s){}",
-        galaxy.health_interval,
-        galaxy.peers().len(),
-        if galaxy.verify_tls {
-            ""
-        } else {
-            " (TLS verification off)"
-        }
-    );
+    let tls_note = if galaxy.verify_tls {
+        ""
+    } else {
+        " (TLS verification off)"
+    };
+    match galaxy.peers().len() {
+        0 => log::info!(
+            "Galaxy health checks every {}s, once there are peers to check{tls_note}",
+            galaxy.health_interval
+        ),
+        n => log::info!(
+            "Galaxy health checks every {}s for {n} peer(s){tls_note}",
+            galaxy.health_interval
+        ),
+    }
 
     let period = Duration::from_secs(galaxy.health_interval);
     loop {
@@ -987,22 +993,42 @@ pub async fn sync(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdo
     let Some(galaxy) = state.galaxy.as_ref() else {
         return;
     };
-    if galaxy.peers().is_empty() || galaxy.sync_interval == 0 {
-        // Nothing to catch up from, or catching up is off. Either way this
-        // server is as current as it is going to get.
+    if galaxy.sync_interval == 0 {
+        // Catching up is off, so this server is as current as it is going to
+        // get.
         state.set_catching_up(false);
         return;
     }
+    // An empty peer list is *not* a reason to stop: peers can be added while
+    // the server runs. It does mean there is nothing to be behind, so the
+    // flag is cleared now and the loop below picks up any peer that appears.
+    if galaxy.peers().is_empty() {
+        state.set_catching_up(false);
+    }
 
-    log::info!(
-        "Catching up from {} peer(s) every {}s",
-        galaxy.peers().len(),
-        galaxy.sync_interval
-    );
+    match galaxy.peers().len() {
+        0 => log::info!(
+            "Catching up every {}s, once there are peers to catch up from",
+            galaxy.sync_interval
+        ),
+        n => log::info!(
+            "Catching up from {n} peer(s) every {}s",
+            galaxy.sync_interval
+        ),
+    }
 
     let period = Duration::from_secs(galaxy.sync_interval);
+    // Whether the next pass is the full one. A server that started with no
+    // peers has not compared itself with anything, so the first pass after one
+    // appears is still the full pass rather than the cheap heuristic.
     let mut first = true;
     loop {
+        if galaxy.peers().is_empty() {
+            if nap(&shutdown, period).await {
+                return;
+            }
+            continue;
+        }
         let report = galaxy.catch_up(&state, first).await;
         if first {
             // Current as of one full pass. Reads can be served from here.
@@ -1276,7 +1302,7 @@ pub async fn gossip(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shut
     let Some(galaxy) = state.galaxy.as_ref() else {
         return;
     };
-    if galaxy.peers().is_empty() || galaxy.gossip_interval == 0 {
+    if galaxy.gossip_interval == 0 {
         return;
     }
     // Nothing to offer, and nothing to offer it with.
@@ -1382,7 +1408,7 @@ pub async fn reconcile(state: Arc<crate::handlers::SharedState>, shutdown: Arc<S
     let Some(galaxy) = state.galaxy.as_ref() else {
         return;
     };
-    if galaxy.peers().is_empty() || galaxy.reconcile_interval == 0 {
+    if galaxy.reconcile_interval == 0 {
         return;
     }
 
@@ -1890,6 +1916,43 @@ mod tests {
             acl_replaceable: false,
             verify_tls: true,
         })
+    }
+
+    /// A peer added while the server runs is reachable by the health poller.
+    ///
+    /// The poller used to return at startup when the peer list was empty,
+    /// which was fine while the list was fixed in the configuration. Once the
+    /// management interface could add one, that early return left every
+    /// runtime-added peer permanently unprobed: online in fact, "not asked
+    /// yet" in the interface, and `Last answered: never` for ever.
+    ///
+    /// This pins the property the poller depends on — that the list it reads
+    /// each round is the live one, not a copy taken at startup.
+    #[test]
+    fn a_peer_added_after_startup_is_in_the_list_the_poller_reads() {
+        let galaxy = galaxy(&[]);
+        assert!(galaxy.peers().is_empty(), "starts with none");
+
+        galaxy
+            .add_peer(
+                Peer {
+                    url: "https://added:9999".to_string(),
+                    key: "k".to_string(),
+                    stores: crate::db::StoragePolicy::everything(),
+                },
+                "127.0.0.1:9999",
+            )
+            .expect("added");
+
+        // What `run` iterates every round.
+        let seen: Vec<String> = galaxy.peers().into_iter().map(|peer| peer.url).collect();
+        assert_eq!(seen, vec!["https://added:9999".to_string()]);
+
+        // And it is reported, as unprobed rather than as absent.
+        let health = galaxy.health();
+        assert_eq!(health.len(), 1);
+        assert!(!health[0].probed, "it has not been asked yet");
+        assert_eq!(health[0].last_seen, 0);
     }
 
     /// Before the first probe a peer is neither up nor down, and the view has

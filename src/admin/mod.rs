@@ -528,6 +528,17 @@ fn clean_namespace(namespace: &str) -> Result<String, HttpResponse> {
 pub async fn index() -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
+        // Revalidate every time. The page *is* the application — markup, CSS
+        // and script in one file compiled into the binary — so a cached copy
+        // means a browser running the previous version's JavaScript against
+        // this version's API. With no cache headers at all a browser applies
+        // its own heuristics and may not ask, which is how an upgraded server
+        // ends up serving an interface nobody can explain.
+        //
+        // `no-cache` rather than `no-store`: the browser may keep it, it just
+        // has to check. The one asset that is genuinely immutable between
+        // builds, the charting bundle, keeps its long expiry below.
+        .insert_header(("Cache-Control", "no-cache"))
         .body(UI)
 }
 
@@ -624,12 +635,65 @@ pub async fn galaxy(state: State, req: HttpRequest) -> HttpResponse {
         // The server answering, so a view has a root to draw from without
         // being told separately which one it asked.
         "self": describe(&state),
-        "peers": galaxy.health(),
+        "peers": peers_with_storage(galaxy),
         // Each peer's own answer, keyed by its url. A peer that is itself a
         // router has peers of its own in here, which is how a cascade is
         // drawn from one request.
+        //
+        // Empty unless the peer key carries `admin` there, since this is the
+        // same endpoint and it requires one. That is a deliberate trade — a
+        // peer key should be the narrowest thing that works — and it is why
+        // each peer's storage is reported above from *this* server's own
+        // configuration rather than only from the peer's answer.
         "below": below,
     }))
+}
+
+/// Each peer's health, plus what this server has been told it stores.
+///
+/// The health alone is not enough to draw a galaxy: a viewer needs to know
+/// which peers are full mirrors and which hold a slice. That used to be read
+/// only from `below`, each peer's own answer — which is empty whenever the
+/// peer key lacks `admin`, so every peer rendered as holding nothing on
+/// exactly the galaxies that follow the advice about narrow keys.
+///
+/// This server knows the answer without asking: it is in its own `[galaxy]`
+/// peer list, and it is what routing decisions are already made from. Said to
+/// be *declared* rather than observed, because a configuration can disagree
+/// with what a peer really holds and the viewer should be able to tell which
+/// it is looking at.
+fn peers_with_storage(galaxy: &crate::galaxy::Galaxy) -> Vec<serde_json::Value> {
+    let declared: std::collections::HashMap<String, crate::db::StoragePolicy> = galaxy
+        .peers()
+        .into_iter()
+        .map(|peer| (peer.url, peer.stores))
+        .collect();
+
+    galaxy
+        .health()
+        .into_iter()
+        .map(|health| {
+            let mut entry = serde_json::to_value(&health).unwrap_or_default();
+            if let (Some(object), Some(stores)) = (entry.as_object_mut(), declared.get(&health.url))
+            {
+                object.insert(
+                    "mirrors_everything".to_string(),
+                    serde_json::json!(stores.stores_everything()),
+                );
+                // Null for a full mirror, which is how the rest of the API
+                // reports it too.
+                object.insert(
+                    "namespaces".to_string(),
+                    if stores.stores_everything() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(stores.prefixes())
+                    },
+                );
+            }
+            entry
+        })
+        .collect()
 }
 
 /// One peer as the interface lists it.
@@ -2218,6 +2282,39 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = test::read_body(resp).await;
         assert!(String::from_utf8_lossy(&body).contains("<title>"));
+    }
+
+    /// The page must be revalidated, not reused.
+    ///
+    /// It is the whole application in one file, so a browser holding a cached
+    /// copy runs the previous version's JavaScript against this version's
+    /// API — which looks like the server being wrong rather than the page
+    /// being old. With no cache header at all a browser decides for itself,
+    /// and may decide not to ask.
+    #[actix_web::test]
+    async fn the_interface_is_not_cached_across_upgrades() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = get!(app, "/_management/", NO_KEY);
+        assert_eq!(
+            resp.headers()
+                .get("Cache-Control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "the management page may be served from a stale cache"
+        );
+
+        // The charting bundle does not change between builds and is big, so
+        // it keeps its long expiry. If that ever flips, this says so.
+        let resp = get!(app, "/_management/echarts.min.js", NO_KEY);
+        assert!(
+            resp.headers()
+                .get("Cache-Control")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("max-age")),
+            "the charting bundle lost its cache headers"
+        );
     }
 
     #[actix_web::test]

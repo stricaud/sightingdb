@@ -46,8 +46,12 @@
   .swatch { display: inline-block; width: 1rem; height: 1rem; border-radius: 4px;
             border: 1px solid var(--line); vertical-align: -3px; }
   /* The suggestion list floats over the page, so its container is the
-     positioning context rather than the input itself. */
+     positioning context rather than the input itself.
+     `grow` is for an input that was laid out full-width: the wrapper is
+     inline-block, which shrinks to fit, and an input inside it asking for
+     100% would then resolve against that rather than against the row. */
   .complete { position: relative; display: inline-block; }
+  .complete.grow { display: block; width: 100%; }
   .suggest { position: absolute; z-index: 20; left: 0; top: 100%; min-width: 14rem;
              max-height: 14rem; overflow-y: auto; background: var(--bg);
              border: 1px solid var(--line); border-radius: 6px; margin-top: 2px;
@@ -61,6 +65,15 @@
            vertical-align: top; }
   th { color: var(--muted); font-weight: 600; white-space: nowrap; }
   td.v, td.n { font-family: var(--mono); word-break: break-all; }
+  /* The value is what the row is about — an address, a hash, a domain — and
+     everything else on the row is context for it. So it is set larger than
+     the table's body text, and the tags beside it smaller: a value is read,
+     a tag set is scanned. */
+  td.v { font-size: 1.08rem; }
+  td.v a { text-decoration: none; }
+  td.v a:hover { text-decoration: underline; }
+  td.tags .chip { font-size: .72rem; padding: 0 .3rem; }
+  td.tags .crumbs { font-size: .78rem; }
   tbody tr:hover { background: var(--panel); }
   .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-bottom: .8rem; }
   .muted { color: var(--muted); }
@@ -230,7 +243,7 @@
 
       <div class="scroll"><table>
         <thead><tr>
-          <th>Address</th><th>Holds</th><th>State</th><th>Version</th><th>Last seen</th><th></th>
+          <th>Address</th><th>Holds</th><th>State</th><th>Version</th><th>Last answered</th><th></th>
         </tr></thead>
         <tbody id="p-rows"></tbody>
       </table></div>
@@ -1285,6 +1298,11 @@ function attachTagComplete(input) {
   // against a wrapper so it can overflow the row.
   const wrap = document.createElement("span");
   wrap.className = "complete";
+  // An input that was asking for the full width of its row keeps it: the
+  // wrapper stretches instead of shrinking to fit.
+  if (input.style.width === "100%") {
+    wrap.classList.add("grow");
+  }
   input.parentNode.insertBefore(wrap, input);
   wrap.append(input);
 
@@ -1591,7 +1609,9 @@ function tagValue(tags, key) {
  */
 function tagCell(item, onSaved) {
   const td = document.createElement("td");
-  td.className = "actions";
+  // `tags` sets the smaller type; `actions` keeps the button spacing the
+  // other action cells use.
+  td.className = "actions tags";
 
   const show = () => {
     td.replaceChildren();
@@ -1806,18 +1826,39 @@ function galaxyGraph(view) {
 
   const add = (url, me, parentUrl) => {
     if (!seen.has(url)) {
-      const role = me.role || {};
       const health = healthOf.get(url);
-      let kind = role.kind === "router" ? "router"
-               : role.mirrors_everything ? "full" : "partial";
+      // What the peer says about itself, if it answered the walk. It only
+      // does when the key used to reach it carries `admin` there, and a peer
+      // key should be the narrowest thing that works — so this is usually
+      // absent and the declaration below is what there is.
+      const role = me.role || null;
+      // What the server above it was configured to believe. It is what
+      // routing decisions are actually made from, so it is the right thing
+      // to draw even when it disagrees with the peer.
+      const declared = health && health.mirrors_everything !== undefined
+        ? { mirrors_everything: health.mirrors_everything,
+            namespaces: health.namespaces || [] }
+        : null;
+      const storage = role || declared || {};
+
+      let kind = role && role.kind === "router" ? "router"
+               : storage.mirrors_everything ? "full"
+               : declared || role ? "partial"
+               : "unknown";
       // What the parent sees beats what the server says about itself: a
       // server that answered our walk is up, but one we could not reach has
       // no `self` at all and is only known through its parent.
       if (health && health.probed && !health.online) kind = "down";
 
-      const held = role.kind === "router" ? "forwards only"
-                 : role.mirrors_everything ? "full mirror"
-                 : `holds ${(role.namespaces || []).join(", ") || "nothing"}`;
+      const names = (storage.namespaces || []).join(", ");
+      let held = role && role.kind === "router" ? "forwards only"
+               : storage.mirrors_everything ? "full mirror"
+               : names ? `holds ${names}`
+               : "what it holds is not known here";
+      // Said plainly when it comes from this server's configuration rather
+      // than from the peer: the two can disagree, and which one you are
+      // looking at matters when they do.
+      if (!role && declared) held += " (as configured here)";
 
       seen.set(url, nodes.length);
       nodes.push({
@@ -1830,8 +1871,11 @@ function galaxyGraph(view) {
         label: { show: true, formatter: me.node_id || url },
         tooltip: {
           formatter: [
-            `<b>${me.node_id || "(unknown)"}</b>`,
-            url,
+            // A peer's own name is only known if it answered the walk. The
+            // address is what this server actually has, so it is the heading
+            // rather than a second line saying "(unknown)" above it.
+            `<b>${me.node_id || url}</b>`,
+            me.node_id ? url : "",
             held,
             me.version ? `version ${me.version}` : "",
             health
@@ -1944,9 +1988,18 @@ function renderPeers() {
     version.textContent = health.version || "—";
     if (!health.version) version.className = "muted";
 
+    // When this server last had a successful health reply from that peer —
+    // nothing to do with a value's `last_seen`, which is why the column is
+    // not called that. "never" means no probe has ever succeeded, which for a
+    // peer that is online usually means it has only just been added.
     const seen = document.createElement("td");
-    seen.textContent = health.last_seen ? fmtTime(health.last_seen) : "never";
+    seen.textContent = health.last_seen ? fmtTime(health.last_seen)
+                     : health.probed ? "never answered"
+                     : "not asked yet";
     if (!health.last_seen) seen.className = "muted";
+    seen.title = health.last_seen
+      ? "When this server last got a health reply from this peer"
+      : "This server has had no successful health reply from this peer";
 
     const actions = document.createElement("td");
     actions.className = "actions";

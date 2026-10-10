@@ -1,0 +1,212 @@
+{
+ "_source": {
+  "feed": "https://www.circl.lu/doc/misp/feed-osint",
+  "event": "cf909fc3-0e55-4962-b462-2219981ea53c",
+  "info": "OSINT - PhantomCaptcha | Multi-Stage WebSocket RAT Targets Ukraine in Single-Day Spearphishing Operation",
+  "event_date": "2025-11-10",
+  "published_by": "CIRCL",
+  "marking": [
+   "tlp:clear",
+   "tlp:white"
+  ],
+  "retrieved": "2026-10-10",
+  "generated_by": "doc/docker/fetch-demo-data.py",
+  "credit": "\u00a9 CIRCL. Sample data from the CIRCL MISP OSINT feed, https://www.circl.lu/doc/misp/feed-osint",
+  "terms": "Marked TLP:CLEAR, which says it may be shared without restriction but is a handling designation rather than a copyright licence: the feed states no licence and CIRCL reserves copyright. Kept here as a small attributed sample so the demo has real data in it. If that is not a basis you are comfortable with, run fetch-demo-data.py yourself instead of committing its output.",
+  "note": "Indicators someone else published, and a dated snapshot: the feed is rewritten daily and this is not current. Read as data, not as advice."
+ },
+ "items": [
+  {
+   "namespace": "misp/domains",
+   "value": "lapas.live",
+   "timestamp": 1762792503,
+   "tags": "misp-type:domain,stix-type:domain-name,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:PhantomCaptcha,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/domains",
+   "value": "zoomconference.app",
+   "timestamp": 1762792503,
+   "tags": "misp-type:domain,stix-type:domain-name,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:PhantomCaptcha,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/domains",
+   "value": "zoomconference.click",
+   "timestamp": 1762792503,
+   "tags": "misp-type:domain,stix-type:domain-name,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:PhantomCaptcha,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/ips",
+   "value": "45.15.156.24",
+   "timestamp": 1762792503,
+   "tags": "misp-type:ip-dst,stix-type:ipv4-addr,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:PhantomCaptcha,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/ips",
+   "value": "185.142.33.131",
+   "timestamp": 1762792503,
+   "tags": "misp-type:ip-dst,stix-type:ipv4-addr,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:PhantomCaptcha,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/ips",
+   "value": "193.233.23.81",
+   "timestamp": 1762792503,
+   "tags": "misp-type:ip-dst,stix-type:ipv4-addr,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:PhantomCaptcha,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/domains",
+   "value": "princess-mens.click",
+   "timestamp": 1762792554,
+   "tags": "misp-type:domain,stix-type:domain-name,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:Android Malware,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/domains",
+   "value": "princess-mens-club.com",
+   "timestamp": 1762792594,
+   "tags": "misp-type:domain,stix-type:domain-name,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:Android Malware,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/ips",
+   "value": "91.149.253.99",
+   "timestamp": 1762792617,
+   "tags": "misp-type:ip-dst,stix-type:ipv4-addr,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:Android Malware,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/ips",
+   "value": "91.149.253.134",
+   "timestamp": 1762792617,
+   "tags": "misp-type:ip-dst,stix-type:ipv4-addr,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:Android Malware,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/ips",
+   "value": "167.17.188.244",
+   "timestamp": 1762792617,
+   "tags": "misp-type:ip-dst,stix-type:ipv4-addr,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:Android Malware,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "07d9deaace25d90fc91b31849dfc12b2fc3ac5ca90e317cfa165fe1d3553eead",
+   "timestamp": 1762792655,
+   "tags": "misp-type:sha256,stix-type:file.SHA-256,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:Cloud Storage,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "e8d0943042e34a37ae8d79aeb4f9a2fa07b4a37955af2b0cc0e232b79c2e72f3",
+   "timestamp": 1762793206,
+   "tags": "misp-type:sha256,stix-type:file.SHA-256,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:The campaign was initiated through emails that impersonated the Ukrainian President\u2019s Office and contained a weaponized PDF attachment (SHA-256: e8d0943042e34a37ae8d79aeb4f9a2fa07b4a37955af2b0cc0e232b79c2e72f3) embedded with a malicious link.,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "3324550964ec376e74155665765b1492ae1e3bdeb35d57f18ad9aaca64d50a44",
+   "timestamp": 1762794273,
+   "tags": "misp-type:sha256,stix-type:file.SHA-256,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:The initial payload (SHA-256: 3324550964ec376e74155665765b1492ae1e3bdeb35d57f18ad9aaca64d50a44) was a heavily obfuscated PowerShell script named cptch and exceeding 500KB in size. Despite its apparent complexity; the cptch script\u2019s core functionality is simply to download and execute a second-stage payload from hxxps://bsnowcommunications[.]com/maintenance.,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "4bc8cf031b2e521f2b9292ffd1aefc08b9c00dab119f9ec9f65219a0fbf0f566",
+   "timestamp": 1762794488,
+   "tags": "misp-type:sha256,stix-type:file.SHA-256,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:Stage 2: Fingerprinting and Encrypted Comms  The second-stage payload (SHA-256: 4bc8cf031b2e521f2b9292ffd1aefc08b9c00dab119f9ec9f65219a0fbf0f566) is named maintenance and performs system reconnaissance; collecting:      Computer name     Domain information     Username     Process ID     System UUID (hardware identifier),misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/domains",
+   "value": "bsnowcommunications.com",
+   "timestamp": 1762792503,
+   "tags": "misp-type:domain,stix-type:domain-name,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:PhantomCaptcha,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/domains",
+   "value": "goodhillsenterprise.com",
+   "timestamp": 1762795008,
+   "tags": "misp-type:domain,stix-type:domain-name,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:PhantomCaptcha,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "55677db95eb5ddcca47394d188610029f06101ee7d1d8e63d9444c9c5cb04ae1",
+   "timestamp": 1762792672,
+   "tags": "misp-type:sha256,stix-type:file.SHA-256,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/files",
+   "value": "princess.apk",
+   "timestamp": 1762792672,
+   "tags": "misp-type:filename,stix-type:file,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "b02d8f8cf57abdc92b3af2545f1e46f1813f192f4a200a3de102fd38cf048517",
+   "timestamp": 1762792697,
+   "tags": "misp-type:sha256,stix-type:file.SHA-256,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "bcb9e99021f88b9720a667d737a3ddd7d5b9f963ac3cae6d26e74701e406dcdc",
+   "timestamp": 1762792716,
+   "tags": "misp-type:sha256,stix-type:file.SHA-256,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/urls",
+   "value": "https://www.virustotal.com/gui/file/e8d0943042e34a37ae8d79aeb4f9a2fa07b4a37955af2b0cc0e232b79c2e72f3",
+   "timestamp": 1762793328,
+   "tags": "misp-type:link,misp-category:External analysis,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "412196c2f6850998f9681341711aa863",
+   "timestamp": 1762795061,
+   "tags": "misp-type:md5,stix-type:file.MD5,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "2971f1235d8417a5bf271133915da26f1c958bb2",
+   "timestamp": 1762795061,
+   "tags": "misp-type:sha1,stix-type:file.SHA-1,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/urls",
+   "value": "https://zoomconference.app/?conferenceId=fjZlk9qn10CbFjgQobL",
+   "timestamp": 1762793803,
+   "tags": "misp-type:url,stix-type:url,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/urls",
+   "value": "https://www.virustotal.com/gui/file/3324550964ec376e74155665765b1492ae1e3bdeb35d57f18ad9aaca64d50a44",
+   "timestamp": 1762794388,
+   "tags": "misp-type:link,misp-category:External analysis,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/domains",
+   "value": "assets.msn.com-ion.edgesuite.net",
+   "timestamp": 1762794388,
+   "tags": "misp-type:domain,stix-type:domain-name,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "7f7bc8b868852ffe4e35d492eda8173a",
+   "timestamp": 1762794435,
+   "tags": "misp-type:md5,stix-type:file.MD5,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "1a6a06229c86c8c48bdbc1630eab57374a2e2c83",
+   "timestamp": 1762794435,
+   "tags": "misp-type:sha1,stix-type:file.SHA-1,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/hashes",
+   "value": "19bcf7ca3df4e54034b57ca924c9d9d178f4b0b8c2071a350e310dd645cd2b23",
+   "timestamp": 1762794883,
+   "tags": "misp-type:sha256,stix-type:file.SHA-256,misp-category:Payload delivery,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,description:The final payload (SHA-256: 19bcf7ca3df4e54034b57ca924c9d9d178f4b0b8c2071a350e310dd645cd2b23) is a lightweight PowerShell backdoor that connects (and repeatedly reconnects) to a remote WebSocket server at wss://bsnowcommunications[.]com:80. It receives Base64-encoded JSON messages that contain one of:,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/urls",
+   "value": "https://princess-mens.click/K-Lite_Codec_Pack_1905_Basic.rar",
+   "timestamp": 1762795184,
+   "tags": "misp-type:url,stix-type:url,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  },
+  {
+   "namespace": "misp/urls",
+   "value": "https://princess-mens.click/princess.apk",
+   "timestamp": 1762795203,
+   "tags": "misp-type:url,stix-type:url,misp-category:Network activity,misp-event:cf909fc3-0e55-4962-b462-2219981ea53c,misp-galaxy:country=\"ukraine\",misp-galaxy:mitre-attack-pattern=\"Impersonation - T1656\",type:OSINT,osint:lifetime=\"perpetual\",osint:certainty=\"50\",tlp:white,tlp:clear,misp-galaxy:producer=\"SentinelOne\",misp-galaxy:threat-actor=\"Callisto\",misp-galaxy:target-information=\"Ukraine\""
+  }
+ ]
+}

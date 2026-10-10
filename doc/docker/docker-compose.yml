@@ -1,0 +1,201 @@
+# A SightingDB galaxy: one load balancer and three nodes.
+#
+# From the repository root:
+#
+#     docker compose -f doc/docker/docker-compose.yml up --build
+#
+# Then open http://localhost:9999/_management and sign in with the key `demo`.
+# The demo data is already in — real indicators from CIRCL's public MISP OSINT
+# feed, converted by fetch-demo-data.py. Browse misp/ips, open a value, then
+# look at Tags and Galaxy.
+#
+#
+#                        clients
+#                           │
+#                           ▼
+#                  ┌─────────────────┐
+#                  │       lb        │  stores nothing; forwards everything
+#                  │  localhost:9999 │
+#                  └────────┬────────┘
+#            ┌──────────────┼──────────────┐
+#            ▼              ▼              ▼
+#      ┌──────────┐   ┌──────────┐   ┌──────────────┐
+#      │  node-a  │◄─►│  node-b  │   │    node-c    │
+#      │   full   │   │   full   │   │   misp/ips   │
+#      │  mirror  │   │  mirror  │   │     only     │
+#      │   :9991  │   │   :9992  │   │    :9993     │
+#      └──────────┘   └──────────┘   └──────────────┘
+#            ▲                              │
+#            └──────────────────────────────┘
+#                     catches up from
+#
+# What each arrow means:
+#
+#   lb → node     the load balancer forwards. A write goes to every node that
+#                 holds the namespace; a read goes to one, chosen by hashing
+#                 the value, so the same value always comes from the same node
+#                 and a count never appears to go down.
+#   node ↔ node   catching up. A node that was stopped asks its peers what they
+#                 hold and pulls what it missed, and only ever pulls namespaces
+#                 it stores itself.
+#
+# The nodes are reachable directly on 9991-9993 so you can see the difference
+# between what one node holds and what the galaxy holds. That is a convenience
+# for reading this, not a pattern: clients talk to the load balancer.
+#
+# Things worth trying are at the bottom of this file.
+
+# One build, four containers. The anchor gives them the same image tag, so
+# Compose builds it once and the other three reuse it.
+x-sightingdb: &sightingdb
+  build:
+    context: ../..
+    dockerfile: docker/Dockerfile
+  image: sightingdb:galaxy
+  restart: unless-stopped
+  # The image's own healthcheck curls /health. Compose uses it to order
+  # startup, and the Galaxy page uses each node's own probe of its peers.
+  healthcheck:
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 10s
+
+services:
+  lb:
+    <<: *sightingdb
+    container_name: sdb-lb
+    environment:
+      # The key clients use. The load balancer's acl_file starts empty on a
+      # fresh volume, so this is what gets you in; the interface can then
+      # create properly scoped keys, which are written to that file.
+      #
+      # The nodes do not use this: they declare their keys inline, so that the
+      # key the load balancer authenticates with can be narrower than full
+      # access. See node-c.toml.
+      - SIGHTINGDB_APIKEY=demo
+      - SIGHTINGDB_CONFIG=/etc/sightingdb/sightingdb.toml
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./lb.toml:/etc/sightingdb/sightingdb.toml:ro
+      - lb-data:/var/lib/sightingdb
+    depends_on:
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy
+      node-c:
+        condition: service_healthy
+
+  node-a:
+    <<: *sightingdb
+    container_name: sdb-node-a
+    environment:
+      - SIGHTINGDB_CONFIG=/etc/sightingdb/sightingdb.toml
+    ports:
+      - "9991:9999"
+    volumes:
+      - ./node-a.toml:/etc/sightingdb/sightingdb.toml:ro
+      - node-a-data:/var/lib/sightingdb
+
+  node-b:
+    <<: *sightingdb
+    container_name: sdb-node-b
+    environment:
+      - SIGHTINGDB_CONFIG=/etc/sightingdb/sightingdb.toml
+    ports:
+      - "9992:9999"
+    volumes:
+      - ./node-b.toml:/etc/sightingdb/sightingdb.toml:ro
+      - node-b-data:/var/lib/sightingdb
+
+  node-c:
+    <<: *sightingdb
+    container_name: sdb-node-c
+    environment:
+      - SIGHTINGDB_CONFIG=/etc/sightingdb/sightingdb.toml
+    ports:
+      - "9993:9999"
+    volumes:
+      - ./node-c.toml:/etc/sightingdb/sightingdb.toml:ro
+      - node-c-data:/var/lib/sightingdb
+
+  # Writes the demo data through the load balancer, once, then exits. It uses
+  # the same image because that image already has curl in it.
+  #
+  # Through the load balancer rather than into each node, on purpose: that is
+  # what makes the sightings land on the right nodes, and what makes them
+  # counted once rather than once per mirror.
+  seed:
+    <<: *sightingdb
+    container_name: sdb-seed
+    restart: "no"
+    healthcheck:
+      disable: true
+    entrypoint: ["/bin/sh", "/seed.sh"]
+    environment:
+      - SIGHTINGDB=http://lb:9999
+      - APIKEY=demo
+    volumes:
+      - ./seed.sh:/seed.sh:ro
+      # The indicators, and the two values the script points at. Both are
+      # generated by fetch-demo-data.py and committed, so the demo needs no
+      # network beyond this compose file.
+      - ./demo-data.json:/demo-data.json:ro
+      - ./demo-data.env:/demo-data.env:ro
+    depends_on:
+      lb:
+        condition: service_healthy
+
+volumes:
+  lb-data:
+  node-a-data:
+  node-b-data:
+  node-c-data:
+
+# ---------------------------------------------------------------------------
+# Things to try
+# ---------------------------------------------------------------------------
+#
+# Read a value through the load balancer, and from each node directly. node-c
+# has the IP; it does not have the domain, and says so with 404 while the load
+# balancer answers from a node that does:
+#
+#   curl -H 'Authorization: demo' 'http://localhost:9999/r/misp/ips?val=45.15.156.24'
+#   curl -H 'Authorization: demo' 'http://localhost:9993/r/misp/ips?val=45.15.156.24'
+#   curl -H 'Authorization: demo' 'http://localhost:9993/r/misp/domains?val=lapas.live'
+#
+# What each server thinks it is, and who it knows:
+#
+#   curl -H 'Authorization: demo' http://localhost:9999/_management/api/galaxy/peers
+#
+# The capability bound. node-c gives the load balancer `rw:misp/ips` and
+# nothing else, so this is refused by node-c itself:
+#
+#   curl -H 'Authorization: lb-ips' -X POST http://localhost:9993/wb \
+#     -H 'Content-Type: application/json' \
+#     -d '{"items":[{"namespace":"misp/domains","value":"x"}]}'
+#
+# Self-healing. Stop a node, write through the load balancer, start it again,
+# and watch it pull what it missed within sync_interval (30s here):
+#
+#   docker compose -f doc/docker/docker-compose.yml stop node-b
+#   curl -H 'Authorization: demo' 'http://localhost:9999/w/misp/ips?val=203.0.113.99'
+#   docker compose -f doc/docker/docker-compose.yml start node-b
+#   sleep 35
+#   curl -H 'Authorization: demo' 'http://localhost:9992/r/misp/ips?val=203.0.113.99&noshadow'
+#
+# Counting is not inflated by mirroring. Three writes through the load balancer
+# are three sightings, not nine, however many nodes hold them:
+#
+#   for i in 1 2 3; do \
+#     curl -s -H 'Authorization: demo' 'http://localhost:9999/w/misp/ips?val=203.0.113.99' >/dev/null; \
+#   done
+#   curl -H 'Authorization: demo' 'http://localhost:9991/r/misp/ips?val=203.0.113.99&noshadow&for_merge'
+#
+# Adding a fourth node without editing any of this: doc/ADDING-NEW-NODE.md.
+#
+# Start over, volumes and all:
+#
+#   docker compose -f doc/docker/docker-compose.yml down -v

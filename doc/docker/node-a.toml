@@ -1,0 +1,59 @@
+# node-a — see the header of docker-compose.yml for the shape of the galaxy.
+
+[daemon]
+listen_ip = "0.0.0.0"
+listen_port = 9999
+authenticate = true
+daemonize = false
+ssl = false
+
+dbdir = "/var/lib/sightingdb"
+snapshot_interval = 300
+sweep_interval = 60
+
+# Unique in the galaxy. Sightings are counted per node, and two nodes sharing a
+# name would each take the other's for its own.
+node_id = "node-a"
+
+[storage]
+default_tier = "hot"
+warm_idle = 3600
+tiers_file = "/var/lib/sightingdb/tiers.toml"
+
+# Absent means everything. A full mirror: it holds every namespace the load
+# balancer sends it, including ones created after it started.
+
+[galaxy]
+health_interval = 5
+# Short so a node that was stopped visibly catches up when it comes back. It
+# asks each peer what it holds, compares, and pulls what it is missing — and it
+# only ever pulls namespaces it stores itself.
+sync_interval = 30
+# A node counts its own sightings, so it has no router's tally to repair.
+reconcile_interval = 0
+gossip_interval = 0
+# Only the other full mirror. There is nothing to catch up from node-c: it
+# holds a subset of what this node holds, so anything it has, this node was
+# sent too. node-c points *here* instead, which is the direction that helps.
+peers = [
+  { url = "http://node-b:9999", key = "peer-full" },
+]
+
+# Keys, declared here rather than in a file so that this demo can show the one
+# thing that matters about a peer key: it is a capability, and the *peer*
+# decides what it opens.
+#
+# A file would be rewritable from the management interface, which is better in
+# earnest — but an acl_file that does not exist yet starts empty and would
+# discard these, so the demo would lose the point it is making. The load
+# balancer has the writable files instead, since that is where you would open
+# the interface.
+[acl]
+# For poking at this node directly: curl -H 'Authorization: demo' ...
+"demo" = "rw, admin"
+# What the load balancer uses here. "rw" everywhere, because a full mirror has
+# to be able to take a write to any namespace.
+"lb-full" = "rw"
+# What the other nodes use when they catch up from this one. Read-only: pulling
+# is a read, and a peer catching up has no business writing here.
+"peer-full" = "r"

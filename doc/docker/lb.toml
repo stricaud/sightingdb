@@ -1,0 +1,109 @@
+# The load balancer: the entry point clients talk to.
+#
+# It stores nothing of its own. Every sighting is forwarded to the nodes that
+# hold the namespace — writes to all of them, reads to one, chosen by hashing
+# the value so the same value always comes back from the same node.
+
+[daemon]
+listen_ip = "0.0.0.0"
+listen_port = 9999
+authenticate = true
+
+# The container is the process. Letting it fork would leave Docker watching a
+# pid that has already exited.
+daemonize = false
+
+# Off because this is a demo on a private network. In earnest, terminate TLS in
+# front of the containers or mount a key and certificate.
+ssl = false
+
+dbdir = "/var/lib/sightingdb"
+snapshot_interval = 300
+sweep_interval = 60
+
+# This server's name in every counter it writes. It must be unique in the
+# galaxy: two servers sharing a name would each take the other's sightings for
+# its own, and the merge that is supposed to reconcile them would instead
+# discard one side. Each node here has its own.
+node_id = "lb"
+
+# The three files the management interface owns and rewrites. They live on the
+# volume rather than in the image, because the image is read-only and because
+# what they hold has to survive a restart.
+#
+# They are separate files for the same reason: this one is comment-rich and
+# hand-maintained, and a program that rewrote it would destroy the comments you
+# are reading. So anything set here is read-only in the interface, which says
+# so rather than appearing to accept a change.
+acl_file = "/var/lib/sightingdb/acl.toml"
+tags_file = "/var/lib/sightingdb/tags.toml"
+
+[storage]
+default_tier = "hot"
+warm_idle = 3600
+tiers_file = "/var/lib/sightingdb/tiers.toml"
+
+# Nothing. This is what makes it a router: every request it cannot serve goes
+# to a node that can. Give it a list here and it would mirror those namespaces
+# as well, which is allowed — a server can be a router and a node at once.
+namespaces = []
+
+[galaxy]
+max_hops = 4
+# Seconds between health probes. Short so the Galaxy page in the interface goes
+# red and green while you watch it; 30 is the default and plenty in earnest.
+health_interval = 5
+
+# Nothing to catch up on: catching up pulls namespaces this server stores, and
+# it stores none.
+sync_interval = 0
+
+# A router counts a value towards consensus when a node says the sighting was
+# new there, and that only ever rises — values expire and namespaces are
+# deleted on the nodes, and neither of those reaches the router. This surveys
+# the galaxy and puts the tally right. Every 10 minutes here so the demo shows
+# it happening; an hour is the default.
+reconcile_interval = 600
+
+# Off for this demo. Offering keys to a peer goes through that peer's own
+# management interface, so it needs `admin` on the peer key — and the keys
+# below are deliberately narrower than that. Leaving it on would log a refusal
+# every interval, which would be noise rather than news.
+gossip_interval = 0
+
+# Peers added from the management interface are written here and take effect at
+# once, without a restart. Set this and the Galaxy page can add, change and
+# remove nodes; leave it out and the galaxy is read-only there.
+#
+# See doc/ADDING-NEW-NODE.md.
+peers_file = "/var/lib/sightingdb/peers.toml"
+
+# There is deliberately no `peers` list here.
+#
+# The three nodes are added by seed.sh through
+# POST /_management/api/galaxy/peers, which is the same thing the Galaxy page
+# does — so they land in peers_file above and are **editable in the interface**:
+# you can change the key a node is reached with, change which namespaces it
+# holds, remove it, or add a fourth. See doc/ADDING-NEW-NODE.md.
+#
+# Writing them here instead would work, and they would show up in the Galaxy
+# page exactly the same — but marked as coming from the configuration and
+# read-only there, because this file is yours and the program does not rewrite
+# it. A change made in the interface would then last only until the next
+# restart, which is worse than refusing. That is the trade: this file for
+# peers you want to pin, peers_file for peers you want to manage.
+#
+# What a peer entry says, wherever it is written:
+#
+#   url         where the node is
+#   key         the key THIS server authenticates to it with. It is the bound
+#               on what this load balancer may do there, because it is the
+#               node's own ACL that decides: `lb-ips` cannot write outside
+#               misp/ips on node-c however this server is configured, or
+#               compromised.
+#   namespaces  what the node holds, so a request can be sent where it can be
+#               served. Absent means a full mirror. Declared rather than asked
+#               of the node, since asking would need the peer key to carry an
+#               admin grant and the point of that key is to be the narrowest
+#               thing that works. It has to agree with the node's own
+#               [storage] namespaces.
