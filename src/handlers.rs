@@ -3585,6 +3585,92 @@ mod tests {
         assert_eq!(st.db.count("_shadow/feeds/ips", "1.2.3.4"), 0);
     }
 
+    /// A router holding nothing must still export, by asking the mirrors.
+    ///
+    /// It did not: `/stix` had no forwarding path, so a router answered 404 for
+    /// data one hop away. The mirror here is unreachable on purpose — what is
+    /// under test is that the router *asks* rather than what the answer is.
+    #[actix_web::test]
+    async fn a_router_asks_a_mirror_to_export_rather_than_answering_404() {
+        let st = router_towards(&["/"]);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/feeds/ips")
+                .to_request(),
+        )
+        .await;
+
+        // Nowhere to get it from, so still a miss -- but reported as the
+        // namespace being missing from the galaxy, after trying, rather than
+        // as this server's own 404 before trying.
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(
+            body["error"], "Path not found",
+            "an unreachable mirror should still read as a miss: {body}"
+        );
+    }
+
+    /// The same for the automation route.
+    #[actix_web::test]
+    async fn the_export_api_asks_the_mirrors_too() {
+        let st = router_towards(&["/"]);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespaces": ["feeds/ips"]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// An export is `application/stix+json`, and says in headers how much it
+    /// left out. Relaying only the status and the body would hand a client a
+    /// bundle and silently drop the part saying whether it was complete.
+    #[actix_web::test]
+    async fn a_relayed_answer_keeps_the_mirrors_headers() {
+        let answer = crate::galaxy::Forwarded {
+            status: 200,
+            body: b"{}".to_vec(),
+            headers: vec![
+                (
+                    "content-type".to_string(),
+                    "application/stix+json;version=2.1".to_string(),
+                ),
+                ("x-sightingdb-exported".to_string(), "7".to_string()),
+                ("x-sightingdb-truncated".to_string(), "true".to_string()),
+            ],
+        };
+
+        let resp = relayed(answer);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/stix+json;version=2.1"
+        );
+        assert_eq!(resp.headers().get("x-sightingdb-exported").unwrap(), "7");
+        assert_eq!(resp.headers().get("x-sightingdb-truncated").unwrap(), "true");
+        // Still marked as having come from somewhere else.
+        assert_eq!(resp.headers().get("X-SightingDB-Forwarded").unwrap(), "1");
+    }
+
+    /// A mirror with nothing to say about the content type does not end up
+    /// with none: a relayed answer is JSON unless it says otherwise.
+    #[actix_web::test]
+    async fn a_relayed_answer_without_a_content_type_is_json() {
+        let resp = relayed(crate::galaxy::Forwarded {
+            status: 200,
+            body: b"{}".to_vec(),
+            headers: Vec::new(),
+        });
+        assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+    }
+
     /// `noshadow` from the client is still honoured: the entry point records
     /// nothing either.
     #[actix_web::test]
