@@ -426,6 +426,40 @@ impl Namespace {
         (attr.count(), is_new, attr.view(0, false))
     }
 
+    /// Set one value's count outright, reporting whether it changed.
+    ///
+    /// Not a sighting and not a merge: the caller has surveyed the truth and
+    /// is correcting a tally that drifted. Attributed to `node` because the
+    /// server doing the correcting is the one asserting it, and a count of 0
+    /// removes the value — a tally of nothing is nothing, not a zero entry.
+    fn set_count(&self, node: &str, value: &str, count: u64) -> bool {
+        let mut values = self.values.write().unwrap_or_else(PoisonError::into_inner);
+
+        if count == 0 {
+            return values.remove(value).is_some();
+        }
+
+        let cell = values
+            .entry(value.to_string())
+            .or_insert_with(|| Mutex::new(Attribute::new(value)));
+        let attr = cell.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if attr.count() == count {
+            return false;
+        }
+
+        // One entry, under the correcting server's name, replacing whatever
+        // was there: the tally is an assertion about the galaxy rather than a
+        // sum of contributions.
+        attr.counts.clear();
+        attr.counts.insert(node.to_string(), count);
+        if attr.first_seen == DateTime::UNIX_EPOCH {
+            let now = Utc::now();
+            attr.first_seen = now;
+            attr.last_seen = now;
+        }
+        true
+    }
+
     /// Fold a peer's copy in, reporting whether the value was absent here.
     ///
     /// Takes the map's write lock rather than the fast read-lock path, because
@@ -443,6 +477,46 @@ impl Namespace {
         // We hold the map's write lock, so the mutex needs no locking here.
         let attr = cell.get_mut().unwrap_or_else(PoisonError::into_inner);
         (attr.merge(incoming, node), is_new)
+    }
+
+    fn merge_page(&self, offset: usize, limit: usize, now: DateTime<Utc>) -> Page<(String, Merge)> {
+        let values = self.values.read().unwrap_or_else(PoisonError::into_inner);
+        let mut names: Vec<&String> = values.keys().collect();
+        names.sort_unstable();
+
+        // Expired values are not offered, and are not counted either: a caller
+        // paging through should not have to wonder why a page came back short.
+        let live: Vec<&&String> = names
+            .iter()
+            .filter(|value| {
+                values.get(**value).is_some_and(|cell| {
+                    !cell
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .is_expired(now)
+                })
+            })
+            .collect();
+
+        let total = live.len();
+        let items = live
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .filter_map(|value| {
+                let attr = values
+                    .get(*value)?
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                Some(((*value).clone(), attr.as_merge()))
+            })
+            .collect();
+
+        Page {
+            items,
+            total,
+            offset,
+        }
     }
 
     fn merge_payload(&self, value: &str, now: DateTime<Utc>) -> Option<Merge> {
@@ -850,6 +924,48 @@ impl Database {
         outcome
     }
 
+    /// Put the consensus tally right from a survey of who holds what.
+    ///
+    /// `holders` maps each value to the set of namespaces holding it, so the
+    /// tally is the size of that set. A set rather than a sum: the same
+    /// namespace mirrored three times is still one namespace.
+    ///
+    /// Used by a server in front of a galaxy, whose tally it keeps by counting
+    /// forwarded writes and which therefore only ever rises — values expire and
+    /// namespaces are deleted on the nodes, and neither reaches it. See
+    /// [`crate::galaxy::reconcile`].
+    ///
+    /// Returns how many values were wrong. A value this server had a tally for
+    /// and the survey did not find at all is set to nothing: it has gone
+    /// everywhere, so saying otherwise would be the drift this exists to undo.
+    pub fn set_consensus(
+        &self,
+        holders: &HashMap<String, std::collections::BTreeSet<String>>,
+    ) -> usize {
+        let all = self.namespace_or_create(ALL_NAMESPACE);
+        let mut corrected = 0;
+
+        for (value, namespaces) in holders {
+            let truth = namespaces.len() as u64;
+            if all.set_count(&self.node, value, truth) {
+                corrected += 1;
+            }
+        }
+
+        // Anything we have a tally for that the survey never saw has gone from
+        // every namespace that held it.
+        for value in all.value_names() {
+            if !holders.contains_key(&value) && all.set_count(&self.node, &value, 0) {
+                corrected += 1;
+            }
+        }
+
+        if corrected > 0 {
+            self.mark_dirty(ALL_NAMESPACE);
+        }
+        corrected
+    }
+
     /// Replace a value's tags outright, which is how a wrong one comes off.
     ///
     /// This is not a sighting: nothing is counted, and `first_seen` and
@@ -874,6 +990,22 @@ impl Database {
     ) -> Option<AttributeView> {
         self.namespace(path)?
             .view(value, consensus, with_stats, Utc::now())
+    }
+
+    /// Every value in a namespace, in the shape a peer should be offered them.
+    ///
+    /// Paged, because a namespace can hold millions and a catch-up has to be
+    /// able to make progress in bounded steps. Ordered by value so that paging
+    /// is stable while the namespace is being written to: a new value appears
+    /// in its place rather than shifting everything after it.
+    pub fn merge_page(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Option<Page<(String, Merge)>> {
+        let namespace = self.namespace(path)?;
+        Some(namespace.merge_page(offset, limit, Utc::now()))
     }
 
     /// One value in the shape a peer should be offered it, or `None` if it is
@@ -1146,7 +1278,11 @@ impl Database {
         let mut names: Vec<String> = shards
             .values()
             .flat_map(|meta| meta.namespaces.iter())
-            .filter(|name| !name.starts_with(CONFIG_PREFIX) && *name != ALL_NAMESPACE)
+            // Internal namespaces are the database's own. They are readable
+            // one at a time — `/r/_all` is how consensus is asked for — but
+            // they are not something to enumerate, or a recursive export of
+            // `/` would carry every shadow sighting with it.
+            .filter(|name| !is_internal(name))
             .filter(|name| {
                 prefix.is_empty()
                     || name.as_str() == prefix
@@ -1391,6 +1527,30 @@ impl Database {
     }
 
     /// The current policy, for writing back to disk.
+    /// The tier overrides this server holds, for offering to peers.
+    ///
+    /// Only the shards that name their own, since the default travels in the
+    /// configuration rather than through the management interface. Each is
+    /// `(shard, tier, warm_idle)` with `None` where the entry leaves it to the
+    /// default.
+    pub fn tier_overrides(&self) -> Vec<(String, Option<String>, Option<u64>)> {
+        let tiers = self.tiers.read().unwrap_or_else(PoisonError::into_inner);
+        let mut found: Vec<(String, Option<String>, Option<u64>)> = tiers
+            .entries
+            .iter()
+            .map(|(shard, entry)| {
+                (
+                    shard.clone(),
+                    entry.tier.map(|tier| tier.as_str().to_string()),
+                    entry.warm_idle,
+                )
+            })
+            .collect();
+        // Named order, so an offer does not reshuffle between passes.
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found
+    }
+
     pub fn tier_policy(&self) -> TierPolicy {
         self.tiers
             .read()
@@ -1827,7 +1987,7 @@ fn now_secs() -> i64 {
     Utc::now().timestamp()
 }
 
-fn counts_towards_consensus(name: &str) -> bool {
+pub fn counts_towards_consensus(name: &str) -> bool {
     name != ALL_NAMESPACE && !name.starts_with(SHADOW_PREFIX) && !name.starts_with(CONFIG_PREFIX)
 }
 
@@ -2624,6 +2784,92 @@ mod tests {
 
         // And a server with nothing to give back cannot go negative.
         assert_eq!(attr.decrement("node-a"), 1);
+    }
+
+    /// A survey of who holds what puts the tally right — including downward,
+    /// which is the whole reason it exists: a tally kept by counting forwarded
+    /// writes only ever rises.
+    #[test]
+    fn set_consensus_corrects_a_tally_in_both_directions() {
+        use std::collections::{BTreeSet, HashMap};
+
+        let db = Database::with_node(
+            DatabasePolicy::default(),
+            StoragePolicy::everything(),
+            "lb".to_string(),
+        );
+
+        // A tally as a router would have built it: three writes said "new",
+        // so it believes three namespaces hold this.
+        for _ in 0..3 {
+            db.write(ALL_NAMESPACE, "1.2.3.4", Utc::now(), WriteOpts::default());
+        }
+        db.write(
+            ALL_NAMESPACE,
+            "gone-everywhere",
+            Utc::now(),
+            WriteOpts::default(),
+        );
+        assert_eq!(db.count(ALL_NAMESPACE, "1.2.3.4"), 3);
+
+        // The survey finds it in two, and does not find the other at all.
+        let mut holders: HashMap<String, BTreeSet<String>> = HashMap::new();
+        holders.insert(
+            "1.2.3.4".to_string(),
+            ["feeds/a", "feeds/b"]
+                .iter()
+                .map(|n| n.to_string())
+                .collect(),
+        );
+        holders.insert(
+            "new-to-us".to_string(),
+            ["feeds/c"].iter().map(|n| n.to_string()).collect(),
+        );
+
+        let corrected = db.set_consensus(&holders);
+
+        assert_eq!(
+            db.count(ALL_NAMESPACE, "1.2.3.4"),
+            2,
+            "the tally did not come down"
+        );
+        assert_eq!(
+            db.count(ALL_NAMESPACE, "gone-everywhere"),
+            0,
+            "a value the survey never saw kept its tally"
+        );
+        assert_eq!(db.count(ALL_NAMESPACE, "new-to-us"), 1);
+        assert_eq!(corrected, 3, "wrong number reported as corrected");
+
+        // And again changes nothing, so a reconciliation on a timer is quiet
+        // once it agrees.
+        assert_eq!(db.set_consensus(&holders), 0);
+    }
+
+    /// The same namespace mirrored several times is still one namespace. A set
+    /// is what makes that true; a sum would be the double counting the whole
+    /// design exists to avoid.
+    #[test]
+    fn set_consensus_counts_namespaces_not_mirrors() {
+        use std::collections::{BTreeSet, HashMap};
+
+        let db = Database::with_node(
+            DatabasePolicy::default(),
+            StoragePolicy::everything(),
+            "lb".to_string(),
+        );
+
+        let mut holders: HashMap<String, BTreeSet<String>> = HashMap::new();
+        // Surveyed from three mirrors, all holding the same two namespaces.
+        let mut found = BTreeSet::new();
+        for _ in 0..3 {
+            found.insert("feeds/a".to_string());
+            found.insert("feeds/b".to_string());
+        }
+        holders.insert("1.2.3.4".to_string(), found);
+
+        db.set_consensus(&holders);
+        assert_eq!(db.count(ALL_NAMESPACE, "1.2.3.4"), 2);
     }
 
     #[test]

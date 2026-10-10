@@ -279,6 +279,27 @@ tiers_file = "tiers.toml"
 #[galaxy]
 #max_hops = 4
 #health_interval = 30
+# Seconds between catch-up passes: a server that was down finds what it
+# missed and pulls it from a peer that was up. 0 switches it off, which
+# leaves such a server behind until someone syncs it by hand.
+#sync_interval = 300
+# Seconds between rebuilds of the consensus tally from the galaxy. A server
+# in front of one counts a value towards consensus when a mirror says the
+# sighting was new there, which only ever rises — values expire and
+# namespaces are deleted on the nodes, and neither reaches it. This surveys
+# the galaxy and puts the tally right, so it is a repair rather than a
+# steady cost. 0 switches it off.
+#reconcile_interval = 3600
+# Seconds between offering this server's keys to its peers, so a peer that
+# was down for a key change picks it up. A change is pushed as it happens
+# regardless; this only catches up what was missed. 0 switches the periodic
+# offer off.
+#
+# A push goes through the peer's own management interface, so the peer's ACL
+# decides: this server can only administer a peer it holds an admin key for.
+# Note that the offer is additive — a revocation made while a peer was down
+# does not reach it, and must be repeated.
+#gossip_interval = 600
 #verify_tls = true
 #peers = [
 #  { url = "https://node-a.example:9999", key = "..." },

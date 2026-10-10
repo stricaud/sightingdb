@@ -164,6 +164,34 @@ paths:
 
             Raises no shadow sighting. Cannot be combined with `val`.
           schema: { type: string }
+        - name: for_merge
+          in: query
+          allowEmptyValue: true
+          description: |
+            Answer in the shape `POST /_api/merge` takes, so a sync reads from
+            one server and posts to another unchanged.
+
+            With `val`, that one value. Without it, a page of every live value
+            in the namespace — which is what a catch-up walks — using `offset`
+            and `limit`.
+
+            `counts` is per server, not a total. Offering a total would make
+            the receiver attribute every server's sightings to the sender, and
+            two servers exchanging totals inflate each other without bound.
+
+            An expired value is not offered: a peer that took it would hold
+            something this server has already stopped showing.
+          schema: { type: string }
+        - name: offset
+          in: query
+          description: Where to start, when `for_merge` is asked of a namespace.
+          schema: { type: integer, minimum: 0 }
+        - name: limit
+          in: query
+          description: |
+            Values per page, when `for_merge` is asked of a namespace. Default
+            500, maximum 5000.
+          schema: { type: integer, minimum: 1, maximum: 5000 }
       responses:
         "200":
           description: |
@@ -508,6 +536,43 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/MergeResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /_api/namespaces:
+    get:
+      tags: [bulk]
+      summary: Which namespaces exist here
+      description: |
+        What a catch-up needs that nothing else gave it: a server that was down
+        does not know about namespaces created while it was away, so it cannot
+        ask for their values.
+
+        Read-authorized per namespace, like browsing, so a name out of this
+        key's reach is simply absent rather than refused — the answer is "what
+        you may know about".
+
+        Deliberately not the management interface's namespace listing, which
+        needs an `admin` grant: a peer key should be able to be the narrowest
+        thing that does the job.
+      parameters:
+        - name: prefix
+          in: query
+          description: |
+            Only namespaces at or under this one, matched on whole path
+            segments. Absent means all of them.
+          schema: { type: string }
+          example: feeds
+      responses:
+        "200":
+          description: The namespaces this key may know about
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  namespaces:
+                    type: array
+                    items: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /_api/stix:
@@ -1114,6 +1179,75 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "409":
           description: That would leave no admin key, or no acl_file is configured
+
+  /_management/api/keys/drift:
+    get:
+      tags: [management]
+      summary: Where this server's keys and its peers' disagree
+      description: |
+        Keys are gossiped to the peers a server administers, and the periodic
+        offer is deliberately **additive** — it never deletes a key a peer has
+        and this server does not, because this server is not necessarily the
+        only place keys are managed.
+
+        The consequence is that a key revoked while a peer was down stays live
+        on that peer. That is a security hole if it is invisible and merely a
+        chore if it is not, which is what this is for.
+
+        Asked through each peer's own management interface, so a peer this
+        server does not administer reports why rather than appearing to agree.
+      responses:
+        "200":
+          description: Each peer, and how its key list differs from this one
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  peers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        url: { type: string }
+                        readable:
+                          type: boolean
+                          description: |
+                            Whether this server was allowed to ask at all.
+                            `false` means it holds no `admin` key there, which
+                            for a deliberately narrow peer key is expected.
+                        error: { type: string }
+                        revoked_but_present:
+                          type: array
+                          items: { type: string }
+                          description: |
+                            Keys this server **revoked** and the peer still
+                            accepts — a revocation that did not land. **Revoke
+                            them again now the peer is reachable.**
+
+                            The record of revocations is held in memory, so
+                            after a restart one of these moves into
+                            `only_on_peer` and stops being flagged.
+                        only_on_peer:
+                          type: array
+                          items: { type: string }
+                          description: |
+                            Keys the peer has that this server never knew
+                            about. Ordinary — a peer has its own keys,
+                            including the one this server authenticates with —
+                            and kept separate so it does not drown the case
+                            above.
+                        missing:
+                          type: array
+                          items: { type: string }
+                          description: |
+                            Keys this server has and the peer does not. Usually
+                            a peer that has not had the periodic offer yet.
+                        agrees:
+                          type: boolean
+                          description: Readable, and nothing differs.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
   /_management/api/keys/generate:
     get:

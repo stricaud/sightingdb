@@ -283,6 +283,12 @@ pub struct ServerInfo {
     /// What this server stores and who it knows about: the two things that
     /// decide its place in a galaxy.
     pub role: RoleInfo,
+    /// When this server's TLS certificate runs out. `None` when it serves
+    /// plain HTTP, or when the certificate cannot be read.
+    pub tls: Option<crate::tls::Expiry>,
+    /// Days of certificate life below which the interface calls it urgent, so
+    /// the page and the log agree on what "soon" means.
+    pub expiring_soon_days: i64,
 }
 
 /// This server's place in a galaxy.
@@ -351,7 +357,7 @@ pub struct KeyEntry {
 }
 
 impl KeyEntry {
-    fn from_grants(key: &str, grants: &[Grant]) -> Self {
+    pub fn from_grants(key: &str, grants: &[Grant]) -> Self {
         let mut entry = KeyEntry {
             key: key.to_string(),
             admin: false,
@@ -1006,6 +1012,176 @@ fn save_acl(state: &SharedState, acl: crate::acl::Acl) -> Result<(), HttpRespons
     Ok(())
 }
 
+/// `GET /_management/api/keys/drift` — where this server's keys and its peers'
+/// disagree.
+///
+/// Worth a view of its own because of one deliberate limitation: the periodic
+/// offer of keys to peers is *additive*, so a key revoked while a peer was down
+/// stays live on that peer. That is a security hole if it is invisible, and
+/// merely a chore if it is not — this is what makes it visible.
+///
+/// Reports, per peer:
+///
+///   * `revoked_but_present` — keys this server **revoked** and the peer still
+///     accepts. A revocation that did not land, and the reason this exists.
+///   * `only_on_peer` — keys the peer has that this server never knew about.
+///     Ordinary: a peer has its own keys, including the one this server
+///     authenticates with. Kept separate so it does not drown the case above.
+///   * `missing` — keys this server has and the peer does not. Usually a peer
+///     that has not had the periodic offer yet.
+///
+/// The record of revocations is in memory, so it is lost on restart: after one,
+/// a revocation that never landed moves from `revoked_but_present` into
+/// `only_on_peer` and stops being flagged. Checking the peer's own key list is
+/// then the way to find it.
+///
+/// Asked through each peer's own management interface, so a peer this server
+/// does not administer reports why rather than appearing to agree.
+pub async fn key_drift(state: State, req: HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_admin(&state, &req) {
+        return resp;
+    }
+
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return HttpResponse::Ok().json(serde_json::json!({ "peers": [] }));
+    };
+
+    let mine: std::collections::BTreeSet<String> = state
+        .acl()
+        .entries()
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
+    let revoked_here: std::collections::BTreeSet<String> =
+        state.revoked_keys().into_iter().collect();
+
+    let mut rows = Vec::new();
+    for peer in galaxy.peer_keys().await {
+        let theirs: std::collections::BTreeSet<String> = peer.keys.iter().cloned().collect();
+        let unknown: Vec<&String> = theirs.difference(&mine).collect();
+
+        // The dangerous case: this server revoked it and the peer still takes
+        // it. Separated from the rest, because a peer having keys this server
+        // never knew about is ordinary — it has its own, including the one
+        // this server authenticates with, which would otherwise be reported as
+        // stale for ever.
+        let (stale, theirs_alone): (Vec<&String>, Vec<&String>) = unknown
+            .into_iter()
+            .partition(|key| revoked_here.contains(*key));
+
+        let missing: Vec<&String> = mine.difference(&theirs).collect();
+
+        rows.push(serde_json::json!({
+            "url": peer.url,
+            "readable": peer.readable,
+            "error": peer.error,
+            "revoked_but_present": stale,
+            "only_on_peer": theirs_alone,
+            "missing": missing,
+            "agrees": peer.readable && stale.is_empty() && missing.is_empty(),
+        }));
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({ "peers": rows }))
+}
+
+/// `PUT /_management/api/keys` — hold exactly these keys and no others.
+///
+/// What makes a galaxy have one place to manage keys, and the only thing that
+/// makes a revocation reach a server that was offline for it: the periodic
+/// offer of individual keys is additive and cannot delete.
+///
+/// **Refused unless this server has said it may be replaced.** `acl_replaceable`
+/// in `[galaxy]` is off by default, because a server quietly having its keys
+/// rewritten is not a state to arrive at by accident. With it off, the offer
+/// falls back to being additive and nothing is lost.
+///
+/// Two guards, both the same shape as the ones on a single-key change:
+///
+///   * the set must contain an admin key, or nobody could use the interface
+///     again;
+///   * it must contain the key making the request, or the server doing the
+///     replacing locks itself out of the server it just took over.
+///
+/// Keys removed are noted as revoked, so this server's own drift view can
+/// point out any peer that still holds them.
+pub async fn replace_keys(
+    state: State,
+    body: web::Json<KeyList>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    if !state.acl_replaceable {
+        return HttpResponse::Forbidden().json(Message::new(
+            "This server does not let another replace its keys. Set acl_replaceable              in [galaxy] if it should.",
+        ));
+    }
+
+    let wanted = body.into_inner().keys;
+    for entry in &wanted {
+        if let Err(e) = entry.validate() {
+            return HttpResponse::BadRequest().json(Message::new(e.to_string()));
+        }
+    }
+
+    let mut acl = crate::acl::Acl::new();
+    for entry in &wanted {
+        acl.set(&entry.key, entry.to_grants());
+    }
+
+    if acl.admin_count() == 0 {
+        return HttpResponse::Conflict().json(Message::new(
+            "That set has no admin key, and would lock everyone out of this interface.",
+        ));
+    }
+    if !acl.contains(&caller) {
+        return HttpResponse::Conflict().json(Message::new(
+            "That set does not include the key making this request, which would lock              the caller out of the server it is replacing.",
+        ));
+    }
+
+    // What is going away, before it does, so the drift view can say which
+    // peers still take it.
+    let going: Vec<String> = state
+        .acl()
+        .entries()
+        .iter()
+        .map(|(key, _)| key.clone())
+        .filter(|key| !acl.contains(key))
+        .collect();
+
+    if let Err(resp) = save_acl(&state, acl) {
+        return resp;
+    }
+    for key in &going {
+        state.note_revoked(key);
+    }
+    for entry in &wanted {
+        state.note_unrevoked(&entry.key);
+    }
+
+    log::warn!(
+        "Key list replaced by '{caller}': {} key(s) held, {} revoked",
+        wanted.len(),
+        going.len()
+    );
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "held": wanted.len(),
+        "revoked": going,
+    }))
+}
+
+/// A whole key list, for [`replace_keys`].
+#[derive(Debug, Deserialize)]
+pub struct KeyList {
+    pub keys: Vec<KeyEntry>,
+}
+
 pub async fn list_keys(state: State, req: HttpRequest) -> HttpResponse {
     if let Err(resp) = require_admin(&state, &req) {
         return resp;
@@ -1047,7 +1223,39 @@ pub async fn save_key(state: State, body: web::Json<KeyEntry>, req: HttpRequest)
         return resp;
     }
     log::info!("Key '{}' saved by '{caller}'", entry.key);
+    // A key put back is not a stale revocation any more.
+    state.note_unrevoked(&entry.key);
+    gossip_key(&state, &req, &entry).await;
     HttpResponse::Ok().json(entry)
+}
+
+/// Pass a key change on to the peers this server administers.
+///
+/// After the change has been saved here, so a peer never hears about something
+/// this server then failed to keep. Best effort: a peer that is down misses it
+/// and picks it up from the periodic offer — see [`crate::galaxy::gossip`].
+///
+/// A change that *arrived* as gossip is passed along with one hop less, so a
+/// cascade propagates and a cycle dies on the budget. A change made by a person
+/// here starts with the full budget.
+async fn gossip_key(state: &State, req: &HttpRequest, entry: &KeyEntry) {
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return;
+    };
+    let Some(hops) = crate::galaxy::hops_left(req, galaxy.max_hops()) else {
+        return;
+    };
+    let report = galaxy.push_key(&serde_json::json!(entry), hops).await;
+    if report.accepted > 0 || report.failed > 0 {
+        log::info!(
+            "Key '{}' passed to {} peer(s); {} could not take it, {} do not let this \
+             server administer them",
+            entry.key,
+            report.accepted,
+            report.failed,
+            report.refused
+        );
+    }
 }
 
 pub async fn delete_key(state: State, path: web::Path<String>, req: HttpRequest) -> HttpResponse {
@@ -1073,6 +1281,26 @@ pub async fn delete_key(state: State, path: web::Path<String>, req: HttpRequest)
         return resp;
     }
     log::warn!("Key '{key}' revoked by '{caller}'");
+    // Noted so the interface can point out a peer that still holds it: the
+    // periodic offer never deletes, so a revocation missed while a peer was
+    // down is the one thing here that is genuinely dangerous.
+    state.note_revoked(&key);
+
+    if let Some(galaxy) = state.galaxy.as_ref()
+        && let Some(hops) = crate::galaxy::hops_left(&req, galaxy.max_hops())
+    {
+        let report = galaxy.push_key_removal(&key, hops).await;
+        if report.accepted > 0 || report.failed > 0 {
+            log::warn!(
+                "Revocation of '{key}' passed to {} peer(s); {} could not take it, {} do \
+                 not let this server administer them",
+                report.accepted,
+                report.failed,
+                report.refused
+            );
+        }
+    }
+
     HttpResponse::Ok().json(Message::new("ok"))
 }
 
@@ -1151,6 +1379,34 @@ pub async fn set_tier(state: State, body: web::Json<TierChange>, req: HttpReques
         resolved.warm_idle,
     );
 
+    // Passed on to the peers this server administers, under the same rule as a
+    // key change: the peer's own ACL decides whether to accept it. A tier only
+    // ever takes a value — there is no unset — so this needs no deletion to
+    // chase, which is the one thing that made keys awkward.
+    if let Some(galaxy) = state.galaxy.as_ref()
+        && let Some(hops) = crate::galaxy::hops_left(&req, galaxy.max_hops())
+    {
+        let report = galaxy
+            .push_tier(
+                &serde_json::json!({
+                    "namespace": shard,
+                    "tier": resolved.tier.as_str(),
+                    "warm_idle": resolved.warm_idle,
+                }),
+                hops,
+            )
+            .await;
+        if report.accepted > 0 || report.failed > 0 {
+            log::info!(
+                "Storage of '{shard}' passed to {} peer(s); {} could not take it, {} do \
+                 not let this server administer them",
+                report.accepted,
+                report.failed,
+                report.refused
+            );
+        }
+    }
+
     HttpResponse::Ok().json(serde_json::json!({
         "shard": shard,
         "tier": resolved.tier.as_str(),
@@ -1187,10 +1443,13 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/_management/api/sightings", web::get().to(sightings))
         .route("/_management/api/keys", web::get().to(list_keys))
         .route("/_management/api/keys", web::post().to(save_key))
+        .route("/_management/api/keys", web::put().to(replace_keys))
         .route(
             "/_management/api/keys/generate",
             web::get().to(generate_key),
         )
+        // Before the `{key}` route, or "drift" would be taken for a key name.
+        .route("/_management/api/keys/drift", web::get().to(key_drift))
         .route("/_management/api/keys/{key}", web::delete().to(delete_key))
         .route("/_management/api/tier", web::post().to(set_tier))
         .route("/_management", web::get().to(index))
@@ -1548,6 +1807,141 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(st.rejections.len(), 0);
+    }
+
+    /// A server that has not opted in keeps its own keys, whoever asks.
+    ///
+    /// The default, because a server quietly having its key list rewritten is
+    /// not a state to arrive at by accident.
+    #[actix_web::test]
+    async fn keys_cannot_be_replaced_unless_the_server_allows_it() {
+        let st = state();
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/_management/api/keys")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"keys": [
+                    {"key": ADMIN, "admin": true, "read": [""], "write": [""]}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("acl_replaceable"),
+            "the refusal does not say how to allow it: {body}"
+        );
+    }
+
+    /// With it allowed, a replace removes what is not in the set — which is
+    /// the whole reason it exists, since offering keys one at a time cannot
+    /// delete and so cannot carry a revocation to a server that was offline.
+    #[actix_web::test]
+    async fn an_allowed_replace_removes_what_is_not_offered() {
+        let mut inner = SharedState::new(false);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("doomed", parse_grants("rw:feeds").unwrap());
+        let dir = TempDir::new("replace");
+        inner.acl_file = Some(dir.0.join("acl.toml"));
+        inner.acl_replaceable = true;
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/_management/api/keys")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"keys": [
+                    {"key": ADMIN, "admin": true, "read": [""], "write": [""]},
+                    {"key": "kept", "admin": false, "read": ["feeds"], "write": []}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["held"], 2, "{body}");
+        assert_eq!(body["revoked"][0], "doomed", "{body}");
+
+        let acl = st.acl();
+        assert!(acl.contains("kept"));
+        assert!(!acl.contains("doomed"), "the revocation did not land");
+        drop(acl);
+
+        // Noted, so this server's drift view can point out a peer that still
+        // takes it.
+        assert!(st.revoked_keys().contains(&"doomed".to_string()));
+    }
+
+    /// A replace that would lock the interface or the caller out is refused,
+    /// the same way a single-key change is.
+    #[actix_web::test]
+    async fn a_replace_cannot_lock_anyone_out() {
+        let dir = TempDir::new("lockout");
+        let fresh = || {
+            let mut inner = SharedState::new(false);
+            inner.acl.get_mut().unwrap().grant_full(ADMIN);
+            inner.acl_file = Some(dir.0.join("acl.toml"));
+            inner.acl_replaceable = true;
+            web::Data::new(inner) as State
+        };
+
+        // No admin at all.
+        let st = fresh();
+        let app = app!(st);
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/_management/api/keys")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"keys": [
+                    {"key": "reader", "admin": false, "read": ["feeds"], "write": []}
+                ]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(st.acl().contains(ADMIN), "the ACL was replaced anyway");
+
+        // An admin, but not the caller: the server replacing it would lose its
+        // own way in.
+        let st = fresh();
+        let app = app!(st);
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/_management/api/keys")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"keys": [
+                    {"key": "someone-else", "admin": true, "read": [""], "write": [""]}
+                ]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("making this request"),
+            "{body}"
+        );
+        assert!(st.acl().contains(ADMIN));
     }
 
     #[actix_web::test]

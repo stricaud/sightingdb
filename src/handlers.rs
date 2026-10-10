@@ -35,6 +35,31 @@ pub struct SharedState {
     /// The other servers this one knows about, and whether they answer.
     /// `None` when it stands alone.
     pub galaxy: Option<crate::galaxy::Galaxy>,
+    /// Keys revoked on this server, so the interface can say which of them a
+    /// peer still holds.
+    ///
+    /// Needed because this server cannot otherwise tell a revocation that did
+    /// not land from a key the peer has always had of its own — including the
+    /// very key this server authenticates with there, which would be reported
+    /// as stale for ever.
+    ///
+    /// In memory, like the rejection log: a record kept to make something
+    /// visible, not a fact about the data. It is lost on restart, so a
+    /// revocation that never reached a peer stops being flagged once this
+    /// server is restarted. Checking the peer's own key list is then the only
+    /// way to see it.
+    pub revoked: std::sync::RwLock<std::collections::BTreeMap<String, i64>>,
+    /// Whether another server may replace this one's key list wholesale.
+    /// Off unless `[galaxy] acl_replaceable` says otherwise.
+    pub acl_replaceable: bool,
+    /// Set until the first catch-up pass has finished.
+    ///
+    /// A server that has just started may be behind its peers, and a read of
+    /// a value it has not caught up on yet would under-report. Writes are
+    /// accepted throughout: they land directly, and the catch-up fills in the
+    /// history behind them. Stopping writes instead would mean the target
+    /// keeps moving and the catch-up never provably finishes.
+    pub joining: std::sync::atomic::AtomicBool,
 }
 
 impl SharedState {
@@ -56,11 +81,71 @@ impl SharedState {
             started: std::time::Instant::now(),
             rejections: crate::rejections::Rejections::default(),
             galaxy: None,
+            revoked: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            acl_replaceable: false,
+            joining: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
 
 impl SharedState {
+    /// Note that a key was revoked here, so a peer still holding it can be
+    /// pointed out.
+    ///
+    /// Bounded, because a long-lived server rotating keys should not grow a
+    /// list for ever. The oldest go first; a revocation old enough to fall off
+    /// has either propagated or been noticed.
+    pub fn note_revoked(&self, key: &str) {
+        const KEEP: usize = 1000;
+        let mut revoked = self
+            .revoked
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        revoked.insert(key.to_string(), chrono::Utc::now().timestamp());
+        while revoked.len() > KEEP {
+            // Oldest by when it was revoked, not by name.
+            if let Some(oldest) = revoked
+                .iter()
+                .min_by_key(|(_, when)| **when)
+                .map(|(key, _)| key.clone())
+            {
+                revoked.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// A key put back is no longer revoked.
+    pub fn note_unrevoked(&self, key: &str) {
+        self.revoked
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+
+    /// Keys revoked here, newest first.
+    pub fn revoked_keys(&self) -> Vec<String> {
+        let revoked = self
+            .revoked
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut keys: Vec<(&String, &i64)> = revoked.iter().collect();
+        keys.sort_by(|a, b| b.1.cmp(a.1));
+        keys.into_iter().map(|(key, _)| key.clone()).collect()
+    }
+
+    /// Whether this server is still pulling what it missed.
+    pub fn catching_up(&self) -> bool {
+        self.joining.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_catching_up(&self, catching_up: bool) {
+        self.joining
+            .store(catching_up, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Read access to the ACL. Poisoning is recovered from rather than
     /// propagated: one failed request must not lock everyone out.
     pub fn acl(&self) -> std::sync::RwLockReadGuard<'_, Acl> {
@@ -118,6 +203,37 @@ pub struct ReadQuery {
     /// Present at any value to answer in the shape `POST /_api/merge` takes,
     /// so a sync reads from one server and posts to another unchanged.
     for_merge: Option<String>,
+    /// Where to start when `for_merge` is asked of a whole namespace.
+    offset: Option<usize>,
+    /// How many values to answer with. A catch-up walks a namespace in
+    /// bounded steps rather than asking for all of it at once.
+    limit: Option<usize>,
+}
+
+impl ReadQuery {
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(500).clamp(1, 5_000)
+    }
+}
+
+/// One page of a namespace, in the shape `POST /_api/merge` takes.
+#[derive(Debug, Serialize)]
+struct MergePage {
+    namespace: String,
+    items: Vec<MergeOffer>,
+    /// Live values in the namespace, before paging — so a caller knows how
+    /// much is left to walk.
+    total: usize,
+    offset: usize,
+}
+
+/// One value, ready to be posted to `/_api/merge` with nothing added.
+#[derive(Debug, Serialize)]
+struct MergeOffer {
+    namespace: String,
+    value: String,
+    #[serde(flatten)]
+    state: crate::attribute::Merge,
 }
 
 /// How many values a namespace holds, for `/r/<namespace>?count`.
@@ -398,6 +514,13 @@ struct HealthData {
     /// not been touched yet reports 0 of n, which is normal rather than ill.
     resident_shards: usize,
     shards: usize,
+    /// Whether this server is still pulling what it missed from its peers.
+    ///
+    /// Reported so that something in front of it can send reads elsewhere
+    /// while it is behind. Writes are fine — they land directly and the
+    /// catch-up fills in the history behind them — but a read would
+    /// under-report, which is the one thing a sightings database must not do.
+    catching_up: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -564,6 +687,7 @@ pub async fn help() -> impl Responder {
             "\t/wb: write in bulk mode (POST)\n",
             "\t/vwb: check a bulk write without recording it (POST)\n",
             "\t/_api/merge: fold a peer's copy of values into ours (POST)\n",
+            "\t/_api/namespaces: which namespaces exist here (GET)\n",
             "\t/r: read (GET)\n",
             "\t/rs: read with statistics (GET)\n",
             "\t/rb: read in bulk mode (POST)\n",
@@ -615,6 +739,7 @@ pub async fn health(state: State) -> HttpResponse {
         uptime_seconds: state.started.elapsed().as_secs(),
         resident_shards,
         shards,
+        catching_up: state.catching_up(),
     })
 }
 
@@ -667,11 +792,31 @@ async fn forwarded_read(
         Err(resp) => return Some(resp),
     };
     let galaxy = state.galaxy.as_ref()?;
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_default();
+
+    // The search is recorded here, not wherever the read happens to land.
+    //
+    // This server is where the client actually is, so this is where "how often
+    // was this looked for" is true. Recorded on the mirror instead, the count
+    // would be split across whichever mirrors happened to serve each read —
+    // arbitrary, and wrong in a way nobody would notice.
+    //
+    // It also means a read costs the mirror no write at all, which is what
+    // stops serving more clients multiplying write load across a galaxy.
+    //
+    // Before forwarding and whatever the outcome: a miss is still a search,
+    // which is already how a single server behaves.
+    if query.noshadow.is_none()
+        && let Some(value) = query.val.as_deref()
+    {
+        state.db.write(
+            &format!("{}{namespace}", crate::db::SHADOW_PREFIX),
+            value,
+            chrono::Utc::now(),
+            crate::db::WriteOpts::default(),
+        );
+    }
+
+    let path = suppressing_shadow(req);
 
     // Read from one mirror, chosen by the value so the same value always comes
     // from the same place while the mirror set is unchanged. Without that,
@@ -723,9 +868,30 @@ fn do_read(
     // it is a different shape, not a variation on one: per-node counts rather
     // than the sum, which is the whole reason it exists.
     if query.for_merge.is_some() {
+        // With a value: that one, as the merge route takes it. Without one: a
+        // page of the whole namespace, which is what a catch-up walks.
         let Some(value) = query.val.as_deref() else {
-            return HttpResponse::BadRequest()
-                .json(Message::new("for_merge answers about one value. Add val=."));
+            let Some(page) =
+                state
+                    .db
+                    .merge_page(namespace, query.offset.unwrap_or(0), query.limit())
+            else {
+                return error_response(&ApiError::NotFound(NotFound::namespace(namespace, "")));
+            };
+            return HttpResponse::Ok().json(MergePage {
+                namespace: namespace.to_string(),
+                items: page
+                    .items
+                    .into_iter()
+                    .map(|(value, state)| MergeOffer {
+                        namespace: namespace.to_string(),
+                        value,
+                        state,
+                    })
+                    .collect(),
+                total: page.total,
+                offset: page.offset,
+            });
         };
         return match state.db.merge_payload(namespace, value) {
             Some(payload) => HttpResponse::Ok().json(payload),
@@ -763,6 +929,15 @@ pub async fn write(
     if let Err(resp) = authorize(&state, &req, &namespace, Access::Write) {
         return resp;
     }
+
+    // Checked before forwarding: a request with no value is malformed wherever
+    // it lands, so answering it here saves a hop and gives one consistent
+    // error rather than whatever the mirror would have said.
+    let Some(value) = query.val.as_deref() else {
+        return HttpResponse::BadRequest().json(Message::new(
+            "Did not receive a val= argument in the query string.",
+        ));
+    };
 
     // Not ours to store: pass it to every mirror that holds it.
     //
@@ -802,7 +977,10 @@ pub async fn write(
                     .into_iter()
                     .find(|(_, answer)| (200..300).contains(&answer.status));
                 match accepted {
-                    Some((_, answer)) => relayed(answer),
+                    Some((_, answer)) => {
+                        note_consensus(&state, &namespace, value, &answer.body);
+                        relayed(answer)
+                    }
                     None => forward_failed(&crate::galaxy::ForwardError::AllDown {
                         namespace: namespace.clone(),
                     }),
@@ -810,12 +988,6 @@ pub async fn write(
             }
         };
     }
-
-    let Some(value) = query.val.as_deref() else {
-        return HttpResponse::BadRequest().json(Message::new(
-            "Did not receive a val= argument in the query string.",
-        ));
-    };
 
     let when = match query.timestamp.map(timestamp_to_instant).transpose() {
         Ok(when) => when,
@@ -1003,6 +1175,89 @@ fn expand_subtrees(state: &SharedState, req: &HttpRequest, wanted: &[String]) ->
         }
     }
     found
+}
+
+/// Count a forwarded write towards this server's own consensus tally.
+///
+/// A server passing writes along sees the *logical* write — one namespace, one
+/// value — while mirroring is a detail below it. That makes it the only place
+/// the galaxy-wide number can be kept without double counting: a value held by
+/// three mirrors of one namespace is still one namespace.
+///
+/// It needs the one thing it cannot work out for itself — whether this was the
+/// first sighting of the value in that namespace — which is why write responses
+/// carry `new`. Counted once, from the mirror that answered, however many
+/// mirrors took it.
+///
+/// Read it back with `/r/_all?val=<value>`, which is an ordinary namespace read
+/// and so needs no endpoint of its own.
+///
+/// This only ever rises. Values expire and namespaces are deleted on the nodes,
+/// and neither reaches a server in front of them, so the tally drifts upward
+/// between reconciliations — see [`crate::galaxy::reconcile`].
+fn note_consensus(state: &SharedState, namespace: &str, value: &str, body: &[u8]) {
+    if !crate::db::counts_towards_consensus(namespace) {
+        return;
+    }
+    let Ok(answer) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+    if answer.get("new").and_then(|new| new.as_bool()) != Some(true) {
+        return;
+    }
+
+    state.db.write(
+        crate::db::ALL_NAMESPACE,
+        value,
+        chrono::Utc::now(),
+        crate::db::WriteOpts::default(),
+    );
+}
+
+/// The same, for every item of a forwarded batch.
+fn note_consensus_batch(state: &SharedState, items: &[serde_json::Value]) {
+    for entry in items {
+        if entry.get("new").and_then(|new| new.as_bool()) != Some(true) {
+            continue;
+        }
+        let Some(namespace) = entry.get("namespace").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let Some(value) = entry.get("value").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !crate::db::counts_towards_consensus(namespace) {
+            continue;
+        }
+        state.db.write(
+            crate::db::ALL_NAMESPACE,
+            value,
+            chrono::Utc::now(),
+            crate::db::WriteOpts::default(),
+        );
+    }
+}
+
+/// This request's path and query, with `noshadow` added.
+///
+/// The shadow sighting is recorded at the entry point, so the mirror serving
+/// the read must not record one too — otherwise one search is counted twice,
+/// in two places, and neither is the truth.
+fn suppressing_shadow(req: &HttpRequest) -> String {
+    let path = req.uri().path();
+    let query = req.uri().query().unwrap_or_default();
+
+    if query.is_empty() {
+        return format!("{path}?noshadow");
+    }
+    // Already asked for, so nothing to add.
+    if query
+        .split('&')
+        .any(|part| part == "noshadow" || part.starts_with("noshadow="))
+    {
+        return format!("{path}?{query}");
+    }
+    format!("{path}?{query}&noshadow")
 }
 
 /// Relay a peer's answer to our client, unchanged.
@@ -1430,6 +1685,9 @@ async fn merged_batch(
         match accepted {
             Some(entry) => {
                 written += 1;
+                // Counted once, from the mirror that answered. See
+                // `note_consensus`.
+                note_consensus_batch(state, std::slice::from_ref(entry));
                 items.push(BulkWriteItem {
                     index,
                     namespace: item.namespace.clone(),
@@ -1579,6 +1837,47 @@ pub async fn validate_bulk(
     })
 }
 
+/// `GET /_api/namespaces?prefix=<prefix>` — which namespaces exist here.
+///
+/// What a catch-up needs that nothing else gave it: a server that was down
+/// does not know about namespaces created while it was away, so it cannot ask
+/// for their values. This is how it finds out.
+///
+/// Read-authorized per namespace, like browsing, so a name out of a key's
+/// reach is simply absent rather than refused. That means the answer is "what
+/// you may know about", which is the only thing it could honestly be.
+///
+/// Deliberately not the management interface's namespace listing: that needs an
+/// `admin` grant, and a peer key should be able to be the narrowest thing that
+/// does the job.
+pub async fn namespaces(
+    state: State,
+    query: web::Query<NamespacesQuery>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let apikey = match api_key(&state, &req) {
+        Ok(apikey) => apikey,
+        Err(resp) => return resp,
+    };
+
+    let prefix = query.prefix.as_deref().unwrap_or("");
+    let acl = state.acl();
+    let allowed = |name: &str| match apikey {
+        None => true,
+        Some(key) => acl.can_read(key, name),
+    };
+    let found = state.db.namespaces_under(prefix, allowed);
+    drop(acl);
+
+    HttpResponse::Ok().json(serde_json::json!({ "namespaces": found }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NamespacesQuery {
+    /// Only namespaces at or under this one. Absent means all of them.
+    prefix: Option<String>,
+}
+
 /// `POST /_api/merge` — fold peers' copies of values into ours.
 ///
 /// This is how a galaxy syncs. Unlike `/w` it is **not a sighting**: nothing is
@@ -1697,6 +1996,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/wb", web::post().to(write_bulk))
         .route("/vwb", web::post().to(validate_bulk))
         .route("/_api/merge", web::post().to(merge))
+        .route("/_api/namespaces", web::get().to(namespaces))
         .route("/d/{namespace:.*}", web::get().to(delete))
         .route("/stix/{namespace:.*}", web::get().to(export_stix))
         .route("/_api/stix", web::post().to(export_stix_api))
@@ -2559,6 +2859,117 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    /// A search is recorded where the client is, not on whichever mirror
+    /// happened to serve the read.
+    #[actix_web::test]
+    async fn a_forwarded_read_records_the_shadow_at_the_entry_point() {
+        // A router with one peer that cannot be reached: the forward fails,
+        // which is the point — a miss is still a search, and the shadow is
+        // recorded before the forward is even attempted.
+        let mut inner = SharedState::new(false);
+        inner.db = crate::db::Database::with_storage(
+            crate::db::DatabasePolicy::default(),
+            crate::db::StoragePolicy::from_prefixes(Vec::<String>::new()),
+        );
+        inner.galaxy = Some(crate::galaxy::Galaxy::new(&crate::config::GalaxySettings {
+            peers: vec![crate::config::Peer {
+                url: "http://127.0.0.1:1".to_string(),
+                key: "k".to_string(),
+                stores: crate::db::StoragePolicy::everything(),
+            }],
+            max_hops: 4,
+            health_interval: 30,
+            sync_interval: 300,
+            reconcile_interval: 3600,
+            gossip_interval: 600,
+            acl_authority: false,
+            acl_replaceable: false,
+            verify_tls: true,
+        }));
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        for _ in 0..3 {
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/r/feeds/ips?val=1.2.3.4")
+                    .to_request(),
+            )
+            .await;
+        }
+
+        // A router stores no ordinary namespace, but `_shadow/*` is its own.
+        assert_eq!(
+            st.db.count("_shadow/feeds/ips", "1.2.3.4"),
+            3,
+            "the searches were not recorded at the entry point"
+        );
+    }
+
+    /// `noshadow` from the client is still honoured: the entry point records
+    /// nothing either.
+    #[actix_web::test]
+    async fn noshadow_is_honoured_at_the_entry_point() {
+        let mut inner = SharedState::new(false);
+        inner.db = crate::db::Database::with_storage(
+            crate::db::DatabasePolicy::default(),
+            crate::db::StoragePolicy::from_prefixes(Vec::<String>::new()),
+        );
+        inner.galaxy = Some(crate::galaxy::Galaxy::new(&crate::config::GalaxySettings {
+            peers: vec![crate::config::Peer {
+                url: "http://127.0.0.1:1".to_string(),
+                key: "k".to_string(),
+                stores: crate::db::StoragePolicy::everything(),
+            }],
+            max_hops: 4,
+            health_interval: 30,
+            sync_interval: 300,
+            reconcile_interval: 3600,
+            gossip_interval: 600,
+            acl_authority: false,
+            acl_replaceable: false,
+            verify_tls: true,
+        }));
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/feeds/ips?val=1.2.3.4&noshadow")
+                .to_request(),
+        )
+        .await;
+
+        assert!(!st.db.namespace_exists("_shadow/feeds/ips"));
+    }
+
+    /// The forwarded request must carry `noshadow`, or the mirror records a
+    /// second shadow for the same search and neither count is the truth.
+    #[actix_web::test]
+    async fn a_forwarded_read_suppresses_the_mirrors_shadow() {
+        let cases = [
+            (
+                "/r/feeds/ips?val=1.2.3.4",
+                "/r/feeds/ips?val=1.2.3.4&noshadow",
+            ),
+            // Already asked for: left alone rather than doubled up.
+            (
+                "/r/feeds/ips?val=1.2.3.4&noshadow",
+                "/r/feeds/ips?val=1.2.3.4&noshadow",
+            ),
+            ("/r/feeds/ips?noshadow=1", "/r/feeds/ips?noshadow=1"),
+            // No query at all.
+            ("/r/feeds/ips", "/r/feeds/ips?noshadow"),
+        ];
+
+        for (asked, expected) in cases {
+            let req = test::TestRequest::get().uri(asked).to_http_request();
+            assert_eq!(suppressing_shadow(&req), expected, "{asked}");
+        }
+    }
+
     /// A forwarded write is counted for the server it came from, not for the
     /// one that stores it.
     ///
@@ -2686,6 +3097,11 @@ mod tests {
             }],
             max_hops: 4,
             health_interval: 30,
+            sync_interval: 300,
+            reconcile_interval: 3600,
+            gossip_interval: 600,
+            acl_authority: false,
+            acl_replaceable: false,
             verify_tls: true,
         }));
         let st: State = web::Data::new(inner);
@@ -2730,6 +3146,11 @@ mod tests {
             }],
             max_hops: 4,
             health_interval: 30,
+            sync_interval: 300,
+            reconcile_interval: 3600,
+            gossip_interval: 600,
+            acl_authority: false,
+            acl_replaceable: false,
             verify_tls: true,
         }));
         let st: State = web::Data::new(inner);
@@ -3657,6 +4078,7 @@ mod tests {
             "/rbs",
             "/stix/{namespace}",
             "/_api/merge",
+            "/_api/namespaces",
             "/_api/stix",
             "/_api/tier",
             "/_api/openapi.yaml",
@@ -3675,6 +4097,7 @@ mod tests {
             "/_management/api/tags",
             "/_management/api/tier",
             "/_management/api/keys",
+            "/_management/api/keys/drift",
             "/_management/api/keys/generate",
             "/_management/api/keys/{key}",
         ] {

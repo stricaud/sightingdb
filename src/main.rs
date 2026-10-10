@@ -284,6 +284,11 @@ fn run() -> Result<()> {
     if settings.http_enabled && settings.tls.is_none() {
         log::warn!("TLS is disabled; serving plain HTTP.");
     }
+    if let Some(tls) = &settings.tls {
+        // At startup because that is when someone is watching. A certificate
+        // that runs out unnoticed takes the server off the network.
+        tls::warn_if_expiring(tls);
+    }
     if dbdir.is_none() {
         log::warn!("Persistence is disabled; data will be lost when the process stops.");
     }
@@ -308,6 +313,14 @@ fn run() -> Result<()> {
         started: std::time::Instant::now(),
         rejections: rejections::Rejections::new(settings.rejection_log),
         galaxy: settings.galaxy.as_ref().map(galaxy::Galaxy::new),
+        // A server with peers starts behind until it has checked. One with no
+        // peers has nothing to be behind.
+        revoked: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+        acl_replaceable: settings
+            .galaxy
+            .as_ref()
+            .is_some_and(|galaxy| galaxy.acl_replaceable),
+        joining: std::sync::atomic::AtomicBool::new(settings.galaxy.is_some()),
     });
 
     let shutdown = Shutdown::new();
@@ -329,6 +342,9 @@ fn run() -> Result<()> {
 
         if state.galaxy.is_some() {
             actix_web::rt::spawn(galaxy::run(Arc::clone(&state), Arc::clone(&shutdown)));
+            actix_web::rt::spawn(galaxy::sync(Arc::clone(&state), Arc::clone(&shutdown)));
+            actix_web::rt::spawn(galaxy::gossip(Arc::clone(&state), Arc::clone(&shutdown)));
+            actix_web::rt::spawn(galaxy::reconcile(Arc::clone(&state), Arc::clone(&shutdown)));
         }
 
         if settings.http_enabled {
@@ -435,6 +451,8 @@ fn server_info(
     };
 
     admin::ServerInfo {
+        tls: settings.tls.as_ref().and_then(tls::expiry),
+        expiring_soon_days: tls::EXPIRING_SOON_DAYS,
         role: admin::RoleInfo {
             kind,
             mirrors_everything: stores.stores_everything(),

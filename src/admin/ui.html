@@ -190,6 +190,19 @@
       </tr></thead>
       <tbody id="k-rows"></tbody>
     </table></div>
+
+    <!-- Where this server's keys and its peers' disagree. Only shown when
+         there is something to say. -->
+    <div id="k-drift" class="hidden" style="margin-top:1rem">
+      <h3 style="margin:0 0 .4rem;font-size:.95rem">Keys across the galaxy</h3>
+      <p class="muted" id="k-drift-note"></p>
+      <div class="scroll"><table>
+        <thead><tr>
+          <th>Peer</th><th>Still holds (revoked here)</th><th>Not yet sent</th>
+        </tr></thead>
+        <tbody id="k-drift-rows"></tbody>
+      </table></div>
+    </div>
   </section>
 
   <!-- Server configuration, read-only -->
@@ -1460,10 +1473,94 @@ function chips(prefixes) {
   return span;
 }
 
+/**
+ * Where this server's keys and its peers' disagree.
+ *
+ * Shown because of one deliberate limitation: the periodic offer of keys to
+ * peers is additive, so it never deletes a key a peer has and this server does
+ * not. A key revoked while a peer was down therefore stays live on that peer —
+ * a security hole if it is invisible, a chore if it is not.
+ *
+ * Hidden entirely when there is nothing to say, so it is a warning rather than
+ * furniture.
+ */
+async function loadKeyDrift() {
+  const panel = $("k-drift");
+  try {
+    const { peers } = await api("/_management/api/keys/drift");
+    // `only_on_peer` is deliberately not a reason to show the panel: a peer
+    // having its own keys is ordinary, and a warning that is always on is a
+    // warning nobody reads.
+    const worth_showing = peers.filter(
+      (p) => p.revoked_but_present.length || p.missing.length || p.error);
+
+    if (!peers.length || !worth_showing.length) {
+      panel.classList.add("hidden");
+      return;
+    }
+    panel.classList.remove("hidden");
+
+    const stale = worth_showing.reduce((n, p) => n + p.revoked_but_present.length, 0);
+    $("k-drift-note").textContent = stale
+      ? `${stale} key(s) were revoked here but are still live on a peer. `
+        + "The periodic offer of keys never deletes, so revoke them again now "
+        + "the peer is reachable."
+      : "These peers have not caught up with this server's keys yet.";
+
+    $("k-drift-rows").replaceChildren(...worth_showing.map((peer) => {
+      const tr = document.createElement("tr");
+
+      const url = document.createElement("td");
+      url.className = "crumbs";
+      url.textContent = peer.url;
+      tr.append(url);
+
+      const chips = (names, colour) => {
+        const td = document.createElement("td");
+        if (!names.length) {
+          td.innerHTML = '<span class="chip none">—</span>';
+          return td;
+        }
+        for (const name of names) {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.style.background = colour;
+          chip.style.color = "#fff";
+          chip.style.borderColor = colour;
+          chip.textContent = name;
+          td.append(chip, " ");
+        }
+        return td;
+      };
+
+      if (!peer.readable) {
+        const why = document.createElement("td");
+        why.className = "muted";
+        why.colSpan = 2;
+        why.textContent = peer.error || "cannot be read from here";
+        tr.append(why);
+        return tr;
+      }
+
+      // Red: a key this server revoked and the peer still accepts, which is
+      // the one thing here that is actually dangerous. Amber: not yet sent,
+      // which the periodic offer fixes on its own.
+      tr.append(chips(peer.revoked_but_present, "#d9534f"));
+      tr.append(chips(peer.missing, "#e8a33d"));
+      return tr;
+    }));
+  } catch (e) {
+    // A galaxy that cannot be asked is not a reason to hide the key list.
+    panel.classList.add("hidden");
+    console.warn("could not read key drift:", e.message);
+  }
+}
+
 async function loadKeys() {
   try {
     const keys = await api("/_management/api/keys");
     state.keys = keys;
+    loadKeyDrift();
 
     $("k-rows").replaceChildren(...keys.map((entry) => {
       const tr = document.createElement("tr");
@@ -1578,6 +1675,34 @@ async function deleteKey(key) {
 
 // --- configuration ---------------------------------------------------------
 
+/**
+ * What to say about this server's certificate.
+ *
+ * The server reports when it expires, not how long is left: an absolute moment
+ * does not go stale between being sent and being read. The judgement of "soon"
+ * is made here, from the same threshold the server logs its warning at, so the
+ * page and the log cannot disagree.
+ */
+function certificateState(info) {
+    if (!info.tls) return info.http_enabled ? "none (plain HTTP)" : "not serving HTTP";
+
+    const days = Math.floor((info.tls.not_after * 1000 - Date.now()) / 86400000);
+    const when = new Date(info.tls.not_after * 1000).toISOString().slice(0, 10);
+    const soon = days < (info.expiring_soon_days ?? 30);
+
+    const chip = (text, colour) =>
+      `<span class="chip" style="background:${colour};color:#fff;border-color:${colour}">${text}</span>`;
+
+    if (days < 0) {
+      return `${chip("EXPIRED", "#d9534f")} ${escapeHtml(when)} — clients will refuse to connect`;
+    }
+    if (soon) {
+      return `${chip(`EXPIRES IN ${days} DAY${days === 1 ? "" : "S"}`, "#e8a33d")} `
+           + `${escapeHtml(when)} — replace ${escapeHtml(info.tls.cert)}`;
+    }
+    return `valid until ${escapeHtml(when)} (${days} days)`;
+}
+
 async function showConfig() {
   setError("");
   try {
@@ -1596,6 +1721,7 @@ async function showConfig() {
       ["Shadow TTL", info.shadow_ttl ? `${info.shadow_ttl}s` : "never expires"],
       ["DNS", info.dns ? `${info.dns.listen} for ${info.dns.zone}` : "disabled"],
       ["ZMQ ingest", info.zmq ? `${info.zmq.endpoint} (${info.zmq.format})` : "disabled"],
+      ["TLS certificate", { html: certificateState(info) }],
     ];
     if (info.dns) {
       for (const e of info.dns.exposed) {
@@ -1610,7 +1736,13 @@ async function showConfig() {
       th.textContent = k;
       const td = document.createElement("td");
       td.className = "n";
-      td.textContent = String(v);
+      // Only a value that says so is treated as markup; everything else is
+      // text, so a configured path or namespace cannot inject anything.
+      if (v && typeof v === "object" && "html" in v) {
+        td.innerHTML = v.html;
+      } else {
+        td.textContent = String(v);
+      }
       tr.append(th, td);
       return tr;
     }));

@@ -134,8 +134,8 @@ Three details that matter more than they look:
 Consensus
 ---------
 
-    PARTLY BUILT: `_all` is readable and unwritable. The rest waits on
-    forwarding.
+    BUILT. A server in front of a galaxy keeps the galaxy-wide tally, read
+    back with /r/_all?val=, and rebuilds it from the nodes on a timer.
 
 Consensus means "how many namespaces have seen this value". Each server keeps
 its own tally in `_all`, which is a local fact: the namespaces *on this server*
@@ -165,21 +165,36 @@ client could write `_all` directly and give a value a consensus no namespace
 supported — the one number this database exists to be trusted about. Reading
 them stays open apart from `_config`.
 
-Write responses now carry `new`: whether the sighting was the first of that
-value in that namespace, which is what gates a consensus increment and which a
-router cannot work out without holding the namespace. A router increments once
-when any downstream says new, and in a cascade each level reports upward the
-same way. The router side of that is step 6.
+Write responses carry `new`: whether the sighting was the first of that value
+in that namespace, which is what gates a consensus increment and which a server
+in front cannot work out without holding the namespace. It counts the value once
+when the mirror that took the write reports new, however many mirrors took it.
 
-One thing still to build:
+Measured on a router over two *partial* mirrors, where neither node can know the
+global number alone:
 
- * Removals never reach the router. Consensus is released when a namespace is
-   deleted and when the sweeper reclaims expired values, both on the node and
-   both invisible from above, so a router's tally drifts upward — faster the
-   more TTLs are in use. It needs periodic reconciliation against the nodes,
-   for which /_management/api/sightings already returns the namespace *names*
-   so they can be unioned rather than summed. Summing double-counts under
-   mirroring; unioning does not.
+    1.2.3.4 written into alpha/one, alpha/two (na) and beta/one (nb)
+      lb 3   na 2   nb 1          lb is the only one that is right
+
+**And rebuilt, because that tally only ever rises.** Consensus is released when
+a namespace is deleted and when the sweeper reclaims an expired value, both on
+the node and both invisible from in front of it:
+
+    delete alpha/two on na
+      lb 3   na 1   nb 1          truth is 2; lb has drifted
+    after a reconciliation pass
+      lb 2   na 1   nb 1
+
+A pass surveys the galaxy: for each namespace, walk its values and record which
+namespaces hold each one. Consensus is then the size of that set — a set, not a
+sum, because the same namespace mirrored three times is still one namespace. A
+value the survey never sees at all is set to nothing: it has gone from
+everywhere.
+
+It **walks the galaxy**, which is why `reconcile_interval` is a setting of its
+own with a long default of an hour. It is a repair, not a steady cost: the
+incremental tally answers reads in between, and a pass that finds nothing wrong
+says nothing.
 
 **Parallel routers cannot share consensus.** Two entry points each see a
 fraction of the writes, and a count cannot be reconciled — you cannot tell a
@@ -268,21 +283,43 @@ make it real. A *newer* version is still refused.
 A node that was down, and comes back
 ------------------------------------
 
-    PARTLY BUILT. Every piece a catch-up needs exists and has been driven by
-    hand; what is missing is something doing it on a timer, and the Joining
-    state that withholds reads while it runs.
+    BUILT. A worker on a timer, and the state that withholds reads while it
+    runs. A galaxy heals itself rather than needing someone with curl.
 
-Done by hand against a real cascade, for a mirror that missed writes while down:
+Measured on a real galaxy. node-b is killed, writes continue through the
+router, node-b is restarted and nobody touches it:
 
-    node-b was down while these were written
-      5.5.5.5   node-a 2   node-b 0
-    node-b pulls each value from node-a
-      5.5.5.5   node-a 2   node-b 2    changed 1
-    pulling twice more
-      5.5.5.5   node-a 2   node-b 2    changed 0
+    nb down      1.2.3.4=3/-  9.9.9.9=4/-  7.7.7.7=2/-
+    +3s          1.2.3.4=3/3  9.9.9.9=4/4  7.7.7.7=2/2
+    +40s         1.2.3.4=3/3  9.9.9.9=4/4  7.7.7.7=2/2
 
-Writes kept succeeding on the surviving mirror throughout, so the outage cost
-availability on one server and nothing else.
+    nb's log: Caught up: 2 namespace(s) checked, 2 value(s) taken from peers
+
+7.7.7.7 is in a namespace node-b had never heard of, created while it was
+down — found through /_api/namespaces, which exists for exactly that. Writes
+kept succeeding on the surviving mirror throughout, so the outage cost
+availability on one server and nothing else. Forty seconds of five-second
+passes after convergence moved nothing.
+
+**How a pass works.** For each peer: ask what namespaces it holds, keep the
+ones this server stores, and for each walk /r/<ns>?for_merge in pages,
+applying each page in-process. The first pass after startup is a full one,
+because a server that has just started has no idea what it missed. Later
+passes use ?count as a trigger and skip a namespace whose peer has no more
+values than we do — O(1) on both sides, which is what makes it usable on a
+timer. That is a heuristic, not a proof: equal counts do not mean equal
+contents. The full pass on startup is what stops the heuristic being
+load-bearing.
+
+**The Joining state.** `catching_up` is reported on /health and set from
+startup until the first full pass finishes. A router reads it and sends reads
+to a mirror that is current instead, because a mirror still catching up would
+under-report. Writes go to it throughout — they land directly and the pass
+fills in the history behind them. If *every* mirror is catching up one answers
+anyway: an under-reported count beats no answer, and refusing would make a
+whole galaxy unreadable for as long as it took to start.
+
+`sync_interval` in [galaxy] sets the period; 0 switches catching up off.
 
 The obvious design is for the entry point to buffer what a dead node missed and
 push it on recovery. That is the wrong mechanism, for two reasons:
@@ -388,29 +425,95 @@ doc/sharding-experiment.py:
 Shadow sightings belong at the entry point
 ------------------------------------------
 
-    NOT BUILT.
+    BUILT.
 
 Every read records a shadow sighting, so there is no such thing as a read-only
 replica and serving more clients roughly doubles write load.
 
 A router is the right place for them, because it is where the client actually
-is. Have it record the shadow locally and forward the read with `noshadow`. A
-search is then counted once, at the entry point, instead of once on whichever
-mirror happened to serve it — which is better than today's behaviour, where the
-count lands arbitrarily. Nodes stop writing on read entirely.
+is. It records the shadow locally and forwards the read with `noshadow`, so a
+search is counted once, at the entry point, instead of once on whichever mirror
+happened to serve it. Nodes stop writing on read entirely, which is what keeps
+serving more clients from multiplying write load across a galaxy.
+
+Measured: five reads through a router, with the value held on both mirrors.
+
+    shadow on lb (entry point)  5
+    shadow on node-a            0
+    shadow on node-b            0
+
+A miss is recorded too, as it already was on a single server: the shadow is
+written before the read is forwarded, because a search happened either way.
 
 Under a router that stores only internal namespaces this costs nothing extra:
 `_shadow/*` is already held.
 
 
+Keys are gossiped, not shared
+-----------------------------
+
+    BUILT, with one limit worth knowing — see the warning below.
+
+acl_file is rewritten by whichever server served the management request, so
+saving a key on one used to leave the others ignorant of it. It is now passed
+on to the peers, through each peer's own management interface — which means
+**the peer's ACL decides whether the change is allowed.**
+
+That is what makes gossip safe here rather than needing a shared file and the
+trust that goes with one. A server can only administer a peer it holds an
+`admin` key for; a server holding a narrow `rw:feeds` key there cannot change
+anything, and gossip therefore flows from whoever holds the credentials towards
+the servers they administer. A narrowly-scoped peer cannot push back.
+
+Measured. A router with an admin key on node-a and only `rw` on node-b:
+
+    save 'analyst' on the router
+      router  [analyst, changeme]
+      node-a  [analyst, changeme, lb-admin]     took it
+      node-b  [changeme, lb-narrow]             not ours to administer
+
+    the key then works on node-a exactly as granted
+      /r with 'analyst'  404   accepted, value absent
+      /w with 'analyst'  403   read-only, as granted
+      node-b             403   never heard of it
+
+Safe to repeat, which is what lets it be retried and re-offered: saving a key
+*sets* its grants rather than adding to them, so the same change arriving twice
+is the same as once. Unlike a sighting, where exactly that was the difficulty.
+
+A change is pushed as it happens, and this server's keys are offered again
+every `gossip_interval` so a peer that was down for a change picks it up:
+
+    node-a down, 'added-while-down' saved on the router
+      node-a  down
+    node-a back, nobody touches it
+      +12s  node-a  [added-while-down, changeme, lb-admin]
+
+A change that arrived *as* gossip is passed along with one hop less, so a
+cascade propagates and a cycle dies on the same budget a forwarded write does.
+
+**The limit, which is security relevant.** The periodic offer is additive: it
+never deletes a key a peer has and this server does not, because this server is
+not necessarily the only place keys are managed and a timer that quietly revoked
+a key somebody added elsewhere would be far worse than one that failed to
+propagate a deletion. The consequence, confirmed by running it:
+
+    node-a down, 'added-while-down' revoked on the router
+      router  [changeme]
+      node-a  [added-while-down, changeme, lb-admin]   still live, 18s later
+
+**A revocation made while a server was offline does not reach it.** Repeat the
+revocation once it is back, or check that server's own key list. Making this
+authoritative instead — peers mirroring one server's ACL exactly — would need a
+server to be declared the owner of the galaxy's keys, and that is a decision for
+whoever runs it rather than one to assume.
+
+Tiers are not gossiped. tiers_file has the same shape of problem and the same
+answer available; it is simply not done.
+
+
 Still unsolved
 --------------
-
-**ACL and tier distribution.** acl_file and tiers_file are rewritten by
-whichever server served the management request. Save a key on one and the others
-never learn it. This is the consequence of keys living in configuration rather
-than in the database. It needs a shared store, a gossiped ACL, or a management
-interface that writes galaxy-wide.
 
 **Durability.** Snapshots every snapshot_interval, 300s by default, and no WAL,
 so a crash loses up to five minutes. Replication can stand in for a log, but
@@ -443,13 +546,17 @@ Order of work
     DONE  7. The galaxy view: one request walks the cascade, and the
              management interface draws it.
 
-          8. Catch-up as a running thing, and the Joining state. Every piece
-             is here — ?count to notice, ?for_merge to read, /_api/merge to
-             apply — so what is missing is a worker on a timer rather than a
-             person with curl.
-          9. Shadow sightings at the entry point.
-         10. Reconciling the router's consensus tally against the nodes.
-         11. A shared store for the ACL and the tiers.
+    DONE  8. Catch-up on a timer, and the Joining state that withholds reads
+             while it runs.
+
+    DONE  9. Shadow sightings at the entry point.
+    DONE 10. The consensus tally in front of a galaxy, and reconciling it
+             against the nodes.
+    DONE 11. Keys gossiped to the peers a server administers.
+
+         12. Tiers gossiped the same way.
+         13. Authoritative ACL, if a galaxy wants one server to own its keys —
+             which would make a revocation reach a server that was offline.
 
 Steps 4 and 5 were refactors with no distributed systems in them, and they were
 where the difficulty lived. What remains is plumbing by comparison — with the

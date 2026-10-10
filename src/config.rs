@@ -88,6 +88,29 @@ pub struct GalaxySettings {
     pub peers: Vec<Peer>,
     /// Seconds between health probes of each peer.
     pub health_interval: u64,
+    /// Seconds between catch-up passes. 0 switches catching up off, which
+    /// leaves a server that was down behind until someone syncs it by hand.
+    pub sync_interval: u64,
+    /// Seconds between rebuilds of the consensus tally from the galaxy. 0
+    /// switches it off, which leaves the tally drifting upward as values
+    /// expire on the nodes.
+    pub reconcile_interval: u64,
+    /// Seconds between offering this server's keys to its peers. 0 switches
+    /// the periodic offer off, leaving only the push made when a key changes.
+    pub gossip_interval: u64,
+    /// Whether this server's key list is the galaxy's.
+    ///
+    /// Off by default. On, the periodic offer sends the whole list and asks a
+    /// peer to hold exactly that — which is what makes a revocation reach a
+    /// server that was offline for it. A peer only obeys if it has said it may
+    /// be replaced, so this takes agreement at both ends.
+    pub acl_authority: bool,
+    /// Whether another server may replace this one's key list wholesale.
+    ///
+    /// Off by default, because a server quietly having its keys rewritten is
+    /// not something to arrive at by accident. On, an admin key may replace
+    /// them — which is how a galaxy gets one place to manage keys.
+    pub acl_replaceable: bool,
     /// Whether a peer's TLS certificate is verified. Off is for a galaxy of
     /// self-signed instances, which is what `--setup` produces.
     pub verify_tls: bool,
@@ -255,6 +278,16 @@ struct RawGalaxy {
     max_hops: u8,
     #[serde(default = "default_health_interval")]
     health_interval: u64,
+    #[serde(default = "default_sync_interval")]
+    sync_interval: u64,
+    #[serde(default = "default_reconcile_interval")]
+    reconcile_interval: u64,
+    #[serde(default = "default_gossip_interval")]
+    gossip_interval: u64,
+    #[serde(default)]
+    acl_authority: bool,
+    #[serde(default)]
+    acl_replaceable: bool,
     #[serde(default = "yes")]
     verify_tls: bool,
 }
@@ -410,6 +443,22 @@ fn default_max_hops() -> u8 {
 }
 fn default_health_interval() -> u64 {
     30
+}
+fn default_reconcile_interval() -> u64 {
+    // It walks the galaxy, so rarely. Long enough to be a repair rather than a
+    // steady cost, short enough that a tally does not drift for a working day.
+    3600
+}
+fn default_gossip_interval() -> u64 {
+    // A key change is pushed as it happens; this only catches up a peer that
+    // was down for one, so it need not be frequent.
+    600
+}
+fn default_sync_interval() -> u64 {
+    // Often enough that a server which was briefly down catches up without
+    // anyone noticing, rarely enough that a steady galaxy is not walking its
+    // namespaces over and over.
+    300
 }
 fn default_warm_idle() -> u64 {
     3600
@@ -615,6 +664,15 @@ impl RawGalaxy {
             );
         }
 
+        if self.acl_authority && self.acl_replaceable {
+            bail!(
+                "[galaxy] sets both acl_authority and acl_replaceable, in {}. A server \
+                 that owns the galaxy's keys cannot also let another server replace \
+                 them: the two would take turns overwriting each other.",
+                path.display()
+            );
+        }
+
         if self.health_interval == 0 {
             bail!(
                 "[galaxy] health_interval must be at least 1 second, in {}",
@@ -626,6 +684,11 @@ impl RawGalaxy {
             peers,
             max_hops: self.max_hops,
             health_interval: self.health_interval,
+            sync_interval: self.sync_interval,
+            reconcile_interval: self.reconcile_interval,
+            gossip_interval: self.gossip_interval,
+            acl_authority: self.acl_authority,
+            acl_replaceable: self.acl_replaceable,
             verify_tls: self.verify_tls,
         })
     }

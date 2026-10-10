@@ -981,6 +981,30 @@ loud: a change made from a row deep in a tree is a change to everything beside
 it. Either field takes `"default"` to stop overriding and go back to
 `[storage]`, and a change is written to `tiers_file` so it survives a restart.
 
+Certificate expiry
+------------------
+
+A server serving TLS reports when its certificate runs out, and says so loudly
+before it does — at startup, in the log, and in the management interface:
+
+	WARN sightingdb::tls - The TLS certificate /etc/sightingdb/ssl/cert.pem
+	expires in 10 day(s). Replace it before then.
+
+**Configuration** shows it with the days remaining, amber under 30 days and red
+once expired. Thirty days is the line: long enough to notice, order and install
+a replacement without hurrying.
+
+	"tls": {"cert": "/etc/sightingdb/ssl/cert.pem",
+	        "not_after": 1792530174, "days_left": 10}
+
+`/_management/api/info` reports `not_after` as an absolute moment rather than a
+countdown, so the answer cannot go stale between being sent and being read; the
+page works out "soon" from the same threshold the server logs at, so the two
+cannot disagree.
+
+A certificate made by `--setup` is good for a year, so this starts mattering
+about eleven months in — which is exactly when nobody is thinking about it.
+
 Setting one up
 --------------
 
@@ -1172,6 +1196,134 @@ counted twice over and merging them adds the two together — three writes
 through a load balancer became six once the mirrors synced. The origin travels
 in `X-SightingDB-Origin` and is passed along unchanged, so the attribution is
 the entry point the client actually talked to.
+
+### Catching up
+
+A server that was down comes back, finds it is behind, and fills in from a peer
+that was up — on a timer, with nobody touching it.
+
+	[galaxy]
+	sync_interval = 300     # seconds between passes; 0 switches it off
+
+Each pass asks every peer which namespaces it holds, keeps the ones this server
+stores, and walks `/r/<namespace>?for_merge` in pages, applying each in place.
+Namespaces created while this server was away are found too, through
+`/_api/namespaces` — which exists for that and nothing else.
+
+The first pass after startup is a full one, because a server that has just
+started has no idea what it missed. Later passes use `?count` as a trigger and
+skip a namespace whose peer holds no more values than this one — O(1) on both
+sides, which is what makes it usable on a timer. That is a heuristic rather
+than a proof: equal counts do not mean equal contents. The full pass on startup
+is what stops it being load-bearing.
+
+**While a server is catching up it says so**, in `catching_up` on `/health`. A
+router reads that and sends reads to a mirror that is current instead, because
+one still catching up would under-report. Writes go to it throughout: they land
+directly, and the pass fills in the history behind them. Withholding writes
+instead would mean the target keeps moving and a pass under load would never
+provably finish.
+
+If every mirror is catching up, one answers anyway. An under-reported count
+beats no answer, and refusing would make a whole galaxy unreadable for as long
+as it took to start.
+
+	nb down      1.2.3.4=3/-  9.9.9.9=4/-  7.7.7.7=2/-
+	+3s          1.2.3.4=3/3  9.9.9.9=4/4  7.7.7.7=2/2
+
+### Searches are recorded where the client is
+
+A read through a router records its shadow sighting **on the router**, and the
+forwarded read carries `noshadow` so the mirror serving it records nothing. A
+search is then counted once, where the client actually was, instead of once on
+whichever mirror happened to answer:
+
+	five reads through a router
+	  shadow on the router  5
+	  shadow on node-a      0
+	  shadow on node-b      0
+
+That also means a read costs the mirrors no write at all, which is what keeps
+serving more clients from multiplying write load across a galaxy.
+
+### Consensus across a galaxy
+
+A server in front of a galaxy keeps the galaxy-wide tally, because it sees the
+*logical* write — one namespace, one value — while mirroring is a detail below
+it. Read it back with `/r/_all?val=<value>`, which is an ordinary namespace read
+and needs no endpoint of its own.
+
+	1.2.3.4 written into alpha/one, alpha/two (node-a) and beta/one (node-b)
+	  router 3   node-a 2   node-b 1     only the router is right
+
+It is kept by counting forwarded writes the mirrors report as `new`, so it only
+ever rises: values expire and namespaces are deleted on the nodes, consensus is
+released there, and neither reaches anything in front of them.
+
+	[galaxy]
+	reconcile_interval = 3600   # seconds; 0 switches it off
+
+So it is rebuilt on a timer by surveying the galaxy — for each namespace, which
+values it holds — and taking consensus to be the number of *namespaces* holding
+each value. A set rather than a sum, because the same namespace mirrored three
+times is still one namespace.
+
+This walks the galaxy, which is why it has its own long interval. It is a
+repair; the incremental tally answers reads in between, and a pass that finds
+nothing wrong logs nothing.
+
+### Keys are gossiped, not shared
+
+`acl_file` is rewritten by whichever server served the management request, so
+saving a key on one would otherwise leave the others ignorant of it. A change is
+now passed on to the peers through **each peer's own management interface** —
+which means the peer's ACL decides whether to accept it.
+
+That is what makes this safe without a shared file: a server can only
+administer a peer it holds an `admin` key for. A server holding a narrow
+`rw:feeds` key there cannot change anything, so gossip flows from whoever holds
+the credentials towards the servers they administer, and a narrowly-scoped peer
+cannot push back.
+
+	save 'analyst' on the router
+	  router  [analyst, changeme]
+	  node-a  [analyst, changeme, lb-admin]   took it
+	  node-b  [changeme, lb-narrow]           not ours to administer
+
+Safe to repeat: saving a key *sets* its grants rather than adding to them. A
+change is pushed as it happens, and this server's keys are offered again every
+`gossip_interval` (600s by default; 0 switches the periodic offer off) so a
+peer that was down for a change picks it up.
+
+> **A revocation made while a server was offline does not reach it.**
+>
+> The periodic offer is deliberately additive — it never deletes a key a peer
+> has and this server does not, because this server is not necessarily the only
+> place keys are managed, and a timer that quietly revoked a key added elsewhere
+> would be worse than one that failed to propagate a deletion.
+>
+> So a key revoked while a peer was down **stays live on that peer**. Repeat the
+> revocation once it is back.
+>
+> The management interface points this out rather than leaving you to find it:
+> the **Keys** page shows a "Keys across the galaxy" panel listing, per peer,
+> which keys this server revoked that the peer still accepts. It appears only
+> when there is something to say.
+
+	revoked_but_present  ["doomed"]      <- revoked here, still live there
+	only_on_peer         ["lb-admin"]    <- the peer's own keys; ordinary
+	missing              []              <- not sent yet; the offer fixes it
+
+`only_on_peer` is kept separate on purpose. A peer has keys of its own —
+including the one this server authenticates with — and reporting those as stale
+revocations would make the panel cry wolf every time it was opened.
+
+The record of revocations is held in memory, so it is lost on restart: after
+one, a revocation that never landed moves from `revoked_but_present` into
+`only_on_peer` and stops being flagged. Checking the peer's own key list is then
+the way to find it.
+
+Tiers are not gossiped yet; `tiers_file` has the same shape of problem.
 
 ### Seeing the galaxy
 

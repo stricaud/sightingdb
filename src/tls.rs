@@ -24,6 +24,84 @@ use crate::config::TlsSettings;
 /// enough that nobody mistakes it for something to run in production.
 const VALID_DAYS: u32 = 365;
 
+/// How long this server's certificate has left.
+///
+/// Read from the file rather than remembered, because the file is what clients
+/// are offered and it can be replaced under a running server.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Expiry {
+    /// Where the certificate is, so a warning says what to replace.
+    pub cert: String,
+    /// When it stops being valid, as Unix seconds.
+    ///
+    /// Absolute rather than "days left", so the answer does not go stale
+    /// between being computed and being read.
+    pub not_after: i64,
+    /// Whole days from now until then. Negative when it has already expired.
+    pub days_left: i64,
+}
+
+/// How many days of life left counts as "about to expire".
+///
+/// Thirty: long enough to notice, order and install a replacement without
+/// hurrying, which is the only number that makes the warning worth having.
+pub const EXPIRING_SOON_DAYS: i64 = 30;
+
+impl Expiry {
+    /// Whether this wants doing something about.
+    pub fn soon(&self) -> bool {
+        self.days_left < EXPIRING_SOON_DAYS
+    }
+}
+
+/// Read when the certificate at `tls.cert` expires.
+///
+/// `None` when the file cannot be read or parsed. A server whose certificate
+/// cannot be read is not serving TLS at all, so it will have failed earlier and
+/// louder than this; there is nothing useful to say here that was not already
+/// said.
+pub fn expiry(tls: &TlsSettings) -> Option<Expiry> {
+    let pem = fs::read(&tls.cert).ok()?;
+    let parsed = X509::from_pem(&pem).ok()?;
+
+    // openssl gives the difference between two ASN.1 times rather than a
+    // timestamp, so the absolute moment is derived by walking back from now.
+    let now = Asn1Time::days_from_now(0).ok()?;
+    let diff = now.diff(parsed.not_after()).ok()?;
+    let days_left = i64::from(diff.days);
+    let seconds = i64::from(diff.days) * 86_400 + i64::from(diff.secs);
+
+    Some(Expiry {
+        cert: tls.cert.display().to_string(),
+        not_after: chrono::Utc::now().timestamp() + seconds,
+        days_left,
+    })
+}
+
+/// Say something at startup if the certificate is running out.
+///
+/// At startup because that is when someone is watching, and in the log because
+/// a certificate that expires unnoticed takes the server off the network with
+/// no warning anyone saw.
+pub fn warn_if_expiring(tls: &TlsSettings) {
+    let Some(expiry) = expiry(tls) else {
+        return;
+    };
+    if expiry.days_left < 0 {
+        log::error!(
+            "The TLS certificate {} expired {} day(s) ago. Clients will refuse to connect.",
+            expiry.cert,
+            -expiry.days_left
+        );
+    } else if expiry.soon() {
+        log::warn!(
+            "The TLS certificate {} expires in {} day(s). Replace it before then.",
+            expiry.cert,
+            expiry.days_left
+        );
+    }
+}
+
 pub fn acceptor(tls: &TlsSettings) -> Result<SslAcceptorBuilder> {
     // Checked up front so the failure names the file and the remedy, instead
     // of surfacing OpenSSL's own message about being unable to open it.
@@ -203,6 +281,72 @@ mod tests {
         assert!(tls.cert.exists() && tls.key.exists());
         // The real test: OpenSSL accepts it as a server identity.
         acceptor(&tls).unwrap();
+    }
+
+    /// A freshly made certificate is good for a year, and is not about to
+    /// expire.
+    #[test]
+    fn a_new_certificate_is_not_about_to_expire() {
+        let dir = TempDir::new("expiry");
+        let tls = dir.settings();
+        install_self_signed(&tls).unwrap();
+
+        let expiry = expiry(&tls).expect("a readable certificate");
+
+        // One year, give or take the day it is read on.
+        assert!(
+            (VALID_DAYS as i64 - 2..=VALID_DAYS as i64).contains(&expiry.days_left),
+            "{} days left, expected about {VALID_DAYS}",
+            expiry.days_left
+        );
+        assert!(!expiry.soon(), "a year-long certificate was called urgent");
+
+        // The absolute moment agrees with the days, so a reader can work out
+        // "soon" for itself without the answer going stale.
+        let from_days = chrono::Utc::now().timestamp() + expiry.days_left * 86_400;
+        assert!(
+            (expiry.not_after - from_days).abs() < 86_400,
+            "not_after {} does not match {} days",
+            expiry.not_after,
+            expiry.days_left
+        );
+        assert_eq!(expiry.cert, tls.cert.display().to_string());
+    }
+
+    /// Thirty days is the line, and it is the same number the interface uses.
+    #[test]
+    fn soon_is_thirty_days() {
+        let about = |days| Expiry {
+            cert: "c.pem".to_string(),
+            not_after: 0,
+            days_left: days,
+        };
+
+        assert!(about(-1).soon(), "an expired certificate is not urgent?");
+        assert!(about(0).soon());
+        assert!(about(29).soon());
+        assert!(!about(30).soon());
+        assert!(!about(365).soon());
+        assert_eq!(EXPIRING_SOON_DAYS, 30);
+    }
+
+    /// A certificate that cannot be read says nothing rather than guessing.
+    /// A server in that state failed to start for a louder reason already.
+    #[test]
+    fn an_unreadable_certificate_has_no_expiry() {
+        let dir = TempDir::new("badcert");
+        let tls = dir.settings();
+
+        // Absent.
+        assert!(expiry(&tls).is_none());
+
+        // Present and not a certificate.
+        fs::create_dir_all(tls.cert.parent().unwrap()).unwrap();
+        fs::write(&tls.cert, "this is not a certificate").unwrap();
+        assert!(expiry(&tls).is_none());
+
+        // And warning about it is quiet rather than a panic.
+        warn_if_expiring(&tls);
     }
 
     #[test]

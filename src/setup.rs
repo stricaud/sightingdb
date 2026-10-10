@@ -584,6 +584,58 @@ impl Plan {
             w(&mut out, "#health_interval = 30");
             w(
                 &mut out,
+                "# Seconds between catch-up passes: a server that was down finds",
+            );
+            w(
+                &mut out,
+                "# what it missed and pulls it from a peer that was up. 0 switches",
+            );
+            w(
+                &mut out,
+                "# it off, leaving such a server behind until someone syncs it by",
+            );
+            w(&mut out, "# hand.");
+            w(&mut out, "#sync_interval = 300");
+            w(
+                &mut out,
+                "# Seconds between rebuilds of the consensus tally from the galaxy:",
+            );
+            w(
+                &mut out,
+                "# a server in front of one counts a value towards consensus when a",
+            );
+            w(
+                &mut out,
+                "# mirror says the sighting was new, which only ever rises. This",
+            );
+            w(
+                &mut out,
+                "# surveys the galaxy and puts it right. 0 switches it off.",
+            );
+            w(&mut out, "#reconcile_interval = 3600");
+            w(
+                &mut out,
+                "# Seconds between offering this server's keys to its peers, so one",
+            );
+            w(
+                &mut out,
+                "# that was down for a key change picks it up. A push goes through",
+            );
+            w(
+                &mut out,
+                "# the peer's own management interface, so the peer's ACL decides.",
+            );
+            w(
+                &mut out,
+                "# The offer is additive: a revocation made while a peer was down",
+            );
+            w(
+                &mut out,
+                "# does not reach it and must be repeated. 0 switches it off.",
+            );
+            w(&mut out, "#gossip_interval = 600");
+            w(
+                &mut out,
                 "# Off for a galaxy of self-signed instances, which is what",
             );
             w(&mut out, "# --setup produces.");

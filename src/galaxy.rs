@@ -75,6 +75,12 @@ pub struct PeerHealth {
     /// Consecutive failures, so a flapping peer reads differently from one
     /// that has been gone all week.
     pub failures: u32,
+    /// Whether the peer said it is still pulling what it missed.
+    ///
+    /// Reads are sent elsewhere while it is: its data is incomplete and a read
+    /// would under-report. Writes still go to it — they land directly, and its
+    /// catch-up fills in the history behind them.
+    pub catching_up: bool,
 }
 
 impl PeerHealth {
@@ -88,6 +94,7 @@ impl PeerHealth {
             version: None,
             error: None,
             failures: 0,
+            catching_up: false,
         }
     }
 }
@@ -101,6 +108,17 @@ pub struct Galaxy {
     max_hops: u8,
     /// How often each peer is probed.
     health_interval: u64,
+    /// How often a catch-up pass runs. 0 switches it off.
+    sync_interval: u64,
+    /// How often the consensus tally is rebuilt from the galaxy. 0 switches it
+    /// off, which leaves the tally drifting upward as values expire.
+    reconcile_interval: u64,
+    /// How often this server's keys are offered to its peers. 0 switches it
+    /// off, leaving only the push made when a key is changed.
+    gossip_interval: u64,
+    /// Whether this server's key list is the galaxy's, so the offer replaces a
+    /// peer's list rather than adding to it.
+    acl_authority: bool,
     /// Whether a peer's TLS certificate is verified. Off is for a galaxy of
     /// self-signed instances, which is what `--setup` produces.
     verify_tls: bool,
@@ -158,6 +176,10 @@ impl Galaxy {
             peers: settings.peers.clone(),
             max_hops: settings.max_hops,
             health_interval: settings.health_interval,
+            sync_interval: settings.sync_interval,
+            reconcile_interval: settings.reconcile_interval,
+            gossip_interval: settings.gossip_interval,
+            acl_authority: settings.acl_authority,
             verify_tls: settings.verify_tls,
             health: RwLock::new(health),
         }
@@ -204,9 +226,32 @@ impl Galaxy {
     /// must perturb the whole hash, or the comparison between peers becomes
     /// correlated and the choice stops being evenly spread. Measured in
     /// doc/sharding-experiment.py.
+    /// A mirror still catching up is passed over, because its data is
+    /// incomplete and a read of it would under-report. If every mirror is
+    /// catching up, one of them answers anyway: an under-reported count beats
+    /// no answer at all, and refusing would make a whole galaxy unreadable
+    /// for as long as it took to start.
     pub fn reader_for<'a>(&'a self, namespace: &str, value: &str) -> Option<&'a Peer> {
-        self.live_holders(namespace)
-            .into_iter()
+        let behind: Vec<String> = {
+            let health = self.health.read().unwrap_or_else(PoisonError::into_inner);
+            health
+                .values()
+                .filter(|known| known.catching_up)
+                .map(|known| known.url.clone())
+                .collect()
+        };
+
+        let live = self.live_holders(namespace);
+        let current: Vec<&Peer> = live
+            .iter()
+            .copied()
+            .filter(|peer| !behind.contains(&peer.url))
+            .collect();
+
+        let choose_from = if current.is_empty() { &live } else { &current };
+        choose_from
+            .iter()
+            .copied()
             .max_by_key(|peer| weigh(value, &peer.url))
     }
 
@@ -227,7 +272,7 @@ impl Galaxy {
             .collect()
     }
 
-    fn record(&self, url: &str, outcome: Result<(Option<String>, u64), String>) {
+    fn record(&self, url: &str, outcome: Result<Probed, String>) {
         let mut health = self.health.write().unwrap_or_else(PoisonError::into_inner);
         let entry = health
             .entry(url.to_string())
@@ -235,16 +280,22 @@ impl Galaxy {
 
         entry.probed = true;
         match outcome {
-            Ok((version, latency_ms)) => {
+            Ok(probed) => {
                 if !entry.online && entry.failures > 0 {
                     log::info!("Galaxy peer {url} is answering again");
                 }
+                if probed.catching_up && !entry.catching_up {
+                    log::info!("Galaxy peer {url} is catching up; reads will go elsewhere");
+                } else if !probed.catching_up && entry.catching_up {
+                    log::info!("Galaxy peer {url} has caught up");
+                }
                 entry.online = true;
                 entry.last_seen = chrono::Utc::now().timestamp();
-                entry.latency_ms = Some(latency_ms);
-                entry.version = version;
+                entry.latency_ms = Some(probed.latency_ms);
+                entry.version = probed.version;
                 entry.error = None;
                 entry.failures = 0;
+                entry.catching_up = probed.catching_up;
             }
             Err(error) => {
                 // Logged on the first failure only: a peer that has been gone
@@ -589,11 +640,778 @@ impl Galaxy {
     }
 }
 
+/// Pull what this server missed, on a timer, until asked to stop.
+///
+/// A galaxy heals itself this way rather than needing someone with curl: a
+/// server that was down comes back, finds it is behind, and fills in from a
+/// peer that was up.
+///
+/// **Writes are accepted throughout.** A catch-up withholds *reads* instead —
+/// through the `catching_up` flag on `/health`, which something in front of
+/// this server reads to send reads elsewhere. Withholding writes would mean
+/// the target keeps moving: under continuous load the pass would have no point
+/// at which it provably finished.
+///
+/// The first pass is a full one, because a server that has just started has no
+/// idea what it missed. Later passes use `?count` as a cheap trigger — it is
+/// O(1) — and skip a namespace whose peer has no more values than we do. That
+/// is a heuristic and not a proof: equal counts do not mean equal contents,
+/// two servers can each hold a hundred values the other lacks and report the
+/// same total. It is the right trade for a timer, and the full pass on startup
+/// is what stops the heuristic being load-bearing.
+pub async fn sync(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdown>) {
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return;
+    };
+    if galaxy.peers.is_empty() || galaxy.sync_interval == 0 {
+        // Nothing to catch up from, or catching up is off. Either way this
+        // server is as current as it is going to get.
+        state.set_catching_up(false);
+        return;
+    }
+
+    log::info!(
+        "Catching up from {} peer(s) every {}s",
+        galaxy.peers.len(),
+        galaxy.sync_interval
+    );
+
+    let period = Duration::from_secs(galaxy.sync_interval);
+    let mut first = true;
+    loop {
+        let report = galaxy.catch_up(&state, first).await;
+        if first {
+            // Current as of one full pass. Reads can be served from here.
+            state.set_catching_up(false);
+            first = false;
+            log::info!(
+                "Caught up: {} namespace(s) checked, {} value(s) taken from peers",
+                report.namespaces,
+                report.merged
+            );
+        } else if report.merged > 0 {
+            log::info!(
+                "Caught up on {} value(s) across {} namespace(s)",
+                report.merged,
+                report.namespaces
+            );
+        }
+
+        if nap(&shutdown, period).await {
+            return;
+        }
+    }
+}
+
+impl Galaxy {
+    /// Pass a key change on to the peers this server administers.
+    ///
+    /// Gossip rather than a shared file: a change is pushed through the peer's
+    /// own management interface, so **the peer's ACL decides whether it is
+    /// allowed**. A key granted `rw:feeds` there cannot change keys there, and
+    /// a server holding only that key cannot push anything — which is the
+    /// right answer, not a failure to work around. Only a server trusted with
+    /// `admin` on a peer can administer it.
+    ///
+    /// That makes gossip directional by construction. It flows from a server
+    /// that holds admin credentials towards the ones it administers, and a
+    /// narrowly-scoped peer cannot push back.
+    ///
+    /// Safe to repeat: saving a key sets its grants rather than adding to
+    /// them, so the same change arriving twice is the same as once. Unlike a
+    /// sighting, where that was the whole difficulty.
+    ///
+    /// Best effort. A peer that is down misses the change and does not learn it
+    /// from the next live push — only from the periodic one, which re-pushes
+    /// what this server knows. A *deletion* missed while a peer was down does
+    /// not propagate at all; see [`gossip`].
+    pub async fn push_key(&self, entry: &serde_json::Value, hops_left: u8) -> Gossiped {
+        let body = serde_json::to_vec(entry).unwrap_or_default();
+        self.spread(
+            awc::http::Method::POST,
+            "/_management/api/keys",
+            Some(&body),
+            hops_left,
+        )
+        .await
+    }
+
+    /// Offer a peer the whole key list, to hold exactly.
+    ///
+    /// Used when this server owns the galaxy's keys. Unlike offering them one
+    /// at a time, this can *remove* — which is what makes a revocation reach a
+    /// server that was offline for it.
+    ///
+    /// A peer that has not said it may be replaced answers 403, and the caller
+    /// falls back to offering the keys individually. That is not a failure: a
+    /// server that has not opted in keeps its own keys, which is the point of
+    /// the opt-in.
+    pub async fn push_key_list(&self, keys: &serde_json::Value, hops_left: u8) -> Gossiped {
+        let body = serde_json::to_vec(&serde_json::json!({ "keys": keys })).unwrap_or_default();
+        self.spread(
+            awc::http::Method::PUT,
+            "/_management/api/keys",
+            Some(&body),
+            hops_left,
+        )
+        .await
+    }
+
+    /// Whether this server owns the galaxy's keys.
+    pub fn owns_the_acl(&self) -> bool {
+        self.acl_authority
+    }
+
+    /// Pass a tier change on, the same way and under the same rule.
+    ///
+    /// A tier is purely a setting — there is no "unset", only a different
+    /// value — so unlike a key it has no deletion to miss. That makes the
+    /// periodic offer of tiers complete rather than merely additive: whatever
+    /// this server holds is what a peer ends up with.
+    pub async fn push_tier(&self, change: &serde_json::Value, hops_left: u8) -> Gossiped {
+        let body = serde_json::to_vec(change).unwrap_or_default();
+        self.spread(
+            awc::http::Method::POST,
+            "/_management/api/tier",
+            Some(&body),
+            hops_left,
+        )
+        .await
+    }
+
+    /// The same, for a revocation.
+    pub async fn push_key_removal(&self, key: &str, hops_left: u8) -> Gossiped {
+        let path = format!("/_management/api/keys/{}", urlencoding_of(key));
+        self.spread(awc::http::Method::DELETE, &path, None, hops_left)
+            .await
+    }
+
+    /// Send one management change to every peer, and report how it went.
+    async fn spread(
+        &self,
+        method: awc::http::Method,
+        path: &str,
+        body: Option<&[u8]>,
+        hops_left: u8,
+    ) -> Gossiped {
+        let mut report = Gossiped::default();
+        if hops_left == 0 {
+            // A cycle, or a cascade deeper than max_hops. The same budget that
+            // stops a forwarded write circulating stops this.
+            return report;
+        }
+
+        for peer in &self.peers {
+            match self
+                .send(peer, method.clone(), path, body, hops_left, "")
+                .await
+            {
+                Ok(answer) if (200..300).contains(&answer.status) => report.accepted += 1,
+                Ok(answer) if answer.status == 403 || answer.status == 401 => {
+                    // This server is not trusted to administer that peer. Said
+                    // once at debug, because for a deliberately narrow key it
+                    // is the expected answer rather than a problem.
+                    report.refused += 1;
+                    log::debug!(
+                        "{} does not let this server change its keys ({})",
+                        peer.url,
+                        answer.status
+                    );
+                }
+                Ok(answer) => {
+                    report.failed += 1;
+                    log::warn!(
+                        "{} refused a key change: {} {}",
+                        peer.url,
+                        answer.status,
+                        String::from_utf8_lossy(&answer.body).trim()
+                    );
+                }
+                Err(e) => {
+                    report.failed += 1;
+                    log::warn!("Could not reach {} with a key change: {e}", peer.url);
+                }
+            }
+        }
+        report
+    }
+}
+
+/// How a gossiped change was received.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Gossiped {
+    /// Peers that applied it.
+    pub accepted: usize,
+    /// Peers that do not let this server administer them. Expected, not a
+    /// problem: the peer's own ACL is what decides.
+    pub refused: usize,
+    /// Peers that could not be reached, or answered something else.
+    pub failed: usize,
+}
+
+/// Percent-encode what has to go in a path segment.
+///
+/// An API key is whatever an operator typed, so it may hold a slash or a space
+/// and cannot be pasted into a URL as it stands.
+fn urlencoding_of(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+impl Galaxy {
+    /// Which keys each peer holds, as far as this server may ask.
+    ///
+    /// Asked through the peer's management interface, so it answers only where
+    /// this server holds an `admin` key — the same boundary that decides
+    /// whether a change may be pushed.
+    pub async fn peer_keys(&self) -> Vec<PeerKeys> {
+        let mut found = Vec::with_capacity(self.peers.len());
+
+        for peer in &self.peers {
+            let mut row = PeerKeys {
+                url: peer.url.clone(),
+                keys: Vec::new(),
+                readable: false,
+                error: None,
+            };
+
+            match self
+                .send(
+                    peer,
+                    awc::http::Method::GET,
+                    "/_management/api/keys",
+                    None,
+                    1,
+                    "",
+                )
+                .await
+            {
+                Ok(answer) if (200..300).contains(&answer.status) => {
+                    row.readable = true;
+                    row.keys = serde_json::from_slice::<Vec<serde_json::Value>>(&answer.body)
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|k| k.get("key")?.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                Ok(answer) if answer.status == 401 || answer.status == 403 => {
+                    // Not ours to administer. Expected for a deliberately
+                    // narrow key, so it is a fact about the galaxy rather than
+                    // a fault.
+                    row.error = Some("this server does not administer that peer".to_string());
+                }
+                Ok(answer) => row.error = Some(format!("answered {}", answer.status)),
+                Err(e) => row.error = Some(e.to_string()),
+            }
+
+            found.push(row);
+        }
+
+        found
+    }
+}
+
+/// What keys one peer holds.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerKeys {
+    pub url: String,
+    pub keys: Vec<String>,
+    /// Whether this server was allowed to ask at all.
+    pub readable: bool,
+    pub error: Option<String>,
+}
+
+/// Re-push the keys this server knows about, on a timer.
+///
+/// Live pushes are best effort, so a peer that was down misses them. This is
+/// how it catches up on *additions*: the keys this server holds are offered
+/// again, and setting a key it already has is a no-op.
+///
+/// **Deliberately additive.** It does not delete keys a peer has and this
+/// server does not, because this server is not necessarily the only place keys
+/// are managed, and a timer that quietly revoked a key somebody added
+/// elsewhere would be far worse than one that failed to propagate a deletion.
+///
+/// The consequence, stated plainly: a revocation made while a peer was down
+/// does not reach it. Re-revoke it once the peer is back, or check the peer's
+/// own key list. Making this authoritative instead would need a server to be
+/// declared the owner of the galaxy's ACL, which is a decision for whoever runs
+/// it and not one to assume.
+pub async fn gossip(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdown>) {
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return;
+    };
+    if galaxy.peers.is_empty() || galaxy.gossip_interval == 0 {
+        return;
+    }
+    // Nothing to offer, and nothing to offer it with.
+    if state.acl_file.is_none() {
+        log::info!("Keys are read-only here, so none are offered to peers");
+        return;
+    }
+
+    log::info!(
+        "Offering this server's keys to its peers every {}s",
+        galaxy.gossip_interval
+    );
+    let period = Duration::from_secs(galaxy.gossip_interval);
+
+    loop {
+        if nap(&shutdown, period).await {
+            return;
+        }
+
+        // Taken as owned values, so the ACL lock is not held across an await.
+        let entries: Vec<serde_json::Value> = state
+            .acl()
+            .entries()
+            .iter()
+            .map(|(key, grants)| {
+                serde_json::json!(crate::admin::KeyEntry::from_grants(key, grants))
+            })
+            .collect();
+
+        let mut accepted = 0;
+        let mut refused = 0;
+
+        if galaxy.owns_the_acl() {
+            // The whole list, to be held exactly. This is the only offer that
+            // can remove, and so the only one a revocation survives a peer's
+            // downtime through.
+            let report = galaxy
+                .push_key_list(&serde_json::json!(entries), galaxy.max_hops)
+                .await;
+            accepted += report.accepted;
+            refused += report.refused;
+
+            if report.refused > 0 {
+                // A peer that has not opted in keeps its own keys. Offer them
+                // individually instead, which at least carries the additions.
+                for entry in &entries {
+                    let per_key = galaxy.push_key(entry, galaxy.max_hops).await;
+                    accepted += per_key.accepted;
+                }
+            }
+        } else {
+            for entry in &entries {
+                let report = galaxy.push_key(entry, galaxy.max_hops).await;
+                accepted += report.accepted;
+                refused += report.refused;
+            }
+        }
+
+        // Tiers go with them. Unlike a key, a tier has no deletion to miss —
+        // there is no "unset", only a different value — so offering what this
+        // server holds leaves a peer with exactly that.
+        let tiers = state.db.tier_overrides();
+        for (namespace, tier, warm_idle) in &tiers {
+            let change = serde_json::json!({
+                "namespace": namespace,
+                "tier": tier,
+                "warm_idle": warm_idle,
+            });
+            let report = galaxy.push_tier(&change, galaxy.max_hops).await;
+            accepted += report.accepted;
+            refused += report.refused;
+        }
+
+        if accepted > 0 {
+            log::debug!(
+                "Offered {} key(s) and {} tier(s) to peers: {accepted} applied, {refused} \
+                 not ours to administer",
+                entries.len(),
+                tiers.len()
+            );
+        }
+    }
+}
+
+/// Rebuild this server's consensus tally from the galaxy, on a slow timer.
+///
+/// A server passing writes along counts a value towards consensus when a
+/// mirror says the sighting was new there. That only ever rises: values expire
+/// and namespaces are deleted on the nodes, consensus is released there, and
+/// neither event reaches anything in front of them. So the tally drifts upward,
+/// faster the more TTLs are in use, and something has to put it back.
+///
+/// The honest way is to ask. For every namespace the galaxy holds, walk its
+/// values and record which namespaces hold each one; consensus is then the
+/// size of that set. Union rather than sum, because the same namespace mirrored
+/// three times is still one namespace — summing would be the double counting
+/// this whole design exists to avoid.
+///
+/// **This walks the galaxy**, which is why it has a timer of its own and a long
+/// default. It is a repair, not a steady-state cost: the incremental tally is
+/// what answers reads in between.
+pub async fn reconcile(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdown>) {
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return;
+    };
+    if galaxy.peers.is_empty() || galaxy.reconcile_interval == 0 {
+        return;
+    }
+
+    log::info!(
+        "Reconciling the consensus tally every {}s",
+        galaxy.reconcile_interval
+    );
+    let period = Duration::from_secs(galaxy.reconcile_interval);
+
+    loop {
+        // Waited first: at startup the catch-up pass is the thing to run, and
+        // a tally rebuilt before anything has been forwarded says nothing.
+        if nap(&shutdown, period).await {
+            return;
+        }
+        match galaxy.rebuild_consensus(&state).await {
+            Ok(report) => {
+                if report.corrected > 0 {
+                    log::info!(
+                        "Consensus tally rebuilt: {} value(s) across {} namespace(s), \
+                         {} corrected",
+                        report.values,
+                        report.namespaces,
+                        report.corrected
+                    );
+                } else {
+                    log::debug!(
+                        "Consensus tally rebuilt: {} value(s) across {} namespace(s), \
+                         nothing to correct",
+                        report.values,
+                        report.namespaces
+                    );
+                }
+            }
+            Err(e) => log::warn!("Could not rebuild the consensus tally: {e}"),
+        }
+    }
+}
+
+/// What one reconciliation found.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Reconciled {
+    pub namespaces: usize,
+    pub values: usize,
+    /// Values whose tally was wrong and has been put right.
+    pub corrected: usize,
+}
+
+impl Galaxy {
+    async fn rebuild_consensus(
+        &self,
+        state: &crate::handlers::SharedState,
+    ) -> Result<Reconciled, ForwardError> {
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut holders: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut report = Reconciled::default();
+        let mut seen_namespaces: BTreeSet<String> = BTreeSet::new();
+
+        for peer in &self.peers {
+            let names = self.namespaces_of(peer).await?;
+            for namespace in names {
+                if !crate::db::counts_towards_consensus(&namespace) {
+                    continue;
+                }
+                // A namespace mirrored several times is walked once: the
+                // answers agree, and if they do not the union is still right.
+                if !seen_namespaces.insert(namespace.clone()) {
+                    continue;
+                }
+
+                let mut offset = 0usize;
+                loop {
+                    let path = format!("/r/{namespace}?for_merge&offset={offset}&limit=500");
+                    let answer = self
+                        .send(peer, awc::http::Method::GET, &path, None, 1, "")
+                        .await?;
+                    if !(200..300).contains(&answer.status) {
+                        break;
+                    }
+                    let page: MergeOfferPage = serde_json::from_slice(&answer.body)
+                        .map_err(|e| ForwardError::Unreachable(e.to_string()))?;
+
+                    let taken = page.items.len();
+                    for offer in &page.items {
+                        holders
+                            .entry(offer.value.clone())
+                            .or_default()
+                            .insert(namespace.clone());
+                    }
+                    offset += taken;
+                    if taken == 0 || offset >= page.total {
+                        break;
+                    }
+                }
+            }
+        }
+
+        report.namespaces = seen_namespaces.len();
+        report.values = holders.len();
+        report.corrected = state.db.set_consensus(&holders);
+        Ok(report)
+    }
+}
+
+/// Sleep until the period is up or shutdown is asked for.
+///
+/// In slices rather than one long sleep: a catch-up interval is minutes, and a
+/// process asked to stop should not take minutes to do it. Returns true when it
+/// is time to stop.
+async fn nap(shutdown: &Shutdown, period: Duration) -> bool {
+    const SLICE: Duration = Duration::from_secs(2);
+    let mut left = period;
+    while !left.is_zero() {
+        if shutdown.is_stopped() {
+            return true;
+        }
+        let slice = left.min(SLICE);
+        actix_web::rt::time::sleep(slice).await;
+        left -= slice;
+    }
+    shutdown.is_stopped()
+}
+
+/// What one catch-up pass did.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CaughtUp {
+    /// Namespaces looked at.
+    pub namespaces: usize,
+    /// Values whose local copy a peer changed.
+    pub merged: usize,
+}
+
+impl Galaxy {
+    /// One pass: find where this server is behind, and fill it in.
+    async fn catch_up(&self, state: &crate::handlers::SharedState, full: bool) -> CaughtUp {
+        let mut report = CaughtUp::default();
+
+        for peer in &self.peers {
+            // Namespaces the peer has that we are willing to store. Asked of
+            // the peer rather than taken from our own catalogue, because a
+            // server that was down does not know about namespaces created
+            // while it was away.
+            let names = match self.namespaces_of(peer).await {
+                Ok(names) => names,
+                Err(e) => {
+                    log::debug!("Catch-up could not list {}: {e}", peer.url);
+                    continue;
+                }
+            };
+
+            for namespace in names {
+                if !state.db.holds(&namespace) || crate::db::is_internal(&namespace) {
+                    continue;
+                }
+                report.namespaces += 1;
+
+                if !full && !self.behind_on(peer, &namespace, state).await {
+                    continue;
+                }
+                report.merged += self.pull_namespace(peer, &namespace, state).await;
+            }
+        }
+
+        report
+    }
+
+    /// The namespaces a peer holds that fall under what we store.
+    async fn namespaces_of(&self, peer: &Peer) -> Result<Vec<String>, ForwardError> {
+        let answer = self
+            .send(
+                peer,
+                awc::http::Method::GET,
+                "/_api/namespaces",
+                None,
+                // Not a forwarded request: this is between us and the peer, so
+                // it gets a hop of its own rather than spending the budget of
+                // something a client sent.
+                1,
+                "",
+            )
+            .await?;
+
+        if !(200..300).contains(&answer.status) {
+            return Err(ForwardError::Unreachable(format!(
+                "listing namespaces answered {}",
+                answer.status
+            )));
+        }
+        let parsed: serde_json::Value = serde_json::from_slice(&answer.body)
+            .map_err(|e| ForwardError::Unreachable(e.to_string()))?;
+        Ok(parsed
+            .get("namespaces")
+            .and_then(|list| list.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|name| name.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Whether the peer holds more values in this namespace than we do.
+    ///
+    /// O(1) on both sides, which is what makes it usable on a timer. Not a
+    /// proof of divergence — see [`sync`].
+    async fn behind_on(
+        &self,
+        peer: &Peer,
+        namespace: &str,
+        state: &crate::handlers::SharedState,
+    ) -> bool {
+        let path = format!("/r/{namespace}?count");
+        let Ok(answer) = self
+            .send(peer, awc::http::Method::GET, &path, None, 1, "")
+            .await
+        else {
+            return false;
+        };
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&answer.body) else {
+            return false;
+        };
+        let theirs = parsed.get("values").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mine = state
+            .db
+            .value_count(namespace)
+            .map_or(0, |count| count.values as u64);
+        theirs > mine
+    }
+
+    /// Walk a peer's copy of one namespace and merge every page.
+    ///
+    /// Applied in-process rather than posted back to ourselves: the merge rules
+    /// are the same either way, and going out over HTTP to our own port would
+    /// be a hop spent for nothing.
+    async fn pull_namespace(
+        &self,
+        peer: &Peer,
+        namespace: &str,
+        state: &crate::handlers::SharedState,
+    ) -> usize {
+        const PAGE: usize = 500;
+        let mut offset = 0usize;
+        let mut merged = 0usize;
+
+        loop {
+            let path = format!("/r/{namespace}?for_merge&offset={offset}&limit={PAGE}");
+            let answer = match self
+                .send(peer, awc::http::Method::GET, &path, None, 1, "")
+                .await
+            {
+                Ok(answer) => answer,
+                Err(e) => {
+                    log::warn!("Catch-up of '{namespace}' from {} stopped: {e}", peer.url);
+                    break;
+                }
+            };
+            if !(200..300).contains(&answer.status) {
+                log::warn!(
+                    "Catch-up of '{namespace}' from {} stopped: answered {}",
+                    peer.url,
+                    answer.status
+                );
+                break;
+            }
+            // Logged rather than shrugged off: a catch-up that silently takes
+            // nothing looks exactly like one that had nothing to take, and the
+            // difference is the whole point of running it.
+            let page = match serde_json::from_slice::<MergeOfferPage>(&answer.body) {
+                Ok(page) => page,
+                Err(e) => {
+                    log::warn!(
+                        "Catch-up of '{namespace}' from {} could not read the page: {e}",
+                        peer.url
+                    );
+                    break;
+                }
+            };
+
+            let taken = page.items.len();
+            for offer in page.items {
+                let outcome = state.db.merge(namespace, &offer.value, &offer.state());
+                if outcome.changed {
+                    merged += 1;
+                }
+            }
+
+            offset += taken;
+            if taken == 0 || offset >= page.total {
+                break;
+            }
+        }
+
+        if merged > 0 {
+            log::debug!("Took {merged} value(s) of '{namespace}' from {}", peer.url);
+        }
+        merged
+    }
+}
+
+/// One page of a peer's namespace, as `/r/<ns>?for_merge` answers.
+#[derive(serde::Deserialize)]
+struct MergeOfferPage {
+    items: Vec<MergeOfferItem>,
+    total: usize,
+}
+
+/// One value from that page.
+///
+/// The fields are spelled out rather than flattening
+/// [`crate::attribute::Merge`] into them — for the same reason
+/// [`crate::handlers::MergeItem`] does. `serde`'s `flatten` buffers through an
+/// intermediate that cannot coerce JSON's string object keys back to the `i64`
+/// hours in `stats`, so a page read from a peer would fail to parse and a
+/// catch-up would quietly take nothing.
+#[derive(serde::Deserialize)]
+struct MergeOfferItem {
+    value: String,
+    counts: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    stats: std::collections::BTreeMap<String, std::collections::BTreeMap<i64, u64>>,
+    first_seen: i64,
+    last_seen: i64,
+    #[serde(default)]
+    tags: String,
+    #[serde(default)]
+    ttl: u64,
+}
+
+impl MergeOfferItem {
+    fn state(&self) -> crate::attribute::Merge {
+        crate::attribute::Merge {
+            counts: self.counts.clone(),
+            stats: self.stats.clone(),
+            first_seen: self.first_seen,
+            last_seen: self.last_seen,
+            tags: self.tags.clone(),
+            ttl: self.ttl,
+        }
+    }
+}
+
 /// Ask one peer whether it is well, and how long it took to say so.
 ///
 /// No API key: `/health` needs none, so a probe cannot leak the credential
 /// this server holds for the peer.
-async fn probe(client: &awc::Client, url: &str) -> Result<(Option<String>, u64), String> {
+/// What one peer's `/health` said.
+struct Probed {
+    version: Option<String>,
+    latency_ms: u64,
+    catching_up: bool,
+}
+
+async fn probe(client: &awc::Client, url: &str) -> Result<Probed, String> {
     let at = Instant::now();
     let mut response = client
         .get(format!("{url}/health"))
@@ -608,13 +1426,22 @@ async fn probe(client: &awc::Client, url: &str) -> Result<(Option<String>, u64),
 
     // A peer that answers but says something unreadable is reachable, which is
     // what was being asked. The version is a bonus, not a requirement.
-    let version = response
-        .json::<serde_json::Value>()
-        .await
-        .ok()
+    let body = response.json::<serde_json::Value>().await.ok();
+    let version = body
+        .as_ref()
         .and_then(|body| body.get("version")?.as_str().map(str::to_string));
+    // Absent on a peer older than this field, which is the same as not
+    // catching up as far as anything here is concerned.
+    let catching_up = body
+        .as_ref()
+        .and_then(|body| body.get("catching_up")?.as_bool())
+        .unwrap_or(false);
 
-    Ok((version, latency_ms))
+    Ok(Probed {
+        version,
+        latency_ms,
+        catching_up,
+    })
 }
 
 /// This thread's HTTP client.
@@ -665,6 +1492,14 @@ fn build_client(verify_tls: bool) -> anyhow::Result<awc::Client> {
 mod tests {
     use super::*;
 
+    fn probed(version: Option<&str>, latency_ms: u64, catching_up: bool) -> Probed {
+        Probed {
+            version: version.map(str::to_string),
+            latency_ms,
+            catching_up,
+        }
+    }
+
     fn galaxy(urls: &[&str]) -> Galaxy {
         Galaxy::new(&GalaxySettings {
             peers: urls
@@ -677,6 +1512,11 @@ mod tests {
                 .collect(),
             max_hops: 4,
             health_interval: 30,
+            sync_interval: 300,
+            reconcile_interval: 3600,
+            gossip_interval: 600,
+            acl_authority: false,
+            acl_replaceable: false,
             verify_tls: true,
         })
     }
@@ -704,7 +1544,7 @@ mod tests {
         assert_eq!(galaxy.health()[0].failures, 2);
         assert!(!galaxy.health()[0].online);
 
-        galaxy.record("https://a:9999", Ok((Some("0.6.1".to_string()), 12)));
+        galaxy.record("https://a:9999", Ok(probed(Some("0.6.1"), 12, false)));
         let health = galaxy.health();
         assert!(health[0].online);
         assert!(health[0].probed);
@@ -721,7 +1561,7 @@ mod tests {
     fn last_seen_survives_a_later_failure() {
         let galaxy = galaxy(&["https://a:9999"]);
 
-        galaxy.record("https://a:9999", Ok((None, 5)));
+        galaxy.record("https://a:9999", Ok(probed(None, 5, false)));
         let seen = galaxy.health()[0].last_seen;
         assert!(seen > 0);
 
@@ -733,13 +1573,136 @@ mod tests {
         assert!(health[0].latency_ms.is_none(), "a stale latency was kept");
     }
 
+    /// An API key is whatever an operator typed, so it may hold a slash or a
+    /// space and cannot go into a URL path as it stands. A key containing `/`
+    /// would otherwise address a different route entirely.
+    #[test]
+    fn a_key_is_encoded_before_it_goes_in_a_path() {
+        let cases = [
+            ("simple", "simple"),
+            ("with/slash", "with%2Fslash"),
+            ("with space", "with%20space"),
+            ("keep-._~", "keep-._~"),
+            ("../escape", "..%2Fescape"),
+            ("q?a=b&c", "q%3Fa%3Db%26c"),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(urlencoding_of(key), expected, "{key}");
+        }
+    }
+
+    /// A change that has run out of hops is not passed on. The same budget
+    /// that stops a forwarded write circulating stops a key change going round
+    /// a miswired galaxy for ever.
+    #[actix_web::test]
+    async fn a_key_change_out_of_hops_is_not_passed_on() {
+        let galaxy = galaxy(&["https://a:9999"]);
+
+        let report = galaxy
+            .push_key(
+                &serde_json::json!({"key": "k", "admin": false, "read": [], "write": []}),
+                0,
+            )
+            .await;
+
+        assert_eq!(report.accepted, 0);
+        assert_eq!(report.refused, 0);
+        assert_eq!(report.failed, 0, "it tried anyway");
+    }
+
+    /// A peer that cannot be reached is counted as failed rather than refused:
+    /// the two mean different things to whoever reads the log, and only one of
+    /// them is expected.
+    #[actix_web::test]
+    async fn an_unreachable_peer_is_a_failure_not_a_refusal() {
+        // Nothing listens on port 1.
+        let galaxy = galaxy(&["http://127.0.0.1:1"]);
+
+        let report = galaxy
+            .push_key(
+                &serde_json::json!({"key": "k", "admin": false, "read": [], "write": []}),
+                4,
+            )
+            .await;
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.refused, 0);
+        assert_eq!(report.accepted, 0);
+    }
+
+    /// A mirror still catching up is passed over for reads: its data is
+    /// incomplete and a read of it would under-report.
+    #[test]
+    fn reads_avoid_a_mirror_that_is_catching_up() {
+        let galaxy = galaxy(&["https://a:9999", "https://b:9999"]);
+        galaxy.record("https://a:9999", Ok(probed(None, 1, false)));
+        galaxy.record("https://b:9999", Ok(probed(None, 1, true)));
+
+        // Whatever the value, the choice is the one that is current. Several
+        // values, because the pick is by hash and one could land on `a` by
+        // luck.
+        for value in ["1.2.3.4", "8.8.8.8", "evil.example", "a.b.c", "x"] {
+            let chosen = galaxy.reader_for("feeds", value).expect("a mirror");
+            assert_eq!(
+                chosen.url, "https://a:9999",
+                "{value} was read from a mirror that is catching up"
+            );
+        }
+    }
+
+    /// If every mirror is catching up, one answers anyway. An under-reported
+    /// count beats no answer, and refusing would make a whole galaxy
+    /// unreadable for as long as it took to start.
+    #[test]
+    fn reads_are_served_even_when_every_mirror_is_catching_up() {
+        let galaxy = galaxy(&["https://a:9999", "https://b:9999"]);
+        galaxy.record("https://a:9999", Ok(probed(None, 1, true)));
+        galaxy.record("https://b:9999", Ok(probed(None, 1, true)));
+
+        assert!(galaxy.reader_for("feeds", "1.2.3.4").is_some());
+    }
+
+    /// Catching up is reported per peer and clears when it finishes.
+    #[test]
+    fn catching_up_is_tracked_and_cleared() {
+        let galaxy = galaxy(&["https://a:9999"]);
+
+        galaxy.record("https://a:9999", Ok(probed(None, 1, true)));
+        assert!(galaxy.health()[0].catching_up);
+
+        galaxy.record("https://a:9999", Ok(probed(None, 1, false)));
+        assert!(!galaxy.health()[0].catching_up);
+    }
+
+    /// The same value always picks the same mirror while the set is unchanged.
+    /// Without that, consecutive reads could be served by mirrors at different
+    /// stages of catching up and show a count going down.
+    #[test]
+    fn a_value_always_reads_from_the_same_mirror() {
+        let galaxy = galaxy(&["https://a:9999", "https://b:9999", "https://c:9999"]);
+        for url in ["https://a:9999", "https://b:9999", "https://c:9999"] {
+            galaxy.record(url, Ok(probed(None, 1, false)));
+        }
+
+        for value in ["1.2.3.4", "evil.example", "deadbeef"] {
+            let first = galaxy.reader_for("feeds", value).unwrap().url.clone();
+            for _ in 0..5 {
+                assert_eq!(
+                    galaxy.reader_for("feeds", value).unwrap().url,
+                    first,
+                    "{value} moved between reads"
+                );
+            }
+        }
+    }
+
     /// Reported in configured order, so the view does not reshuffle between
     /// refreshes.
     #[test]
     fn health_is_reported_in_configured_order() {
         let galaxy = galaxy(&["https://c:9999", "https://a:9999", "https://b:9999"]);
 
-        galaxy.record("https://a:9999", Ok((None, 1)));
+        galaxy.record("https://a:9999", Ok(probed(None, 1, false)));
         let health = galaxy.health();
         let urls: Vec<&str> = health.iter().map(|h| h.url.as_str()).collect();
         assert_eq!(urls, ["https://c:9999", "https://a:9999", "https://b:9999"]);
