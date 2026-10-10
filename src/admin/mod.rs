@@ -1116,10 +1116,7 @@ fn tags_file(state: &SharedState) -> Result<&PathBuf, HttpResponse> {
 }
 
 /// Persist the vocabulary, then adopt it. Temp file and rename, like the ACL.
-fn save_tags(
-    state: &SharedState,
-    vocabulary: crate::tags::Vocabulary,
-) -> Result<(), HttpResponse> {
+fn save_tags(state: &SharedState, vocabulary: crate::tags::Vocabulary) -> Result<(), HttpResponse> {
     let path = tags_file(state)?;
 
     let write = || -> std::io::Result<()> {
@@ -1133,9 +1130,11 @@ fn save_tags(
 
     if let Err(e) = write() {
         log::error!("Could not write {}: {e}", path.display());
-        return Err(HttpResponse::InternalServerError().json(Message::new(format!(
-            "Could not write the tag vocabulary: {e}"
-        ))));
+        return Err(
+            HttpResponse::InternalServerError().json(Message::new(format!(
+                "Could not write the tag vocabulary: {e}"
+            ))),
+        );
     }
 
     *state
@@ -1166,7 +1165,11 @@ pub async fn define_tag(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
 
-    if let Err(e) = vocabulary.set(&definition.name, &definition.colour, &definition.description) {
+    if let Err(e) = vocabulary.set(
+        &definition.name,
+        &definition.colour,
+        &definition.description,
+    ) {
         return HttpResponse::BadRequest().json(Message::new(e));
     }
     if let Err(resp) = save_tags(&state, vocabulary) {
@@ -2299,14 +2302,14 @@ mod tests {
             "feeds/ips",
             "1.1.1.1",
             chrono::Utc::now(),
-            None,
+            crate::db::WriteOpts::default(),
             "tlp:green,stix-type:ipv4-addr",
         );
         inner.db.write_tagged(
             "feeds/ips",
             "2.2.2.2",
             chrono::Utc::now(),
-            None,
+            crate::db::WriteOpts::default(),
             "tlp:green,home-grown",
         );
         web::Data::new(inner)
@@ -2352,7 +2355,8 @@ mod tests {
         let st = tagged_state(&dir.0);
         let app = app!(st);
 
-        let body: Json = test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
         assert_eq!(row(&body, "stix-type:")["family"], true);
         assert_eq!(row(&body, "stix-type:")["used"], 1);
     }
@@ -2390,10 +2394,7 @@ mod tests {
         assert!(written.contains("#aa33cc"), "{written}");
         // In effect without a restart.
         assert_eq!(
-            st.tags
-                .read()
-                .unwrap()
-                .colour_of("home-grown"),
+            st.tags.read().unwrap().colour_of("home-grown"),
             Some("#aa33cc")
         );
     }
@@ -2453,7 +2454,8 @@ mod tests {
         let st = state();
         let app = app!(st);
 
-        let body: Json = test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
         assert_eq!(body["editable"], false);
 
         let resp = test::call_service(

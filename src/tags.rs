@@ -365,7 +365,11 @@ mod tests {
         vocabulary.set("file.md5", "#123456", "").unwrap();
 
         let reloaded = Vocabulary::from_toml(&vocabulary.to_toml()).expect("valid TOML");
-        assert!(reloaded.get("file.md5").is_some(), "{}", vocabulary.to_toml());
+        assert!(
+            reloaded.get("file.md5").is_some(),
+            "{}",
+            vocabulary.to_toml()
+        );
     }
 
     /// A bad entry is dropped, and the good ones beside it still load. The
@@ -388,7 +392,10 @@ colour = "not a colour"
         let mut vocabulary = Vocabulary::seeded();
         let before = vocabulary.len();
         assert!(vocabulary.remove("tlp:red"));
-        assert!(!vocabulary.remove("tlp:red"), "removing twice is not a change");
+        assert!(
+            !vocabulary.remove("tlp:red"),
+            "removing twice is not a change"
+        );
         assert_eq!(vocabulary.len(), before - 1);
         assert!(vocabulary.get("tlp:green").is_some());
     }
