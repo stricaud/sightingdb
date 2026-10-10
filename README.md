@@ -791,6 +791,30 @@ values currently have none.
 `limit=` caps how many values one export reads (10,000 by default, 100,000 at
 most); `X-SightingDB-Truncated` says when the namespace held more.
 
+### Exporting a subtree
+
+An export covers the one namespace named. Add `recursive` — `?recursive` on
+`GET /stix/<namespace>`, or `"recursive": true` in the `POST /_api/stix` body —
+to take every namespace below it as well, in one bundle. The management
+interface offers it as a checkbox when you press **Export STIX**.
+
+	X-SightingDB-Namespaces: 4
+	X-SightingDB-Exported: 412
+
+"Below" matches whole path segments, so `feeds` covers `feeds` itself and
+`feeds/misp/ips`, and never `feeds-internal` — a different namespace, not a
+child. The namespace you name is authorized as always, so asking for a subtree
+your key may not read is refused; a namespace *found* underneath that it may
+not read is left out instead, exactly as it is absent from the namespace tree.
+
+`limit=` is the budget for the whole export rather than for each namespace in
+it, so a recursive export of a large tree reads what you asked for and no more.
+`X-SightingDB-Truncated` says when the budget ran out with more to give.
+
+Note that this changes `limit=` for an existing caller that named several
+namespaces in one `POST /_api/stix`: the limit used to apply to each. Naming a
+single namespace is unaffected.
+
 ### Exporting everything anyway
 
 To take the whole namespace regardless, add `untyped=include` — `?untyped=include`

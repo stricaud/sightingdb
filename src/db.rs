@@ -845,6 +845,39 @@ impl Database {
         }
     }
 
+    /// Every namespace at or under `prefix`, in order, that `allowed` permits.
+    ///
+    /// Namespaces are flat paths, so "under" is a prefix match on whole
+    /// segments: `feeds` finds `feeds` itself and `feeds/misp/ips`, and never
+    /// `feeds-internal`, which is a different namespace rather than a child.
+    ///
+    /// Read from the catalogue rather than the resident map, so an evicted
+    /// namespace is still found — it is paged in when its values are read, not
+    /// when it is listed.
+    pub fn namespaces_under(&self, prefix: &str, allowed: impl Fn(&str) -> bool) -> Vec<String> {
+        let prefix = prefix.trim_matches('/');
+        let shards = self.shards.read().unwrap_or_else(PoisonError::into_inner);
+
+        let mut names: Vec<String> = shards
+            .values()
+            .flat_map(|meta| meta.namespaces.iter())
+            .filter(|name| !name.starts_with(CONFIG_PREFIX) && *name != ALL_NAMESPACE)
+            .filter(|name| {
+                prefix.is_empty()
+                    || name.as_str() == prefix
+                    || name
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .filter(|name| allowed(name))
+            .cloned()
+            .collect();
+
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Declare a namespace before anything has been written to it, so the
     /// management interface can make one the way a file browser makes a folder.
     ///

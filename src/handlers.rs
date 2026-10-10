@@ -154,6 +154,10 @@ pub struct ExportRequest {
     /// Defaults to leaving them out, which is what this route has always done.
     #[serde(default)]
     pub untyped: crate::stix::Untyped,
+    /// Also export every namespace below each one named. Off by default, so a
+    /// caller that named one namespace still gets one namespace.
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 impl ExportRequest {
@@ -177,6 +181,8 @@ impl ExportRequest {
 #[derive(Debug, Deserialize)]
 pub struct ExportQuery {
     limit: Option<usize>,
+    /// Present at any value to export the namespaces below this one too.
+    recursive: Option<String>,
     /// `include` exports values nothing could identify; anything else, or
     /// absent, leaves them out. Absent is the default so that an existing
     /// caller's bundle does not change shape under it.
@@ -662,6 +668,22 @@ pub async fn export_stix(
         return error_response(&ApiError::ConfigNamespace);
     }
 
+    if query.recursive.is_some() {
+        let wanted = expand_subtrees(&state, &req, std::slice::from_ref(&namespace));
+        if wanted.is_empty() {
+            return error_response(&ApiError::NotFound(NotFound::namespace(&namespace, "")));
+        }
+        let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        return stix_response(crate::stix::export_namespaces(
+            &state.db,
+            &state.stix,
+            &names,
+            "",
+            query.limit(),
+            query.untyped(),
+        ));
+    }
+
     let Some(export) = crate::stix::export_namespace(
         &state.db,
         &state.stix,
@@ -701,6 +723,18 @@ pub async fn export_stix_api(
         }
     }
 
+    // Expanded after authorizing what was named, so the subtree is reached
+    // only through a namespace the key was already allowed to export.
+    let wanted = if body.recursive {
+        let found = expand_subtrees(&state, &req, &wanted);
+        if found.is_empty() {
+            return error_response(&ApiError::NotFound(NotFound::namespace(&wanted[0], "")));
+        }
+        found
+    } else {
+        wanted
+    };
+
     let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
     let export = crate::stix::export_namespaces(
         &state.db,
@@ -722,12 +756,48 @@ pub async fn export_stix_api(
 
 /// A bundle, with what it could not carry reported in headers: the body has to
 /// be a STIX bundle and nothing else.
+/// Expand each namespace into itself plus everything below it that this key
+/// may read.
+///
+/// The namespaces named are authorized by the caller before this runs, and a
+/// refusal there is a `403`. What is *found* underneath follows the browsing
+/// rule instead: a namespace the key may not read is left out rather than
+/// failing the export, exactly as it is absent from the namespace tree. The
+/// count that comes back in `X-SightingDB-Namespaces` is what the bundle
+/// actually covers, so a caller can tell it got a subtree and how much of one.
+fn expand_subtrees(state: &SharedState, req: &HttpRequest, wanted: &[String]) -> Vec<String> {
+    // Read the key once: this asks about every namespace in the catalogue, and
+    // going through `refusal_for` would log a warning for each refusal.
+    let apikey = match api_key(state, req) {
+        Ok(apikey) => apikey,
+        // The caller has already authorized `wanted`, so a key that was going
+        // to be refused never reaches this.
+        Err(_) => return wanted.to_vec(),
+    };
+    let acl = state.acl();
+    let allowed = |name: &str| match apikey {
+        None => true,
+        Some(key) => acl.can_read(key, name),
+    };
+
+    let mut found: Vec<String> = Vec::new();
+    for namespace in wanted {
+        for name in state.db.namespaces_under(namespace, allowed) {
+            if !found.contains(&name) {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
 fn stix_response(export: crate::stix::Export) -> HttpResponse {
     let mut response = HttpResponse::Ok();
     response
         .insert_header(("X-SightingDB-Exported", export.exported.to_string()))
         .insert_header(("X-SightingDB-Skipped", export.skipped.len().to_string()))
         .insert_header(("X-SightingDB-Untyped", export.untyped.to_string()))
+        .insert_header(("X-SightingDB-Namespaces", export.namespaces.to_string()))
         .insert_header(("X-SightingDB-Truncated", export.truncated.to_string()))
         .content_type("application/stix+json;version=2.1");
     if !export.missing.is_empty() {
@@ -1409,6 +1479,201 @@ mod tests {
         assert!(
             body["message"].as_str().unwrap().contains("namespace"),
             "{body}"
+        );
+    }
+
+    /// A recursive export covers the subtree; without it, one namespace means
+    /// one namespace.
+    #[actix_web::test]
+    async fn a_stix_export_can_be_asked_for_the_whole_subtree() {
+        let st = state(false);
+        let app = app!(st);
+
+        for uri in [
+            "/w/feeds?val=1.1.1.1",
+            "/w/feeds/misp/ips?val=2.2.2.2",
+            "/w/feeds/misp/domains?val=evil.example",
+            // A sibling that merely shares the first few characters. A prefix
+            // match on raw text would drag this in; it is not a child.
+            "/w/feeds-internal?val=3.3.3.3",
+            "/w/other?val=4.4.4.4",
+        ] {
+            test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        }
+
+        // Default: just `feeds` itself.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/stix/feeds").to_request(),
+        )
+        .await;
+        assert_eq!(resp.headers().get("X-SightingDB-Namespaces").unwrap(), "1");
+        assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "1");
+
+        // Recursive: `feeds` and the two below it, and nothing else.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/feeds?recursive")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("X-SightingDB-Namespaces").unwrap(), "3");
+        assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "3");
+
+        let body: Value = test::read_body_json(resp).await;
+        let covered: Vec<&str> = body["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["x_sightingdb_namespace"].as_str())
+            .collect();
+        assert!(covered.contains(&"feeds"), "{covered:?}");
+        assert!(covered.contains(&"feeds/misp/ips"), "{covered:?}");
+        assert!(covered.contains(&"feeds/misp/domains"), "{covered:?}");
+        assert!(
+            !covered.contains(&"feeds-internal"),
+            "a sibling sharing the prefix was treated as a child: {covered:?}"
+        );
+        assert!(!covered.contains(&"other"), "{covered:?}");
+    }
+
+    /// The same through the POST route, which takes it in the body.
+    #[actix_web::test]
+    async fn the_stix_api_route_can_be_asked_for_the_whole_subtree() {
+        let st = state(false);
+        let app = app!(st);
+
+        for uri in ["/w/feeds/a?val=1.1.1.1", "/w/feeds/b?val=2.2.2.2"] {
+            test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        }
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/stix")
+                .set_json(json!({"namespace": "feeds", "recursive": true}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // `feeds` itself holds nothing, so only the two below it contribute.
+        assert_eq!(resp.headers().get("X-SightingDB-Namespaces").unwrap(), "2");
+        assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "2");
+    }
+
+    /// A namespace below the one asked for that this key may not read is left
+    /// out, rather than failing the whole export.
+    ///
+    /// The namespace *named* is authorized as always — that is a 403. What is
+    /// found underneath follows the browsing rule, where something out of
+    /// reach is simply not there.
+    #[actix_web::test]
+    async fn a_recursive_export_leaves_out_what_the_key_may_not_read() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("scoped", parse_grants("rw:feeds/open").unwrap());
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("full", parse_grants("rw").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        for uri in [
+            "/w/feeds/open/a?val=1.1.1.1",
+            "/w/feeds/closed/b?val=2.2.2.2",
+        ] {
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(uri)
+                    .insert_header(("Authorization", "full"))
+                    .to_request(),
+            )
+            .await;
+        }
+
+        // The scoped key may read `feeds/open`, so it may export that subtree.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/feeds/open?recursive")
+                .insert_header(("Authorization", "scoped"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("X-SightingDB-Namespaces").unwrap(), "1");
+        let body: Value = test::read_body_json(resp).await;
+        let covered: Vec<&str> = body["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["x_sightingdb_namespace"].as_str())
+            .collect();
+        assert!(covered.contains(&"feeds/open/a"), "{covered:?}");
+        assert!(
+            !covered.contains(&"feeds/closed/b"),
+            "a recursive export reached outside the key's scope: {covered:?}"
+        );
+
+        // And asking for the parent it may not read is still a refusal.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/feeds?recursive")
+                .insert_header(("Authorization", "scoped"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `limit` is the budget for the export, not for each namespace in it —
+    /// otherwise a recursive export of a large tree reads a multiple of it.
+    #[actix_web::test]
+    async fn the_export_limit_is_spent_across_the_whole_subtree() {
+        let st = state(false);
+        let app = app!(st);
+
+        // Addresses rather than arbitrary strings: an untyped value is left
+        // out of the bundle entirely, which would make this test about the
+        // wrong thing.
+        for n in 0..4 {
+            for (ns, octet) in [("feeds/a", 10), ("feeds/b", 20)] {
+                test::call_service(
+                    &app,
+                    test::TestRequest::get()
+                        .uri(&format!("/w/{ns}?val={octet}.0.0.{n}"))
+                        .to_request(),
+                )
+                .await;
+            }
+        }
+
+        // Eight values across two namespaces, and a budget of five.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/feeds?recursive&limit=5")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("X-SightingDB-Exported").unwrap(),
+            "5",
+            "the limit was applied per namespace rather than to the export"
+        );
+        assert_eq!(
+            resp.headers().get("X-SightingDB-Truncated").unwrap(),
+            "true"
         );
     }
 

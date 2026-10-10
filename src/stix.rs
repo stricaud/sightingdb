@@ -106,6 +106,10 @@ pub struct Export {
     pub truncated: bool,
     /// Namespaces asked for that do not exist.
     pub missing: Vec<String>,
+    /// How many namespaces contributed values to the bundle. Worth reporting
+    /// when a recursive export was asked for, since the caller named one
+    /// namespace and may have got a subtree.
+    pub namespaces: usize,
 }
 
 /// The TLP marking definitions defined by the specification, which are
@@ -312,6 +316,7 @@ pub fn bundle_of(parts: &[Part<'_>], settings: &Settings, untyped: Untyped) -> E
             "objects": objects,
         }),
         untyped: untyped_count,
+        namespaces: parts.len(),
         exported,
         skipped,
     }
@@ -361,10 +366,22 @@ pub fn export_namespaces(
     let mut missing = Vec::new();
     let mut truncated = false;
 
+    // `limit` is the budget for the whole export rather than for each
+    // namespace in it. Per namespace it would multiply: a recursive export of
+    // a tree of five hundred namespaces would read five hundred times the
+    // limit, which is not what "how many values one export reads" can mean.
+    let mut budget = limit;
+
     for namespace in namespaces {
-        match db.value_page(namespace, filter, 0, limit, false) {
+        if budget == 0 {
+            // Nothing left to spend, and namespaces still to go.
+            truncated = true;
+            break;
+        }
+        match db.value_page(namespace, filter, 0, budget, false) {
             Some(page) => {
                 truncated |= page.total > page.items.len();
+                budget -= page.items.len();
                 pages.push((*namespace, page.items));
             }
             None => missing.push((*namespace).to_string()),

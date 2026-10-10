@@ -21,7 +21,7 @@ Contents
 - [Conventions](#conventions)
 - [Sightings](#sightings) — `/w` `/r` `/r?count` `/rs` `/d`
 - [Bulk](#bulk) — `/wb` `/vwb` `/rb` `/rbs`
-- [STIX export](#stix-export) — `/stix` `/_api/stix`, and [untyped values](#values-with-no-observable-type)
+- [STIX export](#stix-export) — `/stix` `/_api/stix`, [subtrees](#exporting-a-whole-subtree), [untyped values](#values-with-no-observable-type)
 - [Storage](#storage) — `/_api/tier`
 - [Service](#service) — `/health` `/i` `/` `/_api/openapi.yaml` `/c`
 - [Management interface](#management-interface) — `/_management/*`
@@ -382,6 +382,61 @@ namespace travels as `x_sightingdb_namespace`. A `tlp:` tag becomes a
 `?limit=<n>` caps how many values go into the bundle — default 10000, clamped
 to 100000. A bundle is read by a machine, but it is still one response held in
 memory.
+
+### Exporting a whole subtree
+
+By default an export covers the one namespace named. `?recursive` (or
+`"recursive": true` in the `POST` body) also takes every namespace below it:
+
+	$ curl -D- -o /dev/null -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/stix/feeds'
+	x-sightingdb-namespaces: 1
+	x-sightingdb-exported: 1
+
+	$ curl -D- -o /dev/null -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/stix/feeds?recursive'
+	x-sightingdb-namespaces: 4
+	x-sightingdb-exported: 4
+
+`X-SightingDB-Namespaces` is how many namespaces contributed, so a caller that
+named one can see it got a subtree and how big a one.
+
+"Below" is a match on whole path segments. `feeds` finds `feeds` itself and
+`feeds/misp/ips`, and never `feeds-internal` — which is a different namespace,
+not a child.
+
+**Permissions.** The namespace you name is authorized as always, so asking for
+a subtree you may not read is a `403`:
+
+	$ curl -o /dev/null -w '%{http_code}\n' -H 'Authorization: scoped' \
+	    'http://127.0.0.1:9999/stix/feeds?recursive'
+	403
+
+What is *found* underneath follows the browsing rule instead: a namespace your
+key may not read is left out rather than failing the export, exactly as it is
+absent from the namespace tree. A key holding `rw:feeds/open` exporting
+`/stix/feeds/open?recursive` gets its own subtree and nothing else.
+
+**The limit is shared.** `limit=` is the budget for the whole export, not for
+each namespace in it — per namespace it would multiply, and a recursive export
+of a large tree would read a multiple of what was asked for:
+
+	$ curl -D- -o /dev/null -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/stix/feeds?recursive&limit=2'
+	x-sightingdb-namespaces: 2
+	x-sightingdb-exported: 2
+	x-sightingdb-truncated: true
+
+`X-SightingDB-Truncated` says when the budget ran out with more to give, either
+within a namespace or with namespaces still to go. Raise `limit=`, or export a
+narrower part of the tree.
+
+> **Changed behaviour.** `limit=` used to apply per namespace on
+> `POST /_api/stix` with several namespaces named, so such a caller may now get
+> fewer values than before for the same limit. The single-namespace case is
+> unaffected.
+
+`recursive` and `untyped` are independent, and combine.
 
 ### Values with no observable type
 

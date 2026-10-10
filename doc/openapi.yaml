@@ -380,6 +380,18 @@ paths:
         response headers say how many that was.
       parameters:
         - $ref: "#/components/parameters/Namespace"
+        - name: recursive
+          in: query
+          allowEmptyValue: true
+          description: |
+            Present at any value to also export every namespace below this one,
+            as one bundle. "Below" matches whole path segments, so `feeds`
+            covers `feeds/misp/ips` and never `feeds-internal`.
+
+            The namespace named is authorized as always; one found underneath
+            that the key may not read is left out rather than refusing the
+            export. `X-SightingDB-Namespaces` reports how many contributed.
+          schema: { type: string }
         - name: untyped
           in: query
           description: |
@@ -399,6 +411,8 @@ paths:
           headers:
             X-SightingDB-Exported: { $ref: "#/components/headers/Exported" }
             X-SightingDB-Skipped: { $ref: "#/components/headers/Skipped" }
+            X-SightingDB-Untyped: { $ref: "#/components/headers/Untyped" }
+            X-SightingDB-Namespaces: { $ref: "#/components/headers/Namespaces" }
             X-SightingDB-Truncated: { $ref: "#/components/headers/Truncated" }
           content:
             application/stix+json:
@@ -430,6 +444,8 @@ paths:
           headers:
             X-SightingDB-Exported: { $ref: "#/components/headers/Exported" }
             X-SightingDB-Skipped: { $ref: "#/components/headers/Skipped" }
+            X-SightingDB-Untyped: { $ref: "#/components/headers/Untyped" }
+            X-SightingDB-Namespaces: { $ref: "#/components/headers/Namespaces" }
             X-SightingDB-Truncated: { $ref: "#/components/headers/Truncated" }
             X-SightingDB-Missing:
               description: Namespaces asked for that do not exist, comma separated.
@@ -1022,10 +1038,27 @@ components:
       description: Values written into the bundle.
       schema: { type: integer }
     Skipped:
-      description: Values left out because their observable type was unknown.
+      description: |
+        Values left out because their observable type was unknown. Always 0
+        when `untyped` is `include`, which exports them instead.
+      schema: { type: integer }
+    Untyped:
+      description: |
+        How many of the exported values went out as `x-sightingdb-value`
+        because nothing identified them. A value carrying an explicit
+        `stix-type:` tag is never counted here.
+      schema: { type: integer }
+    Namespaces:
+      description: |
+        How many namespaces contributed values to the bundle. Worth reading
+        after a recursive export, where one namespace was named and a subtree
+        may have been returned.
       schema: { type: integer }
     Truncated:
-      description: Whether a namespace held more than the export read.
+      description: |
+        Whether there was more than the export read — either within a
+        namespace, or with namespaces still to go when the shared `limit`
+        budget ran out.
       schema: { type: boolean }
 
   responses:
@@ -1303,6 +1336,14 @@ components:
         namespaces:
           type: array
           items: { type: string }
+        recursive:
+          type: boolean
+          default: false
+          description: |
+            Also export every namespace below each one named, as one bundle.
+            "Below" matches whole path segments. Each namespace named is
+            authorized first; namespaces found underneath that the key may not
+            read are left out rather than refusing the export.
         untyped:
           type: string
           enum: [skip, include]
