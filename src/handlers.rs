@@ -1079,9 +1079,18 @@ pub async fn export_stix(
     }
 
     if query.recursive.is_some() {
-        let wanted = expand_subtrees(&state, &req, std::slice::from_ref(&namespace));
+        // The subtree can span this server and its mirrors, so what it
+        // contains is asked of the galaxy as well as of the local catalogue —
+        // a router's own catalogue is empty, and a recursive export there
+        // would otherwise find nothing.
+        let wanted = reachable_subtrees(&state, &req, std::slice::from_ref(&namespace)).await;
         if wanted.is_empty() {
             return error_response(&ApiError::NotFound(NotFound::namespace(&namespace, "")));
+        }
+        if let Some(resp) =
+            gathered_export(&state, &wanted, "", query.limit(), query.untyped()).await
+        {
+            return resp;
         }
         let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
         return stix_response(crate::stix::export_namespaces(
@@ -1092,6 +1101,18 @@ pub async fn export_stix(
             query.limit(),
             query.untyped(),
         ));
+    }
+
+    if let Some(resp) = gathered_export(
+        &state,
+        std::slice::from_ref(&namespace),
+        "",
+        query.limit(),
+        query.untyped(),
+    )
+    .await
+    {
+        return resp;
     }
 
     let Some(export) = crate::stix::export_namespace(
@@ -1105,6 +1126,45 @@ pub async fn export_stix(
     };
 
     stix_response(export)
+}
+
+/// Every namespace under what was asked for, here and on the mirrors.
+///
+/// [`expand_subtrees`] reads the local catalogue, which is the whole story on
+/// a server that stores things and empty on a router. The galaxy is asked as
+/// well, filtered by what the key may read, so a recursive export means the
+/// same thing wherever it is sent.
+async fn reachable_subtrees(state: &State, req: &HttpRequest, wanted: &[String]) -> Vec<String> {
+    let mut found = expand_subtrees(state, req, wanted);
+
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return found;
+    };
+    let apikey = match api_key(state, req) {
+        Ok(apikey) => apikey,
+        Err(_) => return found,
+    };
+
+    // Asked before the ACL is read, because asking means a request to every
+    // peer: holding the lock across that would stop every write on this
+    // server for as long as the slowest mirror takes to answer.
+    let reachable = galaxy.namespaces_under(wanted).await;
+
+    let acl = state.acl();
+    let allowed = |name: &str| match apikey {
+        None => true,
+        Some(key) => acl.can_read(key, name),
+    };
+    for name in reachable {
+        if crate::db::is_internal(&name) || !allowed(&name) || found.contains(&name) {
+            continue;
+        }
+        found.push(name);
+    }
+    drop(acl);
+
+    found.sort();
+    found
 }
 
 /// The same export, for automation: `POST /_api/stix`.
@@ -1136,7 +1196,7 @@ pub async fn export_stix_api(
     // Expanded after authorizing what was named, so the subtree is reached
     // only through a namespace the key was already allowed to export.
     let wanted = if body.recursive {
-        let found = expand_subtrees(&state, &req, &wanted);
+        let found = reachable_subtrees(&state, &req, &wanted).await;
         if found.is_empty() {
             return error_response(&ApiError::NotFound(NotFound::namespace(&wanted[0], "")));
         }
@@ -1144,6 +1204,13 @@ pub async fn export_stix_api(
     } else {
         wanted
     };
+
+    // Namespaces this server does not hold are exported by the mirrors that
+    // do, and folded in with whatever it exported itself.
+    if let Some(resp) = gathered_export(&state, &wanted, &body.q, body.limit(), body.untyped).await
+    {
+        return resp;
+    }
 
     let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
     let export = crate::stix::export_namespaces(
@@ -1363,6 +1430,188 @@ fn should_forward(
         Some(hops) => Ok(hops),
         None => Err(forward_failed(&crate::galaxy::ForwardError::TooManyHops)),
     })
+}
+
+/// Export namespaces this server does not hold, by asking the mirrors that do.
+///
+/// `None` means everything asked for is here, or there is nowhere to ask. A
+/// router holds nothing, so without this a STIX export through the entry point
+/// answered 404 for data that was one hop away — the same gap bulk reads had.
+///
+/// Each mirror is asked for the namespaces *it* holds, through `/_api/stix`,
+/// and the bundles are folded together by
+/// [`crate::stix::merge_exports`]. Exporting is a read, so each namespace goes
+/// to one mirror rather than all of them; the mirror is chosen the way a
+/// namespace listing is, since an export has no single value to hash.
+async fn gathered_export(
+    state: &State,
+    wanted: &[String],
+    filter: &str,
+    limit: usize,
+    untyped: crate::stix::Untyped,
+) -> Option<HttpResponse> {
+    let elsewhere: Vec<&String> = wanted
+        .iter()
+        .filter(|namespace| !state.db.holds(namespace) && !crate::db::is_internal(namespace))
+        .collect();
+    if elsewhere.is_empty() {
+        return None;
+    }
+    let galaxy = state.galaxy.as_ref()?;
+
+    // Namespaces grouped by the mirror that will serve them, so a mirror is
+    // asked once however many of them it holds.
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+    let mut nowhere: Vec<String> = Vec::new();
+    for namespace in elsewhere {
+        match galaxy.reader_url(namespace, "") {
+            Ok(url) => match grouped.iter_mut().find(|(known, _)| *known == url) {
+                Some((_, names)) => names.push(namespace.clone()),
+                None => grouped.push((url, vec![namespace.clone()])),
+            },
+            // Nobody holds it. Reported as missing, which is what a server
+            // that held none of it would have said.
+            Err(_) => nowhere.push(namespace.clone()),
+        }
+    }
+
+    let mut parts: Vec<crate::stix::Export> = Vec::new();
+
+    // Whatever this server does hold, exported here.
+    let mine: Vec<&str> = wanted
+        .iter()
+        .filter(|namespace| state.db.holds(namespace))
+        .map(String::as_str)
+        .collect();
+    if !mine.is_empty() {
+        parts.push(crate::stix::export_namespaces(
+            &state.db,
+            &state.stix,
+            &mine,
+            filter,
+            limit,
+            untyped,
+        ));
+    }
+
+    if !nowhere.is_empty() {
+        parts.push(crate::stix::Export {
+            bundle: serde_json::json!({}),
+            exported: 0,
+            skipped: Vec::new(),
+            untyped: 0,
+            truncated: false,
+            missing: nowhere,
+            namespaces: 0,
+        });
+    }
+
+    for (url, names) in &grouped {
+        let payload = serde_json::json!({
+            "namespaces": names,
+            "q": filter,
+            "limit": limit,
+            "untyped": matches!(untyped, crate::stix::Untyped::Include),
+        });
+        let body = match serde_json::to_vec(&payload) {
+            Ok(body) => body,
+            Err(e) => {
+                return Some(
+                    HttpResponse::InternalServerError()
+                        .json(Message::new(format!("could not ask {url}: {e}"))),
+                );
+            }
+        };
+
+        match galaxy
+            .forward_to(
+                url,
+                awc::http::Method::POST,
+                "/_api/stix",
+                Some(&body),
+                galaxy.max_hops(),
+                "",
+            )
+            .await
+        {
+            Ok(answer) if (200..300).contains(&answer.status) => match exported_from(&answer) {
+                Some(part) => parts.push(part),
+                None => {
+                    log::warn!("{url} answered an unreadable STIX bundle");
+                    parts.push(unreachable_part(names));
+                }
+            },
+            // A mirror that will not export is not a reason to answer nothing
+            // for the namespaces that did: its share is reported as missing,
+            // which the response already has a field for.
+            Ok(answer) => {
+                log::warn!(
+                    "{url} refused to export {}: {}",
+                    names.join(", "),
+                    answer.status
+                );
+                parts.push(unreachable_part(names));
+            }
+            Err(e) => {
+                log::warn!("Could not ask {url} to export {}: {e}", names.join(", "));
+                parts.push(unreachable_part(names));
+            }
+        }
+    }
+
+    let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    let merged = crate::stix::merge_exports(&names, parts);
+
+    // Nothing anywhere had anything, which is a mistake worth reporting rather
+    // than an empty bundle to be puzzled over. Matches what a single server
+    // does with a namespace that does not exist.
+    if merged.exported == 0 && merged.missing.len() == wanted.len() {
+        return Some(error_response(&ApiError::NotFound(NotFound::namespace(
+            &wanted[0], "",
+        ))));
+    }
+    Some(stix_response(merged))
+}
+
+/// A mirror's bundle, with the counters it reported in headers.
+fn exported_from(answer: &crate::galaxy::Forwarded) -> Option<crate::stix::Export> {
+    let bundle: serde_json::Value = serde_json::from_slice(&answer.body).ok()?;
+    let header = |name: &str| {
+        answer
+            .headers
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    let number = |name: &str| header(name).and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    Some(crate::stix::Export {
+        bundle,
+        exported: number("x-sightingdb-exported"),
+        // The names are not in the header, only the count, and a bundle that
+        // says "3 skipped" without saying which is still worth more than one
+        // that says nothing.
+        skipped: Vec::new(),
+        untyped: number("x-sightingdb-untyped"),
+        truncated: header("x-sightingdb-truncated") == Some("true"),
+        missing: header("x-sightingdb-missing")
+            .map(|list| list.split(',').map(str::to_string).collect())
+            .unwrap_or_default(),
+        namespaces: number("x-sightingdb-namespaces"),
+    })
+}
+
+/// The share of an export a mirror could not provide, as missing namespaces.
+fn unreachable_part(names: &[String]) -> crate::stix::Export {
+    crate::stix::Export {
+        bundle: serde_json::json!({}),
+        exported: 0,
+        skipped: Vec::new(),
+        untyped: 0,
+        truncated: false,
+        missing: names.to_vec(),
+        namespaces: 0,
+    }
 }
 
 fn stix_response(export: crate::stix::Export) -> HttpResponse {

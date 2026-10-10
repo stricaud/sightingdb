@@ -322,6 +322,76 @@ pub fn bundle_of(parts: &[Part<'_>], settings: &Settings, untyped: Untyped) -> E
     }
 }
 
+/// Fold exports of different namespaces into one bundle.
+///
+/// For a galaxy: a server that does not hold a namespace asks the mirror that
+/// does to export it, and combines what comes back with whatever it exported
+/// itself. The result has to be the bundle a single server holding all of them
+/// would have produced, or an export through a load balancer would not be
+/// comparable with an export from a node.
+///
+/// Objects are deduplicated by id. That is sound rather than hopeful: every id
+/// here is derived from what it describes — see [`uuid_for`] — so two mirrors
+/// exporting the same value produce the same indicator id, and the shared
+/// identity and marking objects collapse to one apiece. Nothing is minted per
+/// request, which is also why the bundle id below can be rebuilt from the
+/// namespace list instead of being taken from one of the parts.
+///
+/// The counters add up, except `truncated`, which is true if it was true
+/// anywhere: a bundle that left something out somewhere left something out.
+pub fn merge_exports(namespaces: &[&str], parts: Vec<Export>) -> Export {
+    let mut objects: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut exported = 0usize;
+    let mut untyped = 0usize;
+    let mut counted_namespaces = 0usize;
+    let mut truncated = false;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+
+    for part in parts {
+        exported += part.exported;
+        untyped += part.untyped;
+        counted_namespaces += part.namespaces;
+        truncated |= part.truncated;
+        skipped.extend(part.skipped);
+        for name in part.missing {
+            if !missing.contains(&name) {
+                missing.push(name);
+            }
+        }
+
+        let Some(found) = part.bundle.get("objects").and_then(Value::as_array) else {
+            continue;
+        };
+        for object in found {
+            // An object with no id should not happen; carrying it is better
+            // than dropping it silently.
+            if let Some(id) = object.get("id").and_then(Value::as_str) {
+                if seen.iter().any(|known| known == id) {
+                    continue;
+                }
+                seen.push(id.to_string());
+            }
+            objects.push(object.clone());
+        }
+    }
+
+    Export {
+        bundle: json!({
+            "type": "bundle",
+            "id": format!("bundle--{}", uuid_for(&format!("bundle:{}", namespaces.join(",")))),
+            "objects": objects,
+        }),
+        exported,
+        skipped,
+        untyped,
+        truncated,
+        missing,
+        namespaces: counted_namespaces,
+    }
+}
+
 /// Export one namespace straight from the database.
 ///
 /// Returns `None` if the namespace does not exist. `limit` caps how many values

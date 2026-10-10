@@ -1550,6 +1550,45 @@ impl Galaxy {
         report
     }
 
+    /// Every namespace the peers hold that sits under one of `prefixes`.
+    ///
+    /// For a request about a subtree rather than a namespace — a recursive
+    /// STIX export — on a server that does not hold the subtree. The local
+    /// catalogue answers that question for a node; for a router it is empty,
+    /// and the question has to be put to the mirrors.
+    ///
+    /// Matching is on whole path segments, the same rule
+    /// [`crate::db::Database::namespaces_under`] uses, so `misp` covers
+    /// `misp/ips` and never `misp-internal`. An empty prefix matches
+    /// everything, which is what exporting `/` means.
+    ///
+    /// A peer that cannot be reached contributes nothing. Half a subtree is
+    /// reported through the export's own `missing` rather than failing here:
+    /// what is being asked is what exists, and an unreachable mirror does not
+    /// make the rest of the answer wrong.
+    pub async fn namespaces_under(&self, prefixes: &[String]) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for peer in &self.peers() {
+            let Ok(names) = self.namespaces_of(peer).await else {
+                continue;
+            };
+            for name in names {
+                let under = prefixes.iter().any(|prefix| {
+                    let prefix = prefix.trim_matches('/');
+                    prefix.is_empty()
+                        || name == prefix
+                        || name
+                            .strip_prefix(prefix)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                });
+                if under && !found.contains(&name) {
+                    found.push(name);
+                }
+            }
+        }
+        found
+    }
+
     /// The namespaces a peer holds that fall under what we store.
     async fn namespaces_of(&self, peer: &Peer) -> Result<Vec<String>, ForwardError> {
         let answer = self
