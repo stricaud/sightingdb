@@ -463,6 +463,14 @@ paths:
               schema: { $ref: "#/components/schemas/StixBundle" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: >-
+            A mirror holds the namespace and could not be reached. Distinct
+            from 404, which means no server in the galaxy has it: only one of
+            the two is worth retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
 
   /_api/merge:
     post:
@@ -612,6 +620,14 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404":
           description: None of the namespaces asked for exist
+        "502":
+          description: >-
+            A mirror holds what was asked for and could not be reached.
+            Distinct from 404, which means no server in the galaxy has it:
+            only one of the two is worth retrying.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
 
   # -------------------------------------------------------------------------
   # Storage

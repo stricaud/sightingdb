@@ -1487,6 +1487,23 @@ copy to change, so the value is fetched from a mirror, changed, and offered back
 to all of them. The interface therefore behaves the same whether it is pointed
 at a router or at a node.
 
+### Exporting through a router
+
+A STIX export is gathered the same way: each namespace is exported by the
+mirror that holds it, and the bundles are folded into one. The result is
+**byte-identical** to what the mirror would have answered on its own, including
+for a subtree spanning several mirrors — ids are derived from what they
+describe rather than minted per request, so duplicate objects collapse and the
+bundle id is rebuilt from the namespace list. That is what makes an export
+through a load balancer comparable with one from a node rather than merely
+similar.
+
+A namespace nobody holds is `404`. A namespace a mirror holds but that cannot
+be reached is `502`: "there is no such namespace" and "the server that has it
+is down" are different answers, and only one of them is worth retrying. When
+part of an export could be gathered, the bundle carries what there was and
+`X-SightingDB-Missing` names the rest.
+
 ### Bulk reads through a router
 
 `/rb` and `/rbs` are gathered from the mirrors that hold each item, grouped by

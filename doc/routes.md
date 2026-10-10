@@ -476,6 +476,27 @@ Each value becomes an `indicator` plus a `sighting` that refers to it; the
 namespace travels as `x_sightingdb_namespace`. A `tlp:` tag becomes a
 `marking-definition` referenced from the objects it applies to.
 
+**Through a router**, each namespace is exported by the mirror that holds it
+and the bundles are folded together. The result is byte-identical to what the
+mirror would have answered on its own — ids here are derived from what they
+describe rather than minted per request, so duplicate objects collapse and the
+bundle id is rebuilt from the namespace list. That holds for a subtree spanning
+several mirrors too, which is what makes an export through a load balancer
+comparable with one from a node rather than merely similar.
+
+Exporting is a read, so each namespace goes to one mirror rather than all of
+them. A namespace nobody holds is `404`; a namespace a mirror holds but that
+cannot be reached is `502`, because "there is no such namespace" and "the
+server that has it is down" are different answers and only one of them is worth
+retrying:
+
+	{"message":"No mirror holding feeds/ips could be asked to export it. It
+	 exists in this galaxy; this server could not reach what holds it."}
+
+When only part of an export could be gathered, the bundle carries what there
+was and `X-SightingDB-Missing` names the rest, so a partial answer says it is
+partial.
+
 `?limit=<n>` caps how many values go into the bundle — default 10000, clamped
 to 100000. A bundle is read by a machine, but it is still one response held in
 memory.
