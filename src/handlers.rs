@@ -1511,7 +1511,13 @@ async fn gathered_export(
             "namespaces": names,
             "q": filter,
             "limit": limit,
-            "untyped": matches!(untyped, crate::stix::Untyped::Include),
+            // The wire form of `Untyped`, lowercase, not a boolean: sending a
+            // boolean here is a 400 from the mirror, which looked exactly like
+            // a mirror that had nothing.
+            "untyped": match untyped {
+                crate::stix::Untyped::Include => "include",
+                crate::stix::Untyped::Skip => "skip",
+            },
         });
         let body = match serde_json::to_vec(&payload) {
             Ok(body) => body,
