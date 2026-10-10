@@ -2287,6 +2287,226 @@ mod tests {
         assert_eq!(body["items"].as_array().unwrap().len(), 3);
     }
 
+    // -- the tag vocabulary -------------------------------------------------
+
+    /// State with a real tags_file and some tagged values, so the table has
+    /// something to count.
+    fn tagged_state(dir: &std::path::Path) -> State {
+        let mut inner = SharedState::new(true);
+        inner.acl.get_mut().unwrap().grant_full(ADMIN);
+        inner.tags_file = Some(dir.join("tags.toml"));
+        inner.db.write_tagged(
+            "feeds/ips",
+            "1.1.1.1",
+            chrono::Utc::now(),
+            None,
+            "tlp:green,stix-type:ipv4-addr",
+        );
+        inner.db.write_tagged(
+            "feeds/ips",
+            "2.2.2.2",
+            chrono::Utc::now(),
+            None,
+            "tlp:green,home-grown",
+        );
+        web::Data::new(inner)
+    }
+
+    fn row<'a>(body: &'a Json, name: &str) -> &'a Json {
+        body["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("no row for {name} in {body}"))
+    }
+
+    /// The table shows what is defined *and* what turned up on values, because
+    /// a feed brings tags nobody defined and those are the ones worth seeing.
+    #[actix_web::test]
+    async fn the_tags_table_lists_defined_and_merely_seen_tags() {
+        let dir = TempDir::new("tags-list");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let resp = get!(app, "/_management/api/tags", Some(ADMIN));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Json = test::read_body_json(resp).await;
+
+        // Defined by the seed, and in use.
+        assert_eq!(row(&body, "tlp:green")["used"], 2);
+        assert_eq!(row(&body, "tlp:green")["defined"], true);
+        // On a value, defined by nobody.
+        assert_eq!(row(&body, "home-grown")["used"], 1);
+        assert_eq!(row(&body, "home-grown")["defined"], false);
+        // Defined and unused: still listed, with no count.
+        assert_eq!(row(&body, "tlp:amber")["used"], Json::Null);
+        assert_eq!(body["editable"], true);
+    }
+
+    /// A family's count is everything under it, which is the only number that
+    /// means anything for a name no value carries literally.
+    #[actix_web::test]
+    async fn a_family_counts_the_tags_beneath_it() {
+        let dir = TempDir::new("tags-family");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let body: Json = test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        assert_eq!(row(&body, "stix-type:")["family"], true);
+        assert_eq!(row(&body, "stix-type:")["used"], 1);
+    }
+
+    /// A definition lands on disk and takes effect at once, like a key.
+    #[actix_web::test]
+    async fn a_defined_tag_is_written_and_adopted() {
+        let dir = TempDir::new("tags-define");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/tags/vocabulary")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({
+                    "name": "home-grown",
+                    "colour": "#AA33CC",
+                    "description": "Ours, not from a feed."
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Answered with the whole table, so the interface need not refetch.
+        let body: Json = test::read_body_json(resp).await;
+        assert_eq!(row(&body, "home-grown")["defined"], true);
+        assert_eq!(row(&body, "home-grown")["colour"], "#aa33cc");
+        assert_eq!(row(&body, "home-grown")["used"], 1, "it was already in use");
+
+        let written = std::fs::read_to_string(dir.0.join("tags.toml")).expect("the file");
+        assert!(written.contains("home-grown"), "{written}");
+        assert!(written.contains("#aa33cc"), "{written}");
+        // In effect without a restart.
+        assert_eq!(
+            st.tags
+                .read()
+                .unwrap()
+                .colour_of("home-grown"),
+            Some("#aa33cc")
+        );
+    }
+
+    /// Removing a colour must not remove the tag from the values, which would
+    /// make a colour picker delete data.
+    #[actix_web::test]
+    async fn undefining_a_tag_leaves_it_on_the_values() {
+        let dir = TempDir::new("tags-undefine");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/_management/api/tags/vocabulary?tag=tlp:green")
+                .insert_header(("Authorization", ADMIN))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: Json = test::read_body_json(resp).await;
+        // Still in the table, because values still carry it -- just undefined.
+        assert_eq!(row(&body, "tlp:green")["defined"], false);
+        assert_eq!(row(&body, "tlp:green")["used"], 2);
+
+        let view = st.db.view("feeds/ips", "1.1.1.1", 0, false).expect("value");
+        assert!(
+            view.tags.contains("tlp:green"),
+            "the tag was taken off the value: {}",
+            view.tags
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_tag_that_was_never_defined_cannot_be_undefined() {
+        let dir = TempDir::new("tags-missing");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/_management/api/tags/vocabulary?tag=never-existed")
+                .insert_header(("Authorization", ADMIN))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Without a `tags_file` the colours are read-only, and the interface is
+    /// told so rather than finding out when a save fails.
+    #[actix_web::test]
+    async fn colours_are_read_only_without_a_tags_file() {
+        let st = state();
+        let app = app!(st);
+
+        let body: Json = test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        assert_eq!(body["editable"], false);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/tags/vocabulary")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"name": "x", "colour": "#ffffff"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: Json = test::read_body_json(resp).await;
+        assert!(
+            body["message"].as_str().unwrap().contains("tags_file"),
+            "the refusal should name the setting: {body}"
+        );
+    }
+
+    /// The vocabulary is server-wide, so a key that cannot read everywhere
+    /// would learn from the counts which tags exist in namespaces it has no
+    /// access to.
+    #[actix_web::test]
+    async fn a_scoped_key_sees_no_usage_counts() {
+        let dir = TempDir::new("tags-scoped");
+        let st = tagged_state(&dir.0);
+        st.acl
+            .write()
+            .unwrap()
+            .set("scoped", parse_grants("admin, rw:other").unwrap());
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some("scoped"))).await;
+        assert_eq!(
+            row(&body, "tlp:green")["used"],
+            Json::Null,
+            "a scoped key was told how many values carry a tag"
+        );
+        // The vocabulary itself is not a secret.
+        assert_eq!(row(&body, "tlp:green")["defined"], true);
+    }
+
+    #[actix_web::test]
+    async fn the_tags_table_needs_a_key() {
+        let st = state();
+        let app = app!(st);
+        assert_eq!(
+            get!(app, "/_management/api/tags", NO_KEY).status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
     // -- key management ----------------------------------------------------
 
     /// State with a real acl_file, so saves actually hit the disk.
