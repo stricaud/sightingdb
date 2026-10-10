@@ -32,6 +32,9 @@ pub struct SharedState {
     /// Values that were not written, from every path that writes. See
     /// [`crate::rejections`] for why this is bounded and in memory.
     pub rejections: crate::rejections::Rejections,
+    /// The other servers this one knows about, and whether they answer.
+    /// `None` when it stands alone.
+    pub galaxy: Option<crate::galaxy::Galaxy>,
 }
 
 impl SharedState {
@@ -52,6 +55,7 @@ impl SharedState {
             stix: crate::config::StixSettings::default(),
             started: std::time::Instant::now(),
             rejections: crate::rejections::Rejections::default(),
+            galaxy: None,
         }
     }
 }
@@ -111,6 +115,9 @@ pub struct ReadQuery {
     /// Present at any value to answer with how many values the namespace holds
     /// instead of the values themselves.
     count: Option<String>,
+    /// Present at any value to answer in the shape `POST /_api/merge` takes,
+    /// so a sync reads from one server and posts to another unchanged.
+    for_merge: Option<String>,
 }
 
 /// How many values a namespace holds, for `/r/<namespace>?count`.
@@ -228,6 +235,12 @@ pub struct BulkSighting {
 struct WriteResponse {
     message: &'static str,
     count: u64,
+    /// Whether this was the first sighting of the value in this namespace.
+    ///
+    /// Reported because a server in front of this one cannot work it out: it
+    /// is what decides a consensus increment, and answering it needs the
+    /// namespace, which a router does not hold.
+    new: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -252,6 +265,80 @@ struct BulkWriteResponse {
     /// clients read it. Every entry here also appears in `items`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<BulkWriteError>,
+}
+
+/// A batch of peers' copies, for `POST /_api/merge`.
+#[derive(Debug, Deserialize)]
+pub struct MergeRequest {
+    pub items: Vec<MergeItem>,
+}
+
+/// One value as a peer holds it.
+///
+/// The fields are spelled out rather than flattening [`crate::attribute::Merge`]
+/// into them. `serde`'s `flatten` buffers through an intermediate that cannot
+/// coerce JSON's string object keys back to the `i64` hours in `stats`, so a
+/// payload read straight from `/r?for_merge` would be refused by the route
+/// meant to take it.
+#[derive(Debug, Deserialize)]
+pub struct MergeItem {
+    pub namespace: String,
+    pub value: String,
+    pub counts: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub stats: std::collections::BTreeMap<String, std::collections::BTreeMap<i64, u64>>,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub ttl: u64,
+}
+
+impl MergeItem {
+    fn state(&self) -> crate::attribute::Merge {
+        crate::attribute::Merge {
+            counts: self.counts.clone(),
+            stats: self.stats.clone(),
+            first_seen: self.first_seen,
+            last_seen: self.last_seen,
+            tags: self.tags.clone(),
+            ttl: self.ttl,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MergeResponse {
+    message: &'static str,
+    /// Items that changed the local copy. An item that changed nothing is a
+    /// success, not a failure: during catch-up it is how a caller learns it
+    /// has converged.
+    changed: usize,
+    items: Vec<MergeResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<BulkWriteError>,
+}
+
+#[derive(Debug, Serialize)]
+struct MergeResult {
+    index: usize,
+    namespace: String,
+    value: String,
+    /// `"ok"` or `"error"`.
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changed: Option<bool>,
+    /// The total after merging, so a caller can see where the value stands
+    /// without reading it back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<u64>,
+    /// Entries for this server's own id that were ignored. Non-zero means the
+    /// sender is confused about who it is talking to, which is worth seeing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ignored_self: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// What a dry run found, in the shape `/wb` would have answered with.
@@ -284,6 +371,10 @@ struct BulkWriteItem {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<u64>,
+    /// Whether this was the first sighting of the value in this namespace.
+    /// Absent on an item that was not written, and on a dry run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -472,6 +563,7 @@ pub async fn help() -> impl Responder {
             "\t/w: write (GET)\n",
             "\t/wb: write in bulk mode (POST)\n",
             "\t/vwb: check a bulk write without recording it (POST)\n",
+            "\t/_api/merge: fold a peer's copy of values into ours (POST)\n",
             "\t/r: read (GET)\n",
             "\t/rs: read with statistics (GET)\n",
             "\t/rb: read in bulk mode (POST)\n",
@@ -536,7 +628,11 @@ pub async fn read(
     query: web::Query<ReadQuery>,
     req: HttpRequest,
 ) -> HttpResponse {
-    do_read(&state, &req, &path.into_inner(), &query, false)
+    let namespace = path.into_inner();
+    if let Some(resp) = forwarded_read(&state, &req, &namespace, &query).await {
+        return resp;
+    }
+    do_read(&state, &req, &namespace, &query, false)
 }
 
 pub async fn read_with_stats(
@@ -545,7 +641,53 @@ pub async fn read_with_stats(
     query: web::Query<ReadQuery>,
     req: HttpRequest,
 ) -> HttpResponse {
-    do_read(&state, &req, &path.into_inner(), &query, true)
+    let namespace = path.into_inner();
+    if let Some(resp) = forwarded_read(&state, &req, &namespace, &query).await {
+        return resp;
+    }
+    do_read(&state, &req, &namespace, &query, true)
+}
+
+/// Pass a read to the mirror that should serve it, if this server does not.
+///
+/// `None` means answer it here. The authorization happens before this, in
+/// [`do_read`]'s caller chain — so a refusal is this server's, not a peer's.
+async fn forwarded_read(
+    state: &State,
+    req: &HttpRequest,
+    namespace: &str,
+    query: &ReadQuery,
+) -> Option<HttpResponse> {
+    if let Err(resp) = authorize(state, req, namespace, Access::Read) {
+        return Some(resp);
+    }
+
+    let hops = match should_forward(state, req, namespace)? {
+        Ok(hops) => hops,
+        Err(resp) => return Some(resp),
+    };
+    let galaxy = state.galaxy.as_ref()?;
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+
+    // Read from one mirror, chosen by the value so the same value always comes
+    // from the same place while the mirror set is unchanged. Without that,
+    // consecutive reads could land on mirrors at different stages of catching
+    // up and show a count going down.
+    //
+    // A namespace listing has no value to choose by, so it goes to whichever
+    // mirror the empty string picks — consistently, which is the property that
+    // matters.
+    let value = query.val.as_deref().unwrap_or("");
+    Some(
+        match galaxy.forward_read(namespace, value, &path, hops, "").await {
+            Ok(answer) => relayed(answer),
+            Err(e) => forward_failed(&e),
+        },
+    )
 }
 
 fn do_read(
@@ -574,6 +716,20 @@ fn do_read(
                 count,
             }),
             None => error_response(&ApiError::NotFound(NotFound::namespace(namespace, ""))),
+        };
+    }
+
+    // The read side of /_api/merge. Answered before the ordinary read because
+    // it is a different shape, not a variation on one: per-node counts rather
+    // than the sum, which is the whole reason it exists.
+    if query.for_merge.is_some() {
+        let Some(value) = query.val.as_deref() else {
+            return HttpResponse::BadRequest()
+                .json(Message::new("for_merge answers about one value. Add val=."));
+        };
+        return match state.db.merge_payload(namespace, value) {
+            Some(payload) => HttpResponse::Ok().json(payload),
+            None => error_response(&ApiError::NotFound(NotFound::value(namespace, value))),
         };
     }
 
@@ -608,6 +764,53 @@ pub async fn write(
         return resp;
     }
 
+    // Not ours to store: pass it to every mirror that holds it.
+    //
+    // Fanned out rather than sent to one, because a write that reached only
+    // one mirror is a write the others have to catch up — and catch-up is
+    // repair, not the normal path. One mirror refusing is not a lost write
+    // though: the mirror that took it is what the others converge from.
+    if let Some(hops) = should_forward(&state, &req, &namespace) {
+        let hops = match hops {
+            Ok(hops) => hops,
+            Err(resp) => return resp,
+        };
+        let galaxy = state.galaxy.as_ref().expect("checked by should_forward");
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_default();
+
+        return match galaxy
+            .forward_write(
+                &namespace,
+                awc::http::Method::GET,
+                &path,
+                None,
+                hops,
+                &origin_to_send(&state, &req),
+            )
+            .await
+        {
+            Err(e) => forward_failed(&e),
+            Ok(answers) => {
+                // The first mirror that accepted it answers the client. Its
+                // count is that mirror's view, which is what any single server
+                // can honestly report.
+                let accepted = answers
+                    .into_iter()
+                    .find(|(_, answer)| (200..300).contains(&answer.status));
+                match accepted {
+                    Some((_, answer)) => relayed(answer),
+                    None => forward_failed(&crate::galaxy::ForwardError::AllDown {
+                        namespace: namespace.clone(),
+                    }),
+                }
+            }
+        };
+    }
+
     let Some(value) = query.val.as_deref() else {
         return HttpResponse::BadRequest().json(Message::new(
             "Did not receive a val= argument in the query string.",
@@ -631,10 +834,21 @@ pub async fn write(
     };
 
     let tags = query.tags.as_deref().unwrap_or_default();
-    match sighting_writer::write_tagged(&state.db, &namespace, value, when, query.ttl, tags) {
-        Ok(count) => HttpResponse::Ok().json(WriteResponse {
+    // Counted for whoever forwarded it, if anyone did.
+    let origin = crate::galaxy::origin_of(&req);
+    match sighting_writer::write_tagged_as(
+        &state.db,
+        origin.as_deref(),
+        &namespace,
+        value,
+        when,
+        query.ttl,
+        tags,
+    ) {
+        Ok(written) => HttpResponse::Ok().json(WriteResponse {
             message: "ok",
-            count,
+            count: written.count,
+            new: written.new,
         }),
         Err(e) => {
             state.rejections.record(
@@ -791,6 +1005,71 @@ fn expand_subtrees(state: &SharedState, req: &HttpRequest, wanted: &[String]) ->
     found
 }
 
+/// Relay a peer's answer to our client, unchanged.
+///
+/// The peer's status and body are passed through rather than reinterpreted: a
+/// `404` from the server that holds the value means the same thing to the
+/// client as if it had asked directly, and rewriting it would only lose
+/// detail.
+fn relayed(answer: crate::galaxy::Forwarded) -> HttpResponse {
+    let status = actix_web::http::StatusCode::from_u16(answer.status)
+        .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
+    HttpResponse::build(status)
+        .insert_header(("X-SightingDB-Forwarded", "1"))
+        .content_type("application/json")
+        .body(answer.body)
+}
+
+/// What to answer when a request could not be forwarded.
+///
+/// `NoHolder` is the galaxy-wide version of 421: nowhere in reach stores this,
+/// which is neither forbidden nor missing. Everything else is a `502` — the
+/// request was this server's to pass on and it could not.
+fn forward_failed(e: &crate::galaxy::ForwardError) -> HttpResponse {
+    use crate::galaxy::ForwardError;
+    let status = match e {
+        ForwardError::NoHolder => actix_web::http::StatusCode::MISDIRECTED_REQUEST,
+        ForwardError::TooManyHops => actix_web::http::StatusCode::LOOP_DETECTED,
+        _ => actix_web::http::StatusCode::BAD_GATEWAY,
+    };
+    log::warn!("Could not forward: {e}");
+    HttpResponse::build(status).json(Message::new(e.to_string()))
+}
+
+/// Who a write this server is about to forward should be counted for.
+///
+/// Whatever arrived, so a cascade preserves the entry point the client talked
+/// to; failing that, this server, because it is the entry point.
+fn origin_to_send(state: &SharedState, req: &HttpRequest) -> String {
+    crate::galaxy::origin_of(req).unwrap_or_else(|| state.db.node().to_string())
+}
+
+/// Whether this server should pass a request for `namespace` along, and with
+/// how many hops left.
+///
+/// `None` means handle it here: either this server stores the namespace, or it
+/// has no galaxy to pass it to. `Some(hops)` means forward.
+fn should_forward(
+    state: &SharedState,
+    req: &HttpRequest,
+    namespace: &str,
+) -> Option<Result<u8, HttpResponse>> {
+    if state.db.holds(namespace) {
+        return None;
+    }
+    let galaxy = state.galaxy.as_ref()?;
+    // An internal namespace is this server's own and is never someone else's
+    // to answer for.
+    if crate::db::is_internal(namespace) {
+        return None;
+    }
+
+    Some(match crate::galaxy::hops_left(req, galaxy.max_hops()) {
+        Some(hops) => Ok(hops),
+        None => Err(forward_failed(&crate::galaxy::ForwardError::TooManyHops)),
+    })
+}
+
 fn stix_response(export: crate::stix::Export) -> HttpResponse {
     let mut response = HttpResponse::Ok();
     response
@@ -812,8 +1091,10 @@ pub async fn delete(state: State, path: web::Path<String>, req: HttpRequest) -> 
         return resp;
     }
 
-    if namespace.starts_with(CONFIG_PREFIX) {
-        return error_response(&ApiError::ConfigNamespace);
+    // Deleting is a write. `/d/_all` would discard every consensus tally the
+    // database holds, which is exactly the damage the write guard prevents.
+    if crate::db::is_internal(&namespace) {
+        return error_response(&ApiError::InternalNamespace(namespace));
     }
 
     if state.db.delete(&namespace) {
@@ -900,7 +1181,7 @@ fn check_item(
         return ItemCheck::Refused(message);
     }
 
-    if let Err(e) = sighting_writer::check(&item.namespace, &item.value) {
+    if let Err(e) = sighting_writer::check(&state.db, &item.namespace, &item.value) {
         return ItemCheck::Invalid(e.to_string());
     }
 
@@ -924,6 +1205,49 @@ pub async fn write_bulk(
         Err(resp) => return resp,
     };
 
+    // Namespaces in this batch that this server does not store. If any, the
+    // batch goes to the peers that do — unchanged, so their per-item answers
+    // line up with ours by index.
+    let elsewhere: Vec<String> = body
+        .items
+        .iter()
+        .map(|item| item.namespace.clone())
+        .filter(|namespace| !state.db.holds(namespace) && !crate::db::is_internal(namespace))
+        .collect();
+
+    if !elsewhere.is_empty()
+        && let Some(galaxy) = state.galaxy.as_ref()
+    {
+        let hops = match crate::galaxy::hops_left(&req, galaxy.max_hops()) {
+            Some(hops) => hops,
+            None => return forward_failed(&crate::galaxy::ForwardError::TooManyHops),
+        };
+        let payload = match serde_json::to_vec(&*body) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                    .json(Message::new(format!("could not forward the batch: {e}")));
+            }
+        };
+
+        match galaxy
+            .forward_batch(
+                &elsewhere,
+                "/wb",
+                &payload,
+                hops,
+                &origin_to_send(&state, &req),
+            )
+            .await
+        {
+            Err(e) => return forward_failed(&e),
+            Ok(answers) => {
+                return merged_batch(&state, &req, apikey, &body, answers).await;
+            }
+        }
+    }
+
+    let origin = crate::galaxy::origin_of(&req);
     let mut items = Vec::with_capacity(body.items.len());
     let mut errors = Vec::new();
     let mut written = 0usize;
@@ -934,8 +1258,9 @@ pub async fn write_bulk(
             // The check has already ruled out everything `write_tagged` can
             // refuse, so this cannot fail; if it ever does, the error is
             // reported rather than swallowed.
-            ItemCheck::Ok(when) => sighting_writer::write_tagged(
+            ItemCheck::Ok(when) => sighting_writer::write_tagged_as(
                 &state.db,
+                origin.as_deref(),
                 &item.namespace,
                 &item.value,
                 when,
@@ -951,14 +1276,15 @@ pub async fn write_bulk(
         };
 
         match outcome {
-            Ok(count) => {
+            Ok(done) => {
                 written += 1;
                 items.push(BulkWriteItem {
                     index,
                     namespace: item.namespace.clone(),
                     value: item.value.clone(),
                     status: "ok",
-                    count: Some(count),
+                    count: Some(done.count),
+                    new: Some(done.new),
                     error: None,
                 });
             }
@@ -980,6 +1306,7 @@ pub async fn write_bulk(
                     value: item.value.clone(),
                     status: "error",
                     count: None,
+                    new: None,
                     error: Some(message),
                 });
             }
@@ -1011,6 +1338,151 @@ pub async fn write_bulk(
         items,
         errors,
     })
+}
+
+/// Combine what this server wrote with what the mirrors said.
+///
+/// Items this server stores are written here; the rest were sent to the peers
+/// that hold them, which answered per item in the same order. An item counts
+/// as written if *anywhere* took it — the mirror that did is what the others
+/// catch up from, so one refusal is not a lost sighting.
+async fn merged_batch(
+    state: &State,
+    req: &HttpRequest,
+    apikey: Option<&str>,
+    body: &BulkRequest,
+    answers: Vec<(String, crate::galaxy::Forwarded)>,
+) -> HttpResponse {
+    // Each peer's items array, parsed once.
+    let peer_items: Vec<Vec<serde_json::Value>> = answers
+        .iter()
+        .filter_map(|(_, answer)| {
+            let parsed: serde_json::Value = serde_json::from_slice(&answer.body).ok()?;
+            parsed.get("items")?.as_array().cloned()
+        })
+        .collect();
+
+    let mut items = Vec::with_capacity(body.items.len());
+    let mut errors = Vec::new();
+    let mut written = 0usize;
+
+    for (index, item) in body.items.iter().enumerate() {
+        // Ours to store: write it here.
+        if state.db.holds(&item.namespace) || crate::db::is_internal(&item.namespace) {
+            let outcome = match check_item(state, req, apikey, item) {
+                ItemCheck::Ok(when) => sighting_writer::write_tagged_as(
+                    &state.db,
+                    crate::galaxy::origin_of(req).as_deref(),
+                    &item.namespace,
+                    &item.value,
+                    when,
+                    item.ttl,
+                    &item.tags,
+                )
+                .map_err(|e| e.to_string()),
+                ItemCheck::Refused(message) | ItemCheck::Invalid(message) => Err(message),
+            };
+            match outcome {
+                Ok(done) => {
+                    written += 1;
+                    items.push(BulkWriteItem {
+                        index,
+                        namespace: item.namespace.clone(),
+                        value: item.value.clone(),
+                        status: "ok",
+                        count: Some(done.count),
+                        new: Some(done.new),
+                        error: None,
+                    });
+                }
+                Err(message) => {
+                    state.rejections.record(
+                        &item.namespace,
+                        &item.value,
+                        &message,
+                        crate::rejections::Source::BulkWrite,
+                    );
+                    errors.push(BulkWriteError {
+                        namespace: item.namespace.clone(),
+                        value: item.value.clone(),
+                        error: message.clone(),
+                    });
+                    items.push(BulkWriteItem {
+                        index,
+                        namespace: item.namespace.clone(),
+                        value: item.value.clone(),
+                        status: "error",
+                        count: None,
+                        new: None,
+                        error: Some(message),
+                    });
+                }
+            }
+            continue;
+        }
+
+        // Someone else's: take the first mirror that accepted it.
+        let accepted = peer_items
+            .iter()
+            .filter_map(|answer| answer.get(index))
+            .find(|entry| entry.get("status").and_then(|s| s.as_str()) == Some("ok"));
+
+        match accepted {
+            Some(entry) => {
+                written += 1;
+                items.push(BulkWriteItem {
+                    index,
+                    namespace: item.namespace.clone(),
+                    value: item.value.clone(),
+                    status: "ok",
+                    count: entry.get("count").and_then(|c| c.as_u64()),
+                    new: entry.get("new").and_then(|n| n.as_bool()),
+                    error: None,
+                });
+            }
+            None => {
+                // Whatever the mirrors said, or nothing if none answered about
+                // it at all.
+                let message = peer_items
+                    .iter()
+                    .filter_map(|answer| answer.get(index))
+                    .find_map(|entry| entry.get("error").and_then(|e| e.as_str()))
+                    .unwrap_or("no server holding this namespace accepted it")
+                    .to_string();
+                errors.push(BulkWriteError {
+                    namespace: item.namespace.clone(),
+                    value: item.value.clone(),
+                    error: message.clone(),
+                });
+                items.push(BulkWriteItem {
+                    index,
+                    namespace: item.namespace.clone(),
+                    value: item.value.clone(),
+                    status: "error",
+                    count: None,
+                    new: None,
+                    error: Some(message),
+                });
+            }
+        }
+    }
+
+    let (status, message) = if errors.is_empty() {
+        (actix_web::http::StatusCode::OK, "ok")
+    } else if written > 0 {
+        (actix_web::http::StatusCode::OK, "partial")
+    } else {
+        (actix_web::http::StatusCode::BAD_REQUEST, "failed")
+    };
+
+    HttpResponse::build(status)
+        .insert_header(("X-SightingDB-Forwarded", "1"))
+        .json(BulkWriteResponse {
+            message,
+            written,
+            items,
+            errors,
+        })
 }
 
 /// `POST /vwb` — would this batch be accepted?
@@ -1055,8 +1527,10 @@ pub async fn validate_bulk(
                     namespace: item.namespace.clone(),
                     value: item.value.clone(),
                     status: "ok",
-                    // No sighting was recorded, so there is no count to give.
+                    // Nothing was recorded, so there is no count to give and
+                    // no answer to whether it would have been the first.
                     count: None,
+                    new: None,
                     error: None,
                 });
                 continue;
@@ -1079,6 +1553,7 @@ pub async fn validate_bulk(
             value: item.value.clone(),
             status: "error",
             count: None,
+            new: None,
             error: Some(message),
         });
     }
@@ -1104,6 +1579,110 @@ pub async fn validate_bulk(
     })
 }
 
+/// `POST /_api/merge` — fold peers' copies of values into ours.
+///
+/// This is how a galaxy syncs. Unlike `/w` it is **not a sighting**: nothing is
+/// counted here. The sender states what each server has seen, and each field is
+/// combined by a rule that does not care about order or repetition, so the same
+/// merge can be sent twice, or two peers' copies can arrive either way round,
+/// and the result is the same. See [`crate::attribute::Attribute::merge`].
+///
+/// That is the whole reason this route exists rather than reusing `/wb`. `/w`
+/// means "add one"; replaying it doubles the count. Measured on two instances
+/// before this existed: three sightings became nine after two rounds of
+/// read-the-peer-and-write-it-back.
+///
+/// Authorized as a write, because it changes stored data: the same ACL, the
+/// same refusal of internal namespaces, and the same 421 for a namespace this
+/// server does not store. A peer's key therefore bounds what it can merge here
+/// exactly as it bounds what it can write.
+///
+/// An entry naming *this* server is ignored. A peer does not get to say what
+/// this server has seen.
+pub async fn merge(state: State, body: web::Json<MergeRequest>, req: HttpRequest) -> HttpResponse {
+    let apikey = match api_key(&state, &req) {
+        Ok(apikey) => apikey,
+        Err(resp) => return resp,
+    };
+
+    let mut items = Vec::with_capacity(body.items.len());
+    let mut errors = Vec::new();
+    let mut changed = 0usize;
+    let mut refusals = 0usize;
+    let mut failures = 0usize;
+
+    for (index, item) in body.items.iter().enumerate() {
+        // The ACL first, then everything the writer itself would refuse —
+        // internal namespaces, and namespaces this server does not store.
+        // Counted separately because an all-refused batch answers 403 while a
+        // batch that failed for mixed reasons answers 400.
+        let refusal = if let Some(message) =
+            refusal_for(&state, &req, apikey, &item.namespace, Access::Write)
+        {
+            refusals += 1;
+            Some(message)
+        } else {
+            sighting_writer::check(&state.db, &item.namespace, &item.value)
+                .err()
+                .map(|e| e.to_string())
+        };
+
+        if let Some(message) = refusal {
+            failures += 1;
+            errors.push(BulkWriteError {
+                namespace: item.namespace.clone(),
+                value: item.value.clone(),
+                error: message.clone(),
+            });
+            items.push(MergeResult {
+                index,
+                namespace: item.namespace.clone(),
+                value: item.value.clone(),
+                status: "error",
+                changed: None,
+                count: None,
+                ignored_self: None,
+                error: Some(message),
+            });
+            continue;
+        }
+
+        let outcome = state.db.merge(&item.namespace, &item.value, &item.state());
+        if outcome.changed {
+            changed += 1;
+        }
+        items.push(MergeResult {
+            index,
+            namespace: item.namespace.clone(),
+            value: item.value.clone(),
+            status: "ok",
+            changed: Some(outcome.changed),
+            count: Some(outcome.count),
+            ignored_self: Some(outcome.ignored_self),
+            error: None,
+        });
+    }
+
+    // The same rule the write routes use, so a peer can treat the three alike.
+    let accepted = body.items.len() - failures;
+    let (status, message) = if failures == 0 {
+        (actix_web::http::StatusCode::OK, "ok")
+    } else if accepted > 0 {
+        (actix_web::http::StatusCode::OK, "partial")
+    } else if refusals == failures {
+        (actix_web::http::StatusCode::FORBIDDEN, "failed")
+    } else {
+        (actix_web::http::StatusCode::BAD_REQUEST, "failed")
+    };
+
+    HttpResponse::build(status).json(MergeResponse {
+        message,
+        changed,
+        items,
+        errors,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
@@ -1117,6 +1696,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/w/{namespace:.*}", web::get().to(write))
         .route("/wb", web::post().to(write_bulk))
         .route("/vwb", web::post().to(validate_bulk))
+        .route("/_api/merge", web::post().to(merge))
         .route("/d/{namespace:.*}", web::get().to(delete))
         .route("/stix/{namespace:.*}", web::get().to(export_stix))
         .route("/_api/stix", web::post().to(export_stix_api))
@@ -1160,6 +1740,16 @@ mod tests {
 
     fn state(authenticate: bool) -> State {
         web::Data::new(SharedState::new(authenticate))
+    }
+
+    /// A state whose database only stores the given namespace prefixes.
+    fn narrowed(prefixes: &[&str]) -> State {
+        let mut inner = SharedState::new(false);
+        inner.db = crate::db::Database::with_storage(
+            crate::db::DatabasePolicy::default(),
+            crate::db::StoragePolicy::from_prefixes(prefixes),
+        );
+        web::Data::new(inner)
     }
 
     macro_rules! app {
@@ -1738,6 +2328,813 @@ mod tests {
         );
     }
 
+    /// Every write route refuses the internal namespaces, and the refusal is
+    /// not merely cosmetic: nothing lands.
+    ///
+    /// `_all` is the one that matters. Before this guard a client could write
+    /// it directly and give a value a consensus no namespace supported — the
+    /// one number this database exists to be trusted about.
+    #[actix_web::test]
+    async fn no_write_route_can_reach_an_internal_namespace() {
+        let st = state(false);
+        let app = app!(st);
+
+        // An honest sighting first, so there is a real consensus to corrupt.
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/ips?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(st.db.count(crate::db::ALL_NAMESPACE, "1.2.3.4"), 1);
+
+        // /w
+        for namespace in ["_all", "_shadow/feeds/ips", "_config/acl/apikeys/mine"] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/w/{namespace}?val=1.2.3.4"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "/w/{namespace}");
+        }
+
+        // /wb reports it per item, and writes nothing
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .set_json(json!({"items": [{"namespace": "_all", "value": "1.2.3.4"}]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["written"], 0, "{body}");
+        assert_eq!(body["items"][0]["status"], "error", "{body}");
+
+        // /vwb agrees, as it must
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/vwb")
+                .set_json(json!({"items": [{"namespace": "_all", "value": "1.2.3.4"}]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // /d would discard every tally at once
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/d/_all").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // The consensus is exactly what the one honest write made it.
+        assert_eq!(
+            st.db.count(crate::db::ALL_NAMESPACE, "1.2.3.4"),
+            1,
+            "consensus was reachable after all"
+        );
+    }
+
+    /// Reads of the internal namespaces stay open, apart from `_config`.
+    ///
+    /// `/r/_all?val=` is how consensus is asked for, and `/r/_shadow/<ns>` is
+    /// how searches are reviewed. Closing writes must not close these.
+    #[actix_web::test]
+    async fn internal_namespaces_are_still_readable_except_config() {
+        let st = state(false);
+        let app = app!(st);
+
+        // A write and a read, so both `_all` and `_shadow` have something.
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/ips?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/feeds/ips?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/_all?val=1.2.3.4&noshadow")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "consensus became unreadable");
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["count"], 1, "{body}");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/_shadow/feeds/ips?val=1.2.3.4&noshadow")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "shadows became unreadable");
+
+        // `_config` holds keys on an older deployment and stays closed.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/_config/acl/apikeys/mine?val=x&noshadow")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A server told which namespaces it stores will not take a write outside
+    /// them. Until forwarding exists this is where such a write stops, and it
+    /// says so rather than failing as a missing namespace.
+    #[actix_web::test]
+    async fn a_narrowed_server_refuses_writes_it_does_not_store() {
+        let st = narrowed(&["feeds"]);
+        let app = app!(st);
+
+        // Inside the policy: ordinary.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/misp/ips?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Outside it: 421, which is neither "forbidden" nor "missing" — the
+        // request arrived somewhere that cannot serve it.
+        for outside in ["other", "feeds-internal"] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/w/{outside}?val=1.2.3.4"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "/w/{outside}"
+            );
+            assert!(!st.db.namespace_exists(outside), "{outside} was created");
+        }
+
+        // /wb reports it per item, and the item inside the policy still lands.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .set_json(json!({"items": [
+                    {"namespace": "feeds/a", "value": "1.1.1.1"},
+                    {"namespace": "other", "value": "2.2.2.2"}
+                ]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["message"], "partial", "{body}");
+        assert_eq!(body["items"][0]["status"], "ok", "{body}");
+        assert_eq!(body["items"][1]["status"], "error", "{body}");
+        assert!(
+            body["items"][1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("does not store"),
+            "{body}"
+        );
+
+        // And the dry run agrees with the writer, as it must.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/vwb")
+                .set_json(json!({"items": [{"namespace": "other", "value": "x"}]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["writable"], 0, "{body}");
+    }
+
+    /// A router stores no ordinary namespace, but keeps its own consensus
+    /// tally — which is the whole point of putting one in front of a galaxy.
+    #[actix_web::test]
+    async fn a_router_refuses_every_ordinary_write_but_keeps_its_tally() {
+        let st = narrowed(&[]);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/ips?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+
+        // Its own `_all` is still storage it holds, and still not writable
+        // from outside — the guard from the other direction.
+        assert!(st.db.holds(crate::db::ALL_NAMESPACE));
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/_all?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A forwarded write is counted for the server it came from, not for the
+    /// one that stores it.
+    ///
+    /// This is what stops fan-out double-counting. Measured on a real cascade
+    /// before the origin travelled with the write: three writes through a load
+    /// balancer became six once the two mirrors synced, because each had
+    /// counted the same write under its own name.
+    #[actix_web::test]
+    async fn a_forwarded_write_is_counted_for_its_origin() {
+        let st = state(false);
+        let app = app!(st);
+
+        for _ in 0..3 {
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/w/feeds/ips?val=1.2.3.4")
+                    .insert_header((crate::galaxy::HOPS_HEADER, "3"))
+                    .insert_header((crate::galaxy::ORIGIN_HEADER, "lb1"))
+                    .to_request(),
+            )
+            .await;
+        }
+
+        let payload: Value = test::read_body_json(
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/r/feeds/ips?val=1.2.3.4&noshadow&for_merge")
+                    .to_request(),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(payload["counts"]["lb1"], 3, "{payload}");
+        assert!(
+            payload["counts"]["local"].is_null(),
+            "the write was counted for this server as well: {payload}"
+        );
+    }
+
+    /// The origin is part of the forwarding protocol, not the client API: a
+    /// client naming one without having been forwarded is ignored.
+    #[actix_web::test]
+    async fn an_origin_without_a_hop_header_is_ignored() {
+        let st = state(false);
+        let app = app!(st);
+
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/ips?val=1.2.3.4")
+                .insert_header((crate::galaxy::ORIGIN_HEADER, "pretending"))
+                .to_request(),
+        )
+        .await;
+
+        let payload: Value = test::read_body_json(
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/r/feeds/ips?val=1.2.3.4&noshadow&for_merge")
+                    .to_request(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(payload["counts"]["local"], 1, "{payload}");
+        assert!(payload["counts"]["pretending"].is_null(), "{payload}");
+    }
+
+    /// Bulk writes carry the origin per item too, or a fanned-out batch
+    /// double-counts exactly as a single write would.
+    #[actix_web::test]
+    async fn a_forwarded_batch_is_counted_for_its_origin() {
+        let st = state(false);
+        let app = app!(st);
+
+        test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/wb")
+                .insert_header((crate::galaxy::HOPS_HEADER, "2"))
+                .insert_header((crate::galaxy::ORIGIN_HEADER, "lb1"))
+                .set_json(json!({"items": [
+                    {"namespace": "feeds/a", "value": "1.1.1.1"},
+                    {"namespace": "feeds/b", "value": "2.2.2.2"}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        for (ns, value) in [("feeds/a", "1.1.1.1"), ("feeds/b", "2.2.2.2")] {
+            let payload: Value = test::read_body_json(
+                test::call_service(
+                    &app,
+                    test::TestRequest::get()
+                        .uri(&format!("/r/{ns}?val={value}&noshadow&for_merge"))
+                        .to_request(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(payload["counts"]["lb1"], 1, "{ns}: {payload}");
+        }
+    }
+
+    /// A request that has run out of hops is refused rather than passed on.
+    /// Without this a miswired cascade circulates writes and inflates every
+    /// count that goes round.
+    #[actix_web::test]
+    async fn a_request_out_of_hops_is_refused() {
+        // A router with a peer, so forwarding is what it would otherwise do.
+        let mut inner = SharedState::new(false);
+        inner.db = crate::db::Database::with_storage(
+            crate::db::DatabasePolicy::default(),
+            crate::db::StoragePolicy::from_prefixes(Vec::<String>::new()),
+        );
+        inner.galaxy = Some(crate::galaxy::Galaxy::new(&crate::config::GalaxySettings {
+            peers: vec![crate::config::Peer {
+                url: "http://127.0.0.1:1".to_string(),
+                key: "k".to_string(),
+                stores: crate::db::StoragePolicy::everything(),
+            }],
+            max_hops: 4,
+            health_interval: 30,
+            verify_tls: true,
+        }));
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/ips?val=1.2.3.4")
+                .insert_header((crate::galaxy::HOPS_HEADER, "0"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::LOOP_DETECTED);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/feeds/ips?val=1.2.3.4&noshadow")
+                .insert_header((crate::galaxy::HOPS_HEADER, "0"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::LOOP_DETECTED);
+    }
+
+    /// A router with no peer holding the namespace says so, rather than
+    /// pretending the namespace does not exist.
+    #[actix_web::test]
+    async fn a_router_with_no_holder_answers_421() {
+        let mut inner = SharedState::new(false);
+        inner.db = crate::db::Database::with_storage(
+            crate::db::DatabasePolicy::default(),
+            crate::db::StoragePolicy::from_prefixes(Vec::<String>::new()),
+        );
+        inner.galaxy = Some(crate::galaxy::Galaxy::new(&crate::config::GalaxySettings {
+            peers: vec![crate::config::Peer {
+                url: "http://127.0.0.1:1".to_string(),
+                key: "k".to_string(),
+                // Holds only `feeds`, so `other` is nobody's.
+                stores: crate::db::StoragePolicy::from_prefixes(["feeds"]),
+            }],
+            max_hops: 4,
+            health_interval: 30,
+            verify_tls: true,
+        }));
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/other?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(
+            body["message"].as_str().unwrap().contains("no server"),
+            "{body}"
+        );
+    }
+
+    /// The read side of the merge route. What comes back must be postable to
+    /// `/_api/merge` unchanged — if it is not, a sync cannot be written at all.
+    ///
+    /// Pinned because `serde(flatten)` broke exactly this once: it cannot
+    /// coerce JSON's string object keys back to the `i64` hours in `stats`, so
+    /// a payload read from here was refused by the route meant to take it.
+    #[actix_web::test]
+    async fn what_for_merge_returns_can_be_posted_to_merge_unchanged() {
+        let st = state(false);
+        let app = app!(st);
+
+        for _ in 0..3 {
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/w/feeds/ips?val=1.2.3.4&tags=tlp:amber&ttl=3600")
+                    .to_request(),
+            )
+            .await;
+        }
+
+        let payload: Value = test::read_body_json(
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/r/feeds/ips?val=1.2.3.4&noshadow&for_merge")
+                    .to_request(),
+            )
+            .await,
+        )
+        .await;
+
+        // Per-node counts, not a total: offering a total would make the
+        // receiver attribute every server's sightings to the sender.
+        assert_eq!(payload["counts"]["local"], 3, "{payload}");
+        assert!(payload["stats"]["local"].is_object(), "{payload}");
+        assert_eq!(payload["tags"], "tlp:amber", "{payload}");
+        assert_eq!(payload["ttl"], 3600, "{payload}");
+
+        // Post it back verbatim, with only the two routing fields added.
+        let mut item = payload.clone();
+        item["namespace"] = Value::from("feeds/copy");
+        item["value"] = Value::from("1.2.3.4");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/merge")
+                .set_json(json!({"items": [item]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a payload from for_merge was refused by merge: {:?}",
+            test::read_body(resp).await
+        );
+
+        // Accepted — but the only contributor named is this server itself, and
+        // a peer does not get to say what this server has seen. So the counts
+        // are ignored and reported, which is the rule working rather than
+        // failing.
+        let body: Value = test::read_body_json(
+            test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/_api/merge")
+                    .set_json(json!({"items": [item.clone()]}))
+                    .to_request(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["items"][0]["ignored_self"], 1, "{body}");
+
+        // Relabelled as a peer's — which is what it would be in a real sync,
+        // since the payload would have come from a server with its own id —
+        // the attribution comes across intact.
+        let mut from_peer = item.clone();
+        from_peer["namespace"] = Value::from("feeds/frompeer");
+        from_peer["counts"] = json!({"node-b": 3});
+        from_peer["stats"] = json!({"node-b": payload["stats"]["local"].clone()});
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/merge")
+                .set_json(json!({"items": [from_peer]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let copy: Value = test::read_body_json(
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/r/feeds/frompeer?val=1.2.3.4&noshadow&for_merge")
+                    .to_request(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(copy["counts"]["node-b"], 3, "attribution was lost: {copy}");
+        assert_eq!(copy["stats"]["node-b"], payload["stats"]["local"]);
+        assert_eq!(copy["ttl"], 3600);
+        assert_eq!(copy["tags"], "tlp:amber");
+    }
+
+    /// An expired value is not offered: a peer that took it would hold
+    /// something this server has already stopped showing.
+    #[actix_web::test]
+    async fn for_merge_does_not_offer_an_expired_value() {
+        let st = state(false);
+        let app = app!(st);
+
+        // Sighted in 1970 with a one minute ttl: already gone.
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/ips?val=gone&timestamp=1000&ttl=60")
+                .to_request(),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/r/feeds/ips?val=gone&noshadow&for_merge")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The problem this route exists to solve, demonstrated: replaying `/w`
+    /// doubles a count, and merging the same thing twice does not.
+    #[actix_web::test]
+    async fn merging_twice_does_not_double_what_writing_twice_would() {
+        let st = state(false);
+        let app = app!(st);
+
+        // Three sightings on a peer called node-b, as /wb would have produced
+        // there, offered to us.
+        let offer = json!({"items": [{
+            "namespace": "feeds/ips",
+            "value": "1.2.3.4",
+            "counts": {"node-b": 3},
+            "first_seen": 1_600_000_000i64,
+            "last_seen": 1_600_003_600i64,
+            "tags": "tlp:amber"
+        }]});
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/merge")
+                .set_json(offer.clone())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["message"], "ok", "{body}");
+        assert_eq!(body["changed"], 1, "{body}");
+        assert_eq!(body["items"][0]["count"], 3, "{body}");
+        assert_eq!(body["items"][0]["changed"], true, "{body}");
+
+        // Again. The count must not move, and the response must say nothing
+        // changed — which during catch-up is how a caller knows it is done.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/merge")
+                .set_json(offer)
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(
+            body["changed"], 0,
+            "a repeat merge changed something: {body}"
+        );
+        assert_eq!(body["items"][0]["changed"], false, "{body}");
+        assert_eq!(body["items"][0]["count"], 3, "{body}");
+
+        assert_eq!(st.db.count("feeds/ips", "1.2.3.4"), 3, "the count drifted");
+
+        // The window and tags came across too.
+        let view = st.db.view("feeds/ips", "1.2.3.4", 0, false).unwrap();
+        assert_eq!(view.first_seen, 1_600_000_000);
+        assert_eq!(view.last_seen, 1_600_003_600);
+        assert_eq!(view.tags, "tlp:amber");
+    }
+
+    /// A merge brings the value into a namespace that did not hold it, which
+    /// is a new namespace holding it — so consensus must rise exactly as a
+    /// first write would have made it.
+    #[actix_web::test]
+    async fn a_merge_that_introduces_a_value_counts_towards_consensus() {
+        let st = state(false);
+        let app = app!(st);
+
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/a?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(st.db.count(crate::db::ALL_NAMESPACE, "1.2.3.4"), 1);
+
+        let offer = json!({"items": [{
+            "namespace": "feeds/b", "value": "1.2.3.4",
+            "counts": {"node-b": 2},
+            "first_seen": 1_600_000_000i64, "last_seen": 1_600_000_000i64
+        }]});
+        for _ in 0..3 {
+            test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/_api/merge")
+                    .set_json(offer.clone())
+                    .to_request(),
+            )
+            .await;
+        }
+
+        // Two namespaces hold it, however many times the merge was replayed.
+        assert_eq!(
+            st.db.count(crate::db::ALL_NAMESPACE, "1.2.3.4"),
+            2,
+            "consensus moved with the number of merges"
+        );
+    }
+
+    /// Merging changes stored data, so it is a write: the ACL, the internal
+    /// namespaces and the storage policy all apply.
+    #[actix_web::test]
+    async fn merging_is_authorized_and_bounded_like_a_write() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("feed", parse_grants("rw:feeds").unwrap());
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("full", parse_grants("rw").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        let offer = |ns: &str| {
+            json!({"items": [{
+                "namespace": ns, "value": "1.2.3.4",
+                "counts": {"node-b": 1},
+                "first_seen": 1_600_000_000i64, "last_seen": 1_600_000_000i64
+            }]})
+        };
+        let send = |key: &'static str, body: Value| {
+            test::TestRequest::post()
+                .uri("/_api/merge")
+                .insert_header(("Authorization", key))
+                .set_json(body)
+                .to_request()
+        };
+
+        // Out of scope for this key.
+        let resp = test::call_service(&app, send("feed", offer("secrets"))).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(st.db.count("secrets", "1.2.3.4"), 0);
+
+        // An internal namespace, asked for by a key the ACL would otherwise
+        // allow anywhere: a peer must not be able to merge a consensus tally
+        // into us, which would be the forgery guard bypassed by another door.
+        let resp = test::call_service(&app, send("full", offer("_all"))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(
+            body["items"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("internal namespace"),
+            "{body}"
+        );
+        assert_eq!(st.db.count(crate::db::ALL_NAMESPACE, "1.2.3.4"), 0);
+
+        // In scope.
+        let resp = test::call_service(&app, send("feed", offer("feeds/ips"))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(st.db.count("feeds/ips", "1.2.3.4"), 1);
+    }
+
+    /// A peer offering an entry under our own id is ignored, and the response
+    /// says so — a sender that does it is confused about who it is talking to.
+    #[actix_web::test]
+    async fn a_merge_cannot_rewrite_this_servers_own_contribution() {
+        let st = state(false);
+        let app = app!(st);
+
+        for _ in 0..2 {
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/w/feeds/ips?val=1.2.3.4")
+                    .to_request(),
+            )
+            .await;
+        }
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_api/merge")
+                .set_json(json!({"items": [{
+                    "namespace": "feeds/ips", "value": "1.2.3.4",
+                    "counts": {"local": 999, "node-b": 1},
+                    "first_seen": 1_600_000_000i64, "last_seen": 1_600_000_000i64
+                }]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["items"][0]["ignored_self"], 1, "{body}");
+        // Our two, plus the peer's one. Not 1001.
+        assert_eq!(body["items"][0]["count"], 3, "{body}");
+    }
+
+    /// `/w` and `/wb` report whether a sighting was the first in its
+    /// namespace, which is what a router needs to maintain consensus without
+    /// holding the namespace itself.
+    #[actix_web::test]
+    async fn write_responses_say_whether_the_sighting_was_new() {
+        let st = state(false);
+        let app = app!(st);
+
+        let first: Value = test::read_body_json(
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/w/feeds/ips?val=1.2.3.4")
+                    .to_request(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["count"], 1);
+        assert_eq!(first["new"], true, "{first}");
+
+        let again: Value = test::read_body_json(
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri("/w/feeds/ips?val=1.2.3.4")
+                    .to_request(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(again["count"], 2);
+        assert_eq!(again["new"], false, "{again}");
+
+        // And per item in bulk: same value in a new namespace is new there.
+        let body: Value = test::read_body_json(
+            test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/wb")
+                    .set_json(json!({"items": [
+                        {"namespace": "feeds/ips", "value": "1.2.3.4"},
+                        {"namespace": "feeds/other", "value": "1.2.3.4"}
+                    ]}))
+                    .to_request(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["items"][0]["new"], false, "{body}");
+        assert_eq!(body["items"][1]["new"], true, "{body}");
+    }
+
     #[actix_web::test]
     async fn read_with_stats_needs_a_value() {
         let st = state(false);
@@ -2237,51 +3634,103 @@ mod tests {
         let body = test::read_body(resp).await;
         let spec = String::from_utf8_lossy(&body);
 
-        assert!(spec.starts_with("openapi:"), "not an OpenAPI document");
-        for path in [
-            "  /w/{namespace}:",
-            "  /r/{namespace}:",
-            "  /rs/{namespace}:",
-            "  /d/{namespace}:",
-            "  /wb:",
-            "  /vwb:",
-            "  /rb:",
-            "  /rbs:",
-            "  /stix/{namespace}:",
-            "  /_api/stix:",
-            "  /_api/tier:",
-            "  /_api/openapi.yaml:",
-            "  /c/{namespace}:",
-            "  /i:",
-            "  /health:",
-            "  /_management/api/session:",
-            "  /_management/api/info:",
-            "  /_management/api/namespaces:",
-            "  /_management/api/tree:",
-            "  /_management/api/rejections:",
-            "  /_management/api/values:",
-            "  /_management/api/value:",
-            "  /_management/api/sightings:",
-            "  /_management/api/tags:",
-            "  /_management/api/tier:",
-            "  /_management/api/keys:",
-            "  /_management/api/keys/generate:",
-            "  /_management/api/keys/{key}:",
+        // Parsed rather than searched. This test used to grep for path strings,
+        // which passed happily on a document no importer could read: an
+        // unquoted colon in a description is enough to break the parse while
+        // leaving every string it looks for present.
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&spec)
+            .unwrap_or_else(|e| panic!("the served document is not valid YAML: {e}"));
+
+        let paths = doc
+            .get("paths")
+            .and_then(|paths| paths.as_mapping())
+            .expect("a paths section");
+
+        for route in [
+            "/w/{namespace}",
+            "/r/{namespace}",
+            "/rs/{namespace}",
+            "/d/{namespace}",
+            "/wb",
+            "/vwb",
+            "/rb",
+            "/rbs",
+            "/stix/{namespace}",
+            "/_api/merge",
+            "/_api/stix",
+            "/_api/tier",
+            "/_api/openapi.yaml",
+            "/c/{namespace}",
+            "/i",
+            "/health",
+            "/_management/api/session",
+            "/_management/api/info",
+            "/_management/api/namespaces",
+            "/_management/api/tree",
+            "/_management/api/galaxy",
+            "/_management/api/rejections",
+            "/_management/api/values",
+            "/_management/api/value",
+            "/_management/api/sightings",
+            "/_management/api/tags",
+            "/_management/api/tier",
+            "/_management/api/keys",
+            "/_management/api/keys/generate",
+            "/_management/api/keys/{key}",
         ] {
-            assert!(spec.contains(path), "{path} is not in the OpenAPI document");
+            assert!(
+                paths.contains_key(serde_yaml_ng::Value::from(route)),
+                "{route} is not a path in the OpenAPI document"
+            );
+        }
+
+        // Every internal reference has to resolve. Adding a schema and
+        // referring to it by a name that does not exist leaves a document that
+        // parses and still describes nothing.
+        let mut refs = Vec::new();
+        collect_refs(&doc, &mut refs);
+        assert!(!refs.is_empty(), "no $refs found, so this proves nothing");
+        for reference in &refs {
+            let Some(pointer) = reference.strip_prefix("#/") else {
+                panic!("{reference} is not a local reference");
+            };
+            let mut at = &doc;
+            for segment in pointer.split('/') {
+                at = at
+                    .get(segment)
+                    .unwrap_or_else(|| panic!("{reference} does not resolve: no '{segment}'"));
+            }
         }
 
         // Whatever the file says, the server says what it is.
-        let info = spec.find("\ninfo:").expect("an info section");
-        let version = spec[info..]
-            .lines()
-            .find(|line| line.starts_with("  version:"))
-            .expect("a version");
         assert_eq!(
-            version.trim(),
-            format!("version: \"{}\"", env!("CARGO_PKG_VERSION")),
+            doc.get("info").and_then(|info| info.get("version")),
+            Some(&serde_yaml_ng::Value::from(env!("CARGO_PKG_VERSION"))),
             "the served document names the wrong version"
         );
+    }
+
+    /// Every `$ref` string anywhere in the document.
+    fn collect_refs(node: &serde_yaml_ng::Value, found: &mut Vec<String>) {
+        match node {
+            serde_yaml_ng::Value::Mapping(map) => {
+                for (key, value) in map {
+                    if key.as_str() == Some("$ref") {
+                        if let Some(target) = value.as_str() {
+                            found.push(target.to_string());
+                        }
+                    } else {
+                        collect_refs(value, found);
+                    }
+                }
+            }
+            serde_yaml_ng::Value::Sequence(items) => {
+                for item in items {
+                    collect_refs(item, found);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Issue #5: a client with the wrong key was told `403` and the server said

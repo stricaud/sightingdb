@@ -57,6 +57,8 @@ pub struct Settings {
     /// How many rejected values to keep in memory for `/_management/api/rejections`.
     /// 0 switches the record off.
     pub rejection_log: usize,
+    /// This server's name in its own counters. See [`crate::db::LOCAL_NODE`].
+    pub node_id: String,
     /// API keys. `None` means no `[acl]` table and no `acl_file`.
     pub acl: Option<Acl>,
     /// File holding the keys, which the management interface rewrites.
@@ -69,6 +71,48 @@ pub struct Settings {
     pub dns: Option<DnsSettings>,
     pub zmq: Option<ZmqSettings>,
     pub stix: StixSettings,
+    /// Which namespaces this server stores. Everything, unless `[storage]`
+    /// narrows it with `namespaces`.
+    pub storage: crate::db::StoragePolicy,
+    /// The other servers this one knows about. `None` means it stands alone.
+    pub galaxy: Option<GalaxySettings>,
+}
+
+/// The other servers in this one's galaxy.
+///
+/// Configuration only at this stage: nothing is forwarded yet. It is parsed,
+/// validated and reported so that the topology can be described before it can
+/// be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GalaxySettings {
+    pub peers: Vec<Peer>,
+    /// Seconds between health probes of each peer.
+    pub health_interval: u64,
+    /// Whether a peer's TLS certificate is verified. Off is for a galaxy of
+    /// self-signed instances, which is what `--setup` produces.
+    pub verify_tls: bool,
+    /// How many hops a forwarded request may take before it is refused. A
+    /// cascade can be miswired into a cycle, and a cycle inflates every count
+    /// it carries, so this is a limit rather than a tuning knob.
+    pub max_hops: u8,
+}
+
+/// One peer, and the key this server authenticates to it with.
+///
+/// The key is the capability bound: a peer's own ACL decides what this server
+/// may read and write there, so a key granted `rw:feeds` cannot be used to
+/// write anywhere else however this server is configured or compromised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub url: String,
+    pub key: String,
+    /// What this peer stores, so a request can be sent where it can be served.
+    ///
+    /// Declared here rather than asked of the peer: discovery would need the
+    /// peer key to carry an `admin` grant, and the whole point of that key is
+    /// that it can be the narrowest thing that does the job. The cost is that
+    /// it must agree with the peer's own `[storage] namespaces`.
+    pub stores: crate::db::StoragePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +196,7 @@ struct RawConfig {
     /// Inline keys, for installs that do not use a separate `acl_file`.
     acl: Option<HashMap<String, String>>,
     storage: Option<RawStorage>,
+    galaxy: Option<RawGalaxy>,
     dns: Option<RawDns>,
     zmq: Option<RawZmq>,
     stix: Option<RawStix>,
@@ -194,7 +239,34 @@ struct RawDaemon {
     shadow_ttl: u64,
     #[serde(default = "default_rejection_log")]
     rejection_log: usize,
+    /// This server's name in its own counters. Absent means "local", which is
+    /// right until it joins a galaxy — two servers sharing an id would each
+    /// take the other's contribution for their own.
+    node_id: Option<String>,
     acl_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGalaxy {
+    #[serde(default)]
+    peers: Vec<RawPeer>,
+    #[serde(default = "default_max_hops")]
+    max_hops: u8,
+    #[serde(default = "default_health_interval")]
+    health_interval: u64,
+    #[serde(default = "yes")]
+    verify_tls: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPeer {
+    url: String,
+    key: String,
+    /// What the peer stores. Absent means everything — a full mirror, which is
+    /// the common case and the one a reader should assume.
+    namespaces: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +282,10 @@ struct RawStorage {
     #[serde(default)]
     tiers: HashMap<String, toml::Value>,
     tiers_file: Option<PathBuf>,
+    /// Which namespaces this server stores. Absent means all of them, which is
+    /// what every release before this one did. `["/"]` says the same thing
+    /// explicitly; `[]` makes this a router that stores nothing of its own.
+    namespaces: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,6 +405,12 @@ fn default_tier() -> String {
     // Everything resident, which is how the database behaved before tiering.
     "hot".into()
 }
+fn default_max_hops() -> u8 {
+    4
+}
+fn default_health_interval() -> u64 {
+    30
+}
 fn default_warm_idle() -> u64 {
     3600
 }
@@ -355,6 +437,46 @@ impl RawConfig {
             })
         } else {
             None
+        };
+
+        // Read before `self.storage` is consumed below.
+        let storage_policy = match self.storage.as_ref().and_then(|s| s.namespaces.as_ref()) {
+            Some(list) => crate::db::StoragePolicy::from_prefixes(list),
+            None => crate::db::StoragePolicy::everything(),
+        };
+        for prefix in storage_policy.prefixes() {
+            crate::acl::validate_namespace(prefix).with_context(|| {
+                format!("in the [storage] namespaces list in {}", path.display())
+            })?;
+        }
+
+        let node_id = match daemon.node_id.as_deref().map(str::trim) {
+            None | Some("") => crate::db::LOCAL_NODE.to_string(),
+            Some(id) => {
+                // It is a key in every snapshot this server writes and in every
+                // merge it sends, so keep it to something that survives both.
+                if id.len() > 64 {
+                    bail!(
+                        "node_id must be 64 characters or fewer, in {}",
+                        path.display()
+                    );
+                }
+                if !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                {
+                    bail!(
+                        "node_id may use letters, digits, '-', '_' and '.' only, in {}",
+                        path.display()
+                    );
+                }
+                id.to_string()
+            }
+        };
+
+        let galaxy = match self.galaxy {
+            Some(raw) => Some(raw.into_settings(path)?),
+            None => None,
         };
 
         let (tiers, tiers_file) = match self.storage {
@@ -418,6 +540,7 @@ impl RawConfig {
             stats_retention: daemon.stats_retention,
             shadow_ttl: daemon.shadow_ttl,
             rejection_log: daemon.rejection_log,
+            node_id,
             acl,
             acl_file,
             tiers,
@@ -425,6 +548,85 @@ impl RawConfig {
             dns,
             zmq,
             stix,
+            storage: storage_policy,
+            galaxy,
+        })
+    }
+}
+
+impl RawGalaxy {
+    fn into_settings(self, path: &Path) -> Result<GalaxySettings> {
+        let mut peers: Vec<Peer> = Vec::new();
+        for raw in self.peers {
+            let url = raw.url.trim().trim_end_matches('/').to_string();
+            let key = raw.key.trim().to_string();
+
+            if url.is_empty() {
+                bail!("a [galaxy] peer has no url, in {}", path.display());
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                bail!(
+                    "[galaxy] peer '{url}' needs an http:// or https:// url, in {}",
+                    path.display()
+                );
+            }
+            // A peer we cannot authenticate to is a peer we cannot use, and
+            // finding that out at the first forward is worse than at startup.
+            if key.is_empty() {
+                bail!(
+                    "[galaxy] peer '{url}' has no key, in {}. The key is what bounds \
+                     what this server may do there.",
+                    path.display()
+                );
+            }
+            if peers.iter().any(|peer| peer.url == url) {
+                bail!("[galaxy] lists peer '{url}' twice, in {}", path.display());
+            }
+            let stores = match raw.namespaces.as_ref() {
+                Some(list) => crate::db::StoragePolicy::from_prefixes(list),
+                None => crate::db::StoragePolicy::everything(),
+            };
+            for prefix in stores.prefixes() {
+                crate::acl::validate_namespace(prefix).with_context(|| {
+                    format!(
+                        "in the [galaxy] namespaces for peer '{url}' in {}",
+                        path.display()
+                    )
+                })?;
+            }
+            if stores.is_router() {
+                // A peer that stores nothing can still be forwarded *through*,
+                // but saying so here would be saying it holds nothing, which
+                // is not what a routing table is for. Let it be a full mirror
+                // or a named subtree.
+                bail!(
+                    "[galaxy] peer '{url}' declares an empty namespaces list, in {}. \
+                     Leave it out for a full mirror, or name what it holds.",
+                    path.display()
+                );
+            }
+            peers.push(Peer { url, key, stores });
+        }
+
+        if self.max_hops == 0 {
+            bail!(
+                "[galaxy] max_hops must be at least 1, in {}",
+                path.display()
+            );
+        }
+
+        if self.health_interval == 0 {
+            bail!(
+                "[galaxy] health_interval must be at least 1 second, in {}",
+                path.display()
+            );
+        }
+
+        Ok(GalaxySettings {
+            peers,
+            max_hops: self.max_hops,
+            health_interval: self.health_interval,
+            verify_tls: self.verify_tls,
         })
     }
 }
@@ -838,6 +1040,119 @@ stats_retention = 720
         assert!(acl.is_admin("changeme"));
         assert!(acl.can_read("analyst", "anything"));
         assert!(!acl.can_write("analyst", "anything"));
+    }
+
+    /// Absent `namespaces` must behave as it always has: store everything.
+    #[test]
+    fn storage_defaults_to_everything_and_no_galaxy() {
+        let dir = TempDir::new("nogalaxy");
+        let settings = Settings::load(&dir.write("c.toml", "[daemon]\nssl = false\n")).unwrap();
+
+        assert!(settings.storage.stores_everything());
+        assert!(settings.galaxy.is_none());
+    }
+
+    #[test]
+    fn storage_namespaces_narrow_what_is_held() {
+        let dir = TempDir::new("narrow");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[storage]\nnamespaces = [\"feeds\", \"threats/apt\"]\n",
+        ))
+        .unwrap();
+
+        assert!(!settings.storage.stores_everything());
+        assert!(settings.storage.holds("feeds/misp/ips"));
+        assert!(!settings.storage.holds("other"));
+    }
+
+    #[test]
+    fn an_empty_namespaces_list_is_a_router() {
+        let dir = TempDir::new("router");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[storage]\nnamespaces = []\n",
+        ))
+        .unwrap();
+
+        assert!(settings.storage.is_router());
+        // Still its own internal namespaces.
+        assert!(settings.storage.holds("_all"));
+    }
+
+    #[test]
+    fn a_galaxy_is_parsed_with_its_peers() {
+        let dir = TempDir::new("galaxy");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[galaxy]\nmax_hops = 2\n\
+             peers = [\n  { url = \"https://a:9999/\", key = \"k1\" },\n  \
+             { url = \"http://b:9999\", key = \"k2\" },\n]\n",
+        ))
+        .unwrap();
+
+        let galaxy = settings.galaxy.unwrap();
+        assert_eq!(galaxy.max_hops, 2);
+        assert_eq!(galaxy.peers.len(), 2);
+        // Trailing slash trimmed, so the same peer written two ways is one peer.
+        assert_eq!(galaxy.peers[0].url, "https://a:9999");
+        assert_eq!(galaxy.peers[0].key, "k1");
+    }
+
+    /// Each of these would only be discovered at the first forward, which is
+    /// the worst time to discover it.
+    #[test]
+    fn a_misconfigured_galaxy_is_refused_at_startup() {
+        let cases = [
+            // No key: nothing bounds what this server may do there.
+            (
+                "nokey",
+                "peers = [{ url = \"https://a:9999\", key = \"\" }]",
+                "no key",
+            ),
+            // Not a url we can call.
+            (
+                "noscheme",
+                "peers = [{ url = \"a:9999\", key = \"k\" }]",
+                "http",
+            ),
+            // The same peer twice doubles every write sent to it.
+            (
+                "dupe",
+                "peers = [{ url = \"https://a:9999\", key = \"k\" }, \
+                 { url = \"https://a:9999/\", key = \"k\" }]",
+                "twice",
+            ),
+            // A cascade with no hop budget cannot refuse a cycle.
+            ("hops", "max_hops = 0\npeers = []", "max_hops"),
+        ];
+
+        for (name, body, expected) in cases {
+            let dir = TempDir::new(name);
+            let err = Settings::load(&dir.write(
+                "c.toml",
+                &format!("[daemon]\nssl = false\n\n[galaxy]\n{body}\n"),
+            ))
+            .expect_err(&format!("{name} was accepted"));
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(expected),
+                "{name}: expected {expected:?} in {text}"
+            );
+        }
+    }
+
+    /// An internal namespace cannot be a storage prefix: the server holds
+    /// those regardless, and listing one would suggest it were optional.
+    #[test]
+    fn an_internal_storage_prefix_is_refused() {
+        let dir = TempDir::new("internalprefix");
+        let err = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[storage]\nnamespaces = [\"_all\"]\n",
+        ))
+        .expect_err("_all was accepted as a storage prefix");
+        assert!(format!("{err:#}").contains("internal"), "{err:#}");
     }
 
     #[test]

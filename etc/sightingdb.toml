@@ -67,6 +67,38 @@ shadow_ttl = 2_592_000
 # 0 switches the record off.
 rejection_log = 1000
 
+# This server's name in its own counters. Sightings are counted per node, so
+# that merging two copies of a value is a sum of separate contributions rather
+# than a replay of increments — an increment is not idempotent, and a sync that
+# replayed one would double the count every time it ran.
+#
+# "local" is right until this server joins a galaxy. Then give each one its own
+# name: two sharing an id would each take the other's contribution for their
+# own, and a merge would lose one of them. Letters, digits, '-', '_' and '.',
+# up to 64 characters.
+#
+# Changing it later is safe but not free: the old name keeps its contribution
+# in the stored data and the new one starts at zero, so the total is unchanged
+# while the attribution is split.
+#node_id = "local"
+
+# Which namespaces this server stores. Absent means all of them, which is what
+# a standalone server wants and what every release before galaxies did.
+#
+#   namespaces = ["/"]                  everything, said explicitly
+#   namespaces = ["feeds", "threats"]   those subtrees and nothing else
+#   namespaces = []                     nothing of its own: a pure router
+#
+# Prefixes match whole path segments, so "feeds" holds feeds/misp/ips and never
+# feeds-internal. The internal namespaces (_all, _shadow/*, _config) are always
+# held whatever this says — a server cannot keep a consensus tally otherwise —
+# so they must not be listed here.
+#
+# A write to a namespace this server does not store is refused with 421. Until
+# forwarding exists, narrowing this is how you declare what a server is for,
+# not a way to make it pass work along.
+#namespaces = ["/"]
+
 # How long each top-level namespace stays in memory.
 #
 #   hot   never evicted
@@ -216,3 +248,39 @@ tiers_file = "tiers.toml"
 # "file.MD5" = "stix/hashes"
 # "file.SHA-1" = "stix/hashes"
 # "file.SHA-256" = "stix/hashes"
+
+
+# ---------------------------------------------------------------------------
+# [galaxy] — the other servers this one knows about
+# ---------------------------------------------------------------------------
+#
+# Configuration only at this stage: the peers are parsed, validated and
+# reported at /_management/api/info, and nothing is forwarded to them yet.
+#
+# Each peer carries the key this server authenticates to it with, and that key
+# is the bound on what this server may do there: a key granted "rw:feeds" on
+# the peer cannot write anywhere else, however this server is configured or
+# compromised. Give each one the narrowest grant that does the job.
+#
+# A peer may itself have peers, so a router in front of routers is a cascade.
+# max_hops is what stops a miswired cycle: a cycle inflates every count that
+# travels round it, so this is a limit rather than a tuning knob.
+#
+# A server that does not store a namespace forwards the request to the peers
+# that do: writes to every live mirror, reads to one chosen by hashing the
+# value so the same value always comes from the same place.
+#
+# `namespaces` on a peer says what it holds; absent means a full mirror. It is
+# declared here rather than asked of the peer, because asking would need the
+# peer key to carry an admin grant and the point of that key is to be the
+# narrowest thing that works. It must agree with the peer's own
+# [storage] namespaces.
+#
+#[galaxy]
+#max_hops = 4
+#health_interval = 30
+#verify_tls = true
+#peers = [
+#  { url = "https://node-a.example:9999", key = "..." },
+#  { url = "https://node-b.example:9999", key = "...", namespaces = ["feeds"] },
+#]

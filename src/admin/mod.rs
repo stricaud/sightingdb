@@ -167,6 +167,8 @@ pub struct WriteReport {
 pub struct ValueCount {
     value: String,
     count: u64,
+    /// Whether this was the first sighting of the value in this namespace.
+    new: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -278,6 +280,47 @@ pub struct ServerInfo {
     pub warm_idle: u64,
     /// Shards with a tier of their own.
     pub tiers: Vec<(String, String)>,
+    /// What this server stores and who it knows about: the two things that
+    /// decide its place in a galaxy.
+    pub role: RoleInfo,
+}
+
+/// This server's place in a galaxy.
+///
+/// Derived from `[storage] namespaces` and `[galaxy]`, and reported so that a
+/// topology can be described from the outside — which is what a cluster view
+/// has to read.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoleInfo {
+    /// `"node"`, `"router"`, or `"both"`.
+    ///
+    /// A node stores namespaces and forwards nothing; a router stores none of
+    /// its own and exists to forward; both does each. The words describe a
+    /// configuration rather than a type — any server can be any of them.
+    pub kind: &'static str,
+    /// Whether this server stores every namespace. A full mirror.
+    pub mirrors_everything: bool,
+    /// The namespace prefixes stored, when it is not everything. Empty on a
+    /// router, which stores none.
+    pub namespaces: Vec<String>,
+    /// Peers, without their keys — a key is a credential and does not belong
+    /// in a response the interface renders.
+    pub peers: Vec<String>,
+    pub max_hops: u8,
+}
+
+impl Default for RoleInfo {
+    /// A server that stores everything and knows no peers, which is what every
+    /// release before galaxies was.
+    fn default() -> Self {
+        RoleInfo {
+            kind: "node",
+            mirrors_everything: true,
+            namespaces: Vec::new(),
+            peers: Vec::new(),
+            max_hops: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -530,6 +573,66 @@ pub async fn namespaces(
     HttpResponse::Ok().json(page)
 }
 
+/// `GET /_management/api/galaxy` — this server and the peers it knows.
+///
+/// What a topology view reads. Reports this server's own role and each peer's
+/// health, so the picture can be drawn from one request against whichever
+/// server the operator happens to be connected to.
+///
+/// Peer **keys are never included**: they are credentials, and this response is
+/// rendered in a browser.
+///
+/// Nothing is forwarded to peers yet, so this describes the configured galaxy
+/// and whether its members answer — not a traversal of it. A cascade is
+/// reported one level deep: each peer appears as a peer, and asking *it* for
+/// its own galaxy is how the next level is reached.
+pub async fn galaxy(state: State, req: HttpRequest) -> HttpResponse {
+    if let Err(resp) = require_admin(&state, &req) {
+        return resp;
+    }
+
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "self": describe(&state),
+            "peers": [],
+            "below": {},
+        }));
+    };
+
+    // One level per hop. Asked for only when this request was not itself a
+    // walk that has run out of budget, so a cascade is described all the way
+    // down and a cycle still terminates.
+    let hops = crate::galaxy::hops_left(&req, galaxy.max_hops()).unwrap_or(0);
+    let below: serde_json::Map<String, serde_json::Value> = galaxy
+        .walk(hops)
+        .await
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({
+        // The server answering, so a view has a root to draw from without
+        // being told separately which one it asked.
+        "self": describe(&state),
+        "peers": galaxy.health(),
+        // Each peer's own answer, keyed by its url. A peer that is itself a
+        // router has peers of its own in here, which is how a cascade is
+        // drawn from one request.
+        "below": below,
+    }))
+}
+
+/// This server, as a topology view needs it.
+fn describe(state: &SharedState) -> serde_json::Value {
+    serde_json::json!({
+        "node_id": state.db.node(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "role": state.info.role.clone(),
+        "uptime_seconds": state.started.elapsed().as_secs(),
+    })
+}
+
 /// `GET /_management/api/rejections` — values that were not written.
 ///
 /// Newest first, because the question is nearly always "what has just started
@@ -730,11 +833,12 @@ pub async fn add_values(
         match crate::sighting_writer::write_tagged(
             &state.db, &namespace, value, when, body.ttl, &body.tags,
         ) {
-            Ok(count) => {
+            Ok(written) => {
                 report.written += 1;
                 report.counts.push(ValueCount {
                     value: value.to_string(),
-                    count,
+                    count: written.count,
+                    new: written.new,
                 });
             }
             Err(e) => {
@@ -1070,6 +1174,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
             web::post().to(create_namespace),
         )
         .route("/_management/api/tree", web::get().to(tree))
+        .route("/_management/api/galaxy", web::get().to(galaxy))
         .route("/_management/api/rejections", web::get().to(rejections))
         .route(
             "/_management/api/rejections",

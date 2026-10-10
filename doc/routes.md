@@ -20,7 +20,7 @@ Contents
 
 - [Conventions](#conventions)
 - [Sightings](#sightings) — `/w` `/r` `/r?count` `/rs` `/d`
-- [Bulk](#bulk) — `/wb` `/vwb` `/rb` `/rbs`
+- [Bulk](#bulk) — `/wb` `/vwb` `/_api/merge` `/rb` `/rbs`
 - [STIX export](#stix-export) — `/stix` `/_api/stix`, [subtrees](#exporting-a-whole-subtree), [untyped values](#values-with-no-observable-type)
 - [Storage](#storage) — `/_api/tier`
 - [Service](#service) — `/health` `/i` `/` `/_api/openapi.yaml` `/c`
@@ -72,14 +72,19 @@ running count.
 
 	$ curl -H 'Authorization: changeme' \
 	    'http://127.0.0.1:9999/w/feeds/misp/ips?val=1.2.3.4&tags=stix-type:ipv4-addr,tlp:amber'
-	{"message":"ok","count":1}
+	{"message":"ok","count":1,"new":true}
+
+`new` says whether this was the first sighting of the value in **this**
+namespace. It is reported because a server in front of this one cannot work it
+out: it decides a consensus increment, and answering it needs the namespace,
+which a router does not hold.
 
 Sighting it again returns the new count. The count comes back from inside the
 lock that incremented it, so two concurrent writers get 1 and 2, never 1 and 1:
 
 	$ curl -H 'Authorization: changeme' \
 	    'http://127.0.0.1:9999/w/feeds/misp/ips?val=1.2.3.4'
-	{"message":"ok","count":2}
+	{"message":"ok","count":2,"new":false}
 
 With an explicit time and an expiry:
 
@@ -174,6 +179,24 @@ A namespace that is not there:
 
 	$ curl -H 'Authorization: changeme' 'http://127.0.0.1:9999/r/feeds/nothing?count'
 	{"error":"Path not found","namespace":"feeds/nothing","value":""}     # 404
+
+### `GET /r/<namespace>?val=<value>&for_merge` — the shape a peer is offered
+
+The read side of [`POST /_api/merge`](#post-_apimerge--fold-a-peers-copy-of-values-into-ours).
+What comes back is postable there unchanged, with only `namespace` and `value`
+added:
+
+	$ curl -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/r/feeds/ips?val=1.2.3.4&noshadow&for_merge'
+	{"counts":{"node-a":3},"stats":{"node-a":{"1791658800":3}},
+	 "first_seen":1791660347,"last_seen":1791660347,"tags":"","ttl":0}
+
+`counts` is **per server**, not a total. That is the point: offering a total
+would make the receiver attribute every server's sightings to the sender, and
+two servers exchanging totals inflate each other without bound.
+
+An expired value is not offered — `404` — because a peer that took it would
+hold something this server has already stopped showing.
 
 ### Reading the shadow
 
@@ -321,6 +344,60 @@ ACL can be rewritten between the two calls, so a batch that validates can still
 be refused when you write it. It also records nothing in the rejection log, and
 leaves no sighting behind — which is the thing probing with a real write cannot
 avoid.
+
+### `POST /_api/merge` — fold a peer's copy of values into ours
+
+How a galaxy syncs. **Not a sighting**: nothing is counted. The sender states
+what each server has seen, and every field is combined by a rule that ignores
+order and repetition, so the same merge may be sent twice, or two peers' copies
+may arrive either way round, and the result is the same.
+
+	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X POST http://127.0.0.1:9999/_api/merge \
+	    -d '{"items":[{"namespace":"feeds/ips","value":"1.2.3.4",
+	         "counts":{"node-b":3},"stats":{"node-b":{"1600000000":3}},
+	         "first_seen":1600000000,"last_seen":1600003600,"tags":"tlp:amber"}]}'
+	{"message":"ok","changed":1,"items":[
+	  {"index":0,"namespace":"feeds/ips","value":"1.2.3.4","status":"ok",
+	   "changed":true,"count":3,"ignored_self":0}]}
+
+Sending it again changes nothing, and says so:
+
+	{"message":"ok","changed":0,"items":[{...,"changed":false,"count":3,...}]}
+
+`changed: false` is a **success**, not a failure. During catch-up it is how a
+caller learns it has converged.
+
+**Why this exists rather than reusing `/wb`.** `/w` means "add one", and
+replaying it doubles the count. Measured on two instances before this route:
+three sightings became nine after two rounds of reading a peer and writing back
+what was found.
+
+The rules, each chosen so it cannot depend on order:
+
+| field | merged by |
+| --- | --- |
+| `counts` | the greater of the two, per server — a server's own count only rises, so a stale copy cannot undo a newer one |
+| `stats` | the same, per hourly bucket |
+| `first_seen` | the earlier |
+| `last_seen` | the later |
+| `tags` | the union |
+| `ttl` | the shortest non-zero one, zero meaning never — a value is kept only as long as the most cautious server says |
+
+**An entry naming the receiving server is ignored** and counted in
+`ignored_self`. A peer does not get to say what this server has seen; that is
+the one thing here this server is the authority on. A non-zero `ignored_self`
+means the sender is confused about who it is talking to.
+
+Authorized as a write — the same ACL, the same `403` for internal namespaces,
+the same `421` for a namespace this server does not store — so a peer's key
+bounds what it may merge exactly as it bounds what it may write. Status codes
+follow the same rule as `/wb`: `200` for ok or partial, `403` when everything
+was refused, `400` when nothing merged for mixed reasons.
+
+A merge that brings a value into a namespace which did not hold it raises
+consensus once, exactly as a first write would — and replaying the merge does
+not raise it again.
 
 ### `POST /rb` — read many values
 
@@ -621,7 +698,23 @@ interface asks for one and calls the API below).
 	 "config_path":"/etc/sightingdb/sightingdb.toml","dbdir":"/var/lib/sightingdb",
 	 "snapshot_interval":300,"sweep_interval":60,"stats_retention":720,
 	 "shadow_ttl":2592000,"dns":null,"zmq":null,
-	 "namespaces":2,"apikeys":3,"default_tier":"hot","warm_idle":3600,"tiers":[]}
+	 "namespaces":2,"apikeys":3,"default_tier":"hot","warm_idle":3600,"tiers":[],
+	 "role":{"kind":"node","mirrors_everything":true,"namespaces":[],
+	         "peers":[],"max_hops":0}}
+
+`role` says what this server stores and who it knows about — the two things that
+decide its place in a galaxy:
+
+| field | |
+| --- | --- |
+| `kind` | `node` (stores namespaces, forwards nothing), `router` (stores none of its own, exists to forward), or `both`. A configuration, not a type |
+| `mirrors_everything` | whether it stores every namespace: a full mirror |
+| `namespaces` | the prefixes stored, when it is not everything. Empty on a router |
+| `peers` | peer urls. **Keys are never included** — they are credentials |
+| `max_hops` | how many hops a forwarded request may take, `0` when there is no `[galaxy]` |
+
+Nothing is forwarded to peers yet; they are parsed, validated and reported so a
+topology can be described before it can be used.
 
 ### `GET /_management/api/namespaces` — every namespace, paged
 
@@ -828,8 +921,71 @@ that probing cannot tell valid keys from invalid ones:
 	$ curl -H 'Authorization: analyst' 'http://127.0.0.1:9999/w/feeds/x?val=y'
 	{"message":"API key is not permitted to write this namespace."}       # 403
 
-The `_config` tree holds server state and is never reachable over HTTP — it is
-what would let a key holder mint further keys for themselves.
+### Namespaces this server does not store
+
+A server stores every namespace unless `namespaces` in `[storage]` narrows it.
+A write outside what it holds is refused with **421 Misdirected Request** — the
+request arrived somewhere that cannot serve it, which is neither forbidden nor
+missing:
+
+	$ curl -H 'Authorization: changeme' 'http://127.0.0.1:9999/w/other?val=1.2.3.4'
+	{"message":"This server does not store 'other'. Its [storage] namespaces list
+	  says what it holds."}                                               # 421
+
+`/wb` and `/vwb` report it per item, so a batch spanning the boundary still
+records what the server does hold:
+
+	{"message":"partial","written":1,"items":[
+	  {"index":0,"namespace":"feeds/a","value":"1.1.1.1","status":"ok","count":1},
+	  {"index":1,"namespace":"other","value":"2.2.2.2","status":"error",
+	   "error":"This server does not store 'other'. ..."}]}
+
+Reads of a namespace it does not hold are `404`, as they already were — it has
+no such namespace.
+
+Which server holds what is reported by
+[`/_management/api/info`](#get-_managementapiinfo--what-this-server-was-configured-to-do)
+under `role`.
+
+### Internal namespaces
+
+`_all`, `_shadow/*` and `_config` are written by the database about itself:
+`_all` is the consensus tally, `_shadow/*` records what was searched for, and
+`_config` held API keys on older deployments. **No write route can reach them**,
+whatever the key:
+
+	$ curl -H 'Authorization: changeme' 'http://127.0.0.1:9999/w/_all?val=1.2.3.4'
+	{"message":"'_all' is an internal namespace and is not writable from outside."}
+	                                                                          # 403
+
+That covers `/w`, `/wb`, `/vwb` and `/d` — deleting `_all` would discard every
+consensus tally at once. `/_management/api/values` and the tier route already
+refused them.
+
+`_all` is the one that matters: a client able to write it could give a value a
+consensus no namespace supports, which is the one number this database exists
+to be trusted about.
+
+**Reading them is a different matter and stays allowed**, apart from `_config`:
+
+	$ curl -H 'Authorization: changeme' 'http://127.0.0.1:9999/r/_all?val=1.2.3.4&noshadow'
+	{"value":"1.2.3.4",...,"count":1,...}          # how many namespaces hold it
+
+	$ curl -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/r/_shadow/feeds/ips?val=1.2.3.4&noshadow'
+	{"value":"1.2.3.4",...}                        # how often it was searched for
+
+	$ curl -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/r/_config/acl/apikeys/mine?val=x&noshadow'
+	{"message":"No access to _config namespace from outside!"}                # 403
+
+The underscore only counts on the **first** path segment, which is the same
+rule that decides which shard holds a namespace. `feeds/_private/ips` is an
+ordinary namespace and is writable:
+
+	$ curl -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/w/feeds/_private/ips?val=1.1.1.1'
+	{"message":"ok","count":1}
 
 
 See also

@@ -52,6 +52,46 @@ impl Platform {
     }
 }
 
+/// How a server takes part in a galaxy.
+///
+/// Not a kind of server — a server is whatever its storage set and peer set
+/// add up to. This is the question put to someone installing one, because the
+/// four combinations are what they are actually choosing between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Stores everything, knows no peers. One server on its own.
+    Standalone,
+    /// Stores namespaces; other servers forward to it. It needs no peers of
+    /// its own — they point at it.
+    Node,
+    /// Stores nothing of its own and forwards to peers. The entry point a
+    /// client talks to.
+    Router,
+    /// Stores some namespaces and forwards the rest.
+    Both,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Standalone => "standalone",
+            Mode::Node => "a node in a galaxy",
+            Mode::Router => "a router",
+            Mode::Both => "a node and a router",
+        }
+    }
+
+    /// Whether this mode has peers to forward to.
+    fn forwards(self) -> bool {
+        matches!(self, Mode::Router | Mode::Both)
+    }
+
+    /// Whether it is part of a galaxy at all, and so wants a name of its own.
+    fn in_galaxy(self) -> bool {
+        self != Mode::Standalone
+    }
+}
+
 /// Everything the wizard decided, so it can be shown before it is done.
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -69,6 +109,12 @@ pub struct Plan {
     pub listen_ip: String,
     pub listen_port: u16,
     pub authenticate: bool,
+    pub mode: Mode,
+    /// What this server stores. `None` means everything, which is what a
+    /// standalone one wants and what leaving the setting out means.
+    pub namespaces: Option<Vec<String>>,
+    /// This server's name in its own counters.
+    pub node_id: String,
     pub admin_key: String,
     /// Where the binary should live so the service manager can reach it.
     pub binary: PathBuf,
@@ -148,45 +194,412 @@ impl Plan {
             "  API authentication       {}",
             if self.authenticate { "on" } else { "off" }
         );
+        let _ = writeln!(out, "  running as               {}", self.mode.label());
+        match &self.namespaces {
+            None => {
+                let _ = writeln!(out, "  stores                   every namespace");
+            }
+            Some(held) if held.is_empty() => {
+                let _ = writeln!(
+                    out,
+                    "  stores                   nothing of its own; forwards to its peers"
+                );
+            }
+            Some(held) => {
+                let _ = writeln!(out, "  stores                   {}", held.join(", "));
+            }
+        }
+        if self.mode.in_galaxy() {
+            let _ = writeln!(out, "  known in the galaxy as   {}", self.node_id);
+        }
+        if self.mode.forwards() {
+            let _ = writeln!(
+                out,
+                "\nIts peers are left commented out in the configuration: a peer's key comes\n\
+                 from that peer's own ACL, which does not exist until it is set up. Install\n\
+                 the other servers, create a key on each for this one, then fill in the\n\
+                 [galaxy] section and restart.\n\n\
+                 Until then it has no peers, so it reports itself as a node rather than\n\
+                 {} — which is what it is until they are filled in.",
+                self.mode.label()
+            );
+        }
         out
     }
 
     /// The configuration file this plan produces.
+    ///
+    /// Commented throughout, because this file is where someone goes to change
+    /// their mind and a setting whose purpose has to be looked up elsewhere is
+    /// a setting that does not get changed.
     pub fn config_toml(&self) -> String {
-        let mut out = String::from(
-            "# Written by `sightingdb --setup`. Edit freely: the program only ever\n\
-             # rewrites the acl_file and tiers_file named below.\n\n[daemon]\n",
+        let mut out = String::new();
+        let w = |out: &mut String, line: &str| {
+            let _ = writeln!(out, "{line}");
+        };
+
+        w(&mut out, "# Written by `sightingdb --setup`.");
+        w(&mut out, "#");
+        w(
+            &mut out,
+            "# Edit freely: the program rewrites only the acl_file and tiers_file",
         );
+        w(
+            &mut out,
+            "# named below, and only when a key or a tier is changed through the",
+        );
+        w(&mut out, "# management interface.");
+        w(&mut out, "#");
+        let _ = writeln!(out, "# This server is set up as {}.", self.mode.label());
+        w(&mut out, "");
+        w(&mut out, "[daemon]");
+
+        w(
+            &mut out,
+            "# Where the HTTP API listens. 127.0.0.1 answers only this",
+        );
+        w(&mut out, "# machine; 0.0.0.0 answers every interface.");
         let _ = writeln!(out, "listen_ip = \"{}\"", self.listen_ip);
         let _ = writeln!(out, "listen_port = {}", self.listen_port);
+
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# Require an API key on the sighting API. The management interface",
+        );
+        w(&mut out, "# always requires one, whatever this says.");
         let _ = writeln!(out, "authenticate = {}", self.authenticate);
-        let _ = writeln!(out, "daemonize = false");
+
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# Detaching is the service manager's job, so this stays false: it",
+        );
+        w(
+            &mut out,
+            "# wants a process in the foreground to supervise.",
+        );
+        w(&mut out, "daemonize = false");
+
+        w(&mut out, "");
         match &self.tls {
             Some(tls) => {
-                let _ = writeln!(out, "ssl = true");
+                w(
+                    &mut out,
+                    "# A self-signed certificate, written by --setup. Replace both",
+                );
+                w(
+                    &mut out,
+                    "# files with a real pair when you have one; nothing else changes.",
+                );
+                w(&mut out, "ssl = true");
                 let _ = writeln!(out, "ssl_cert = \"{}\"", tls.cert.display());
                 let _ = writeln!(out, "ssl_key = \"{}\"", tls.key.display());
             }
             None => {
-                let _ = writeln!(out, "ssl = false");
+                w(
+                    &mut out,
+                    "# Plain HTTP. Anything on the network can read the API key as it",
+                );
+                w(
+                    &mut out,
+                    "# goes past, so this wants a trusted network or a proxy in front.",
+                );
+                w(&mut out, "ssl = false");
             }
         }
-        let _ = writeln!(out, "\ndbdir = \"{}\"", self.dbdir.display());
-        let _ = writeln!(out, "snapshot_interval = 300");
-        let _ = writeln!(out, "sweep_interval = 60");
-        let _ = writeln!(out, "# 30 days of hourly statistics per value.");
-        let _ = writeln!(out, "stats_retention = 720");
-        let _ = writeln!(out, "shadow_ttl = 2_592_000");
-        let _ = writeln!(
-            out,
-            "# Rejected values kept for /_management/api/rejections."
+
+        w(&mut out, "");
+        w(&mut out, "# One file per top-level namespace lives here.");
+        let _ = writeln!(out, "dbdir = \"{}\"", self.dbdir.display());
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# Seconds between snapshots, and on a clean shutdown as well.",
         );
-        let _ = writeln!(out, "rejection_log = 1000");
-        let _ = writeln!(out, "\nacl_file = \"{}\"", self.acl_path.display());
-        let _ = writeln!(out, "\n[storage]");
-        let _ = writeln!(out, "default_tier = \"hot\"");
-        let _ = writeln!(out, "warm_idle = 3600");
+        w(
+            &mut out,
+            "# There is no write-ahead log, so a crash loses up to this much.",
+        );
+        w(&mut out, "snapshot_interval = 300");
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# How often expired values are reclaimed. A value stops being",
+        );
+        w(
+            &mut out,
+            "# visible the moment it expires; this is only when the space",
+        );
+        w(&mut out, "# comes back.");
+        w(&mut out, "sweep_interval = 60");
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# Hourly statistics buckets kept per value. 720 is 30 days.",
+        );
+        w(
+            &mut out,
+            "# 0 keeps all of them, and grows one bucket per hour forever.",
+        );
+        w(&mut out, "stats_retention = 720");
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# How long a shadow sighting — the record that something was",
+        );
+        w(
+            &mut out,
+            "# searched for — is kept. 2592000 is 30 days; 0 keeps them for",
+        );
+        w(&mut out, "# ever, so `_shadow/*` grows without bound.");
+        w(&mut out, "shadow_ttl = 2_592_000");
+        w(&mut out, "");
+        w(&mut out, "# Rejected values kept in memory, so");
+        w(
+            &mut out,
+            "# /_management/api/rejections can say which values were turned",
+        );
+        w(&mut out, "# away and why. 0 switches the record off.");
+        w(&mut out, "rejection_log = 1000");
+
+        w(&mut out, "");
+        if self.mode.in_galaxy() {
+            w(
+                &mut out,
+                "# This server's name in its own counters. Sightings are counted",
+            );
+            w(
+                &mut out,
+                "# per server so that merging two copies adds separate",
+            );
+            w(
+                &mut out,
+                "# contributions rather than replaying increments.",
+            );
+            w(&mut out, "#");
+            w(
+                &mut out,
+                "# It must be unique in the galaxy: two servers sharing a name",
+            );
+            w(
+                &mut out,
+                "# would each take the other's contribution for their own.",
+            );
+        } else {
+            w(
+                &mut out,
+                "# This server's name in its own counters. \"local\" is right for a",
+            );
+            w(
+                &mut out,
+                "# server on its own; give each member of a galaxy its own name.",
+            );
+        }
+        let _ = writeln!(out, "node_id = \"{}\"", self.node_id);
+
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# API keys and what each may reach. Rewritten by the management",
+        );
+        w(
+            &mut out,
+            "# interface when a key is saved, so a new key works without a",
+        );
+        w(&mut out, "# restart.");
+        let _ = writeln!(out, "acl_file = \"{}\"", self.acl_path.display());
+
+        w(&mut out, "");
+        w(&mut out, "[storage]");
+        match &self.namespaces {
+            None => {
+                w(
+                    &mut out,
+                    "# Which namespaces this server stores. Absent means all of",
+                );
+                w(&mut out, "# them, which is what a server on its own wants.");
+                w(&mut out, "#");
+                w(
+                    &mut out,
+                    "#   namespaces = [\"feeds\", \"threats\"]   those subtrees only",
+                );
+                w(
+                    &mut out,
+                    "#   namespaces = []                      nothing: a pure router",
+                );
+                w(&mut out, "#");
+                w(
+                    &mut out,
+                    "# Prefixes match whole path segments, so \"feeds\" holds",
+                );
+                w(&mut out, "# feeds/misp/ips and never feeds-internal.");
+                w(&mut out, "#namespaces = [\"/\"]");
+            }
+            Some(held) if held.is_empty() => {
+                w(
+                    &mut out,
+                    "# This server stores no namespace of its own: it forwards every",
+                );
+                w(
+                    &mut out,
+                    "# request to the peers below. A write to a namespace no peer",
+                );
+                w(&mut out, "# holds answers 421.");
+                w(&mut out, "#");
+                w(
+                    &mut out,
+                    "# The internal namespaces — _all, _shadow/*, _config — are held",
+                );
+                w(
+                    &mut out,
+                    "# regardless, because a server cannot keep its own consensus",
+                );
+                w(
+                    &mut out,
+                    "# tally otherwise. That tally is why a router is worth putting",
+                );
+                w(
+                    &mut out,
+                    "# in front of a galaxy: ask it /r/_all?val=<value> for a",
+                );
+                w(&mut out, "# value's consensus across everything below it.");
+                w(&mut out, "namespaces = []");
+            }
+            Some(held) => {
+                w(
+                    &mut out,
+                    "# Which namespaces this server stores. Prefixes match whole path",
+                );
+                w(
+                    &mut out,
+                    "# segments, so \"feeds\" holds feeds/misp/ips and never",
+                );
+                w(
+                    &mut out,
+                    "# feeds-internal. A write to anything else answers 421.",
+                );
+                let list = held
+                    .iter()
+                    .map(|n| format!("\"{n}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "namespaces = [{list}]");
+            }
+        }
+
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# How long a top-level namespace stays in memory: hot is never",
+        );
+        w(
+            &mut out,
+            "# evicted, warm is dropped after warm_idle seconds untouched,",
+        );
+        w(&mut out, "# cold is read back on demand.");
+        w(&mut out, "default_tier = \"hot\"");
+        w(&mut out, "warm_idle = 3600");
+        w(
+            &mut out,
+            "# Rewritten by the management interface when a tier is changed.",
+        );
         let _ = writeln!(out, "tiers_file = \"{}\"", self.tiers_path.display());
+
+        if self.mode.forwards() {
+            w(&mut out, "");
+            w(
+                &mut out,
+                "# ---------------------------------------------------------------",
+            );
+            w(&mut out, "# The other servers this one forwards to.");
+            w(&mut out, "#");
+            w(
+                &mut out,
+                "# Left commented out because a peer's key comes from that peer's",
+            );
+            w(
+                &mut out,
+                "# own ACL, which does not exist until it has been set up. Install",
+            );
+            w(
+                &mut out,
+                "# the other servers, create a key on each for this one, then fill",
+            );
+            w(&mut out, "# this in and restart.");
+            w(&mut out, "#");
+            w(
+                &mut out,
+                "# The key is the bound on what this server may do there: the",
+            );
+            w(
+                &mut out,
+                "# peer's own ACL decides, so a key granted \"rw:feeds\" cannot",
+            );
+            w(
+                &mut out,
+                "# write anywhere else however this server is configured or",
+            );
+            w(
+                &mut out,
+                "# compromised. Give each the narrowest grant that works.",
+            );
+            w(&mut out, "#");
+            w(
+                &mut out,
+                "# `namespaces` on a peer says what that peer holds, so a request",
+            );
+            w(
+                &mut out,
+                "# can be sent where it can be served. Absent means a full mirror.",
+            );
+            w(
+                &mut out,
+                "# It has to agree with that peer's own [storage] namespaces.",
+            );
+            w(&mut out, "#");
+            w(
+                &mut out,
+                "# Writes go to every mirror of a namespace; reads to one, chosen",
+            );
+            w(
+                &mut out,
+                "# by the value so the same value always comes from the same place.",
+            );
+            w(&mut out, "#");
+            w(
+                &mut out,
+                "# max_hops is spent on each hop and refused at zero. A peer may",
+            );
+            w(
+                &mut out,
+                "# itself be a router, so this is what stops a miswired cycle.",
+            );
+            w(
+                &mut out,
+                "# ---------------------------------------------------------------",
+            );
+            w(&mut out, "#[galaxy]");
+            w(&mut out, "#max_hops = 4");
+            w(&mut out, "#health_interval = 30");
+            w(
+                &mut out,
+                "# Off for a galaxy of self-signed instances, which is what",
+            );
+            w(&mut out, "# --setup produces.");
+            w(&mut out, "#verify_tls = true");
+            w(&mut out, "#peers = [");
+            w(
+                &mut out,
+                "#  { url = \"https://node-a.example:9999\", key = \"...\" },",
+            );
+            w(
+                &mut out,
+                "#  { url = \"https://node-b.example:9999\", key = \"...\", namespaces = [\"feeds\"] },",
+            );
+            w(&mut out, "#]");
+        }
+
         out
     }
 
@@ -1231,6 +1644,92 @@ fn ask_yes_no(question: &str, default: bool) -> Result<bool> {
 }
 
 /// What to do about a file that is already there.
+/// Which of the four shapes this server is.
+///
+/// Asked as a question about what it is for rather than about settings,
+/// because `namespaces` and `peers` are the settings and the four useful
+/// combinations of them are what someone is actually choosing between.
+fn ask_mode() -> Result<Mode> {
+    println!(
+        "\nHow should this server run?\n\
+         \x20 1) standalone          stores everything, no other servers (the usual answer)\n\
+         \x20 2) node in a galaxy    stores namespaces; other servers forward to it\n\
+         \x20 3) router              stores nothing of its own; forwards to its peers\n\
+         \x20 4) node and router     stores some namespaces and forwards the rest\n"
+    );
+    loop {
+        match ask("Mode [1-4]", "1")?.trim() {
+            "1" => return Ok(Mode::Standalone),
+            "2" => return Ok(Mode::Node),
+            "3" => return Ok(Mode::Router),
+            "4" => return Ok(Mode::Both),
+            other => println!("  '{other}' is not one of 1, 2, 3 or 4."),
+        }
+    }
+}
+
+/// What this server stores, for the modes where that is a choice.
+fn ask_namespaces(mode: Mode) -> Result<Option<Vec<String>>> {
+    match mode {
+        // Everything, which is what leaving the setting out means.
+        Mode::Standalone => Ok(None),
+        // Stores nothing of its own.
+        Mode::Router => Ok(Some(Vec::new())),
+        Mode::Node | Mode::Both => {
+            println!(
+                "\nWhich namespaces does this server store? A comma separated list of\n\
+                 prefixes — 'feeds, threats' holds those subtrees — or '/' for all of them.\n\
+                 Prefixes match whole path segments, so 'feeds' holds feeds/misp/ips and\n\
+                 never feeds-internal."
+            );
+            let answer = ask("Namespaces", if mode == Mode::Node { "/" } else { "feeds" })?;
+            let held: Vec<String> = answer
+                .split(',')
+                .map(|part| part.trim().trim_matches('/').to_string())
+                .filter(|part| !part.is_empty())
+                .collect();
+            // `/` trims to nothing, which here means everything rather than
+            // the router's nothing — so an empty list from a non-empty answer
+            // is the whole tree.
+            Ok(if held.is_empty() { None } else { Some(held) })
+        }
+    }
+}
+
+/// A name for this server, defaulting to its hostname.
+///
+/// The hostname is the one name already unique among machines, which is what a
+/// node id has to be. Falls back to the standalone name when it cannot be read.
+fn default_node_id() -> String {
+    let from_file = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string));
+
+    let from_command = || {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .and_then(|text| text.split_whitespace().next().map(str::to_string))
+    };
+
+    from_file
+        .or_else(from_command)
+        // Only the part before the first dot, and only characters a node id
+        // may carry.
+        .map(|name| {
+            name.split('.')
+                .next()
+                .unwrap_or(&name)
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                .take(64)
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| crate::db::LOCAL_NODE.to_string())
+}
+
 fn ask_replace(path: &Path, what: &str) -> Result<bool> {
     println!("\n  {} already exists at {}", what, path.display());
     ask_yes_no("  replace it?", false)
@@ -1331,6 +1830,16 @@ fn build_plan(platform: Platform, scope: Scope, root: bool) -> Result<Plan> {
         }
     };
 
+    let mode = ask_mode()?;
+    let namespaces = ask_namespaces(mode)?;
+    let node_id = if mode.in_galaxy() {
+        // Unique per server, because two sharing a name would each take the
+        // other's contribution for their own.
+        ask("This server's name in the galaxy", &default_node_id())?
+    } else {
+        crate::db::LOCAL_NODE.to_string()
+    };
+
     let listen_ip = ask("Listen address", "127.0.0.1")?;
     let listen_port: u16 = ask_parsed("Listen port", "9999", "a port number")?;
     let use_tls = ask_yes_no("Serve HTTPS with a self-signed certificate?", true)?;
@@ -1363,6 +1872,9 @@ fn build_plan(platform: Platform, scope: Scope, root: bool) -> Result<Plan> {
         listen_ip,
         listen_port,
         authenticate,
+        mode,
+        namespaces,
+        node_id,
         admin_key: random_key(),
         binary,
         service_path,
@@ -2055,12 +2567,180 @@ mod tests {
         assert!(safe_to_tidy(Path::new("/etc/sightingdb")));
     }
 
+    /// Whatever mode is chosen, the file it writes must load.
+    ///
+    /// The point of generating a configuration is that it starts; a template
+    /// the program cannot read back is worse than no template, and the
+    /// comments are easy to get wrong in a way only parsing catches.
+    #[test]
+    fn every_mode_writes_a_configuration_that_loads() {
+        let cases = [
+            ("standalone", Mode::Standalone, None),
+            ("node-all", Mode::Node, None),
+            ("node-some", Mode::Node, Some(vec!["feeds".to_string()])),
+            ("router", Mode::Router, Some(Vec::new())),
+            (
+                "both",
+                Mode::Both,
+                Some(vec!["feeds".to_string(), "threats".to_string()]),
+            ),
+        ];
+
+        for (name, mode, namespaces) in cases {
+            for tls in [true, false] {
+                let dir = TempDir::new(&format!("{name}-{tls}"));
+                let plan = plan_as(&dir.0, Platform::Linux, tls, mode, namespaces.clone());
+                let toml = plan.config_toml();
+
+                fs::create_dir_all(plan.config_dir.clone()).unwrap();
+                fs::write(&plan.config_path, &toml).unwrap();
+                let settings = crate::config::Settings::load(&plan.config_path)
+                    .unwrap_or_else(|e| panic!("{name} tls={tls} did not load: {e:#}\n{toml}"));
+
+                // And what it loaded is what was asked for.
+                assert_eq!(settings.node_id, plan.node_id, "{name}");
+                match &namespaces {
+                    None => assert!(
+                        settings.storage.stores_everything(),
+                        "{name} should store everything:\n{toml}"
+                    ),
+                    Some(held) if held.is_empty() => assert!(
+                        settings.storage.is_router(),
+                        "{name} should be a router:\n{toml}"
+                    ),
+                    Some(held) => {
+                        for prefix in held {
+                            assert!(
+                                settings.storage.holds(prefix),
+                                "{name} should hold {prefix}:\n{toml}"
+                            );
+                        }
+                        assert!(
+                            !settings.storage.holds("somewhere-else"),
+                            "{name} should not hold everything:\n{toml}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A galaxy section is offered to the modes that forward and not to the
+    /// others, and it is commented out — a peer's key comes from that peer's
+    /// own ACL, which does not exist yet when this file is written.
+    #[test]
+    fn a_galaxy_template_is_offered_only_where_it_is_wanted() {
+        let dir = TempDir::new("galaxytemplate");
+
+        for mode in [Mode::Standalone, Mode::Node] {
+            let toml = plan_as(&dir.0, Platform::Linux, true, mode, None).config_toml();
+            assert!(
+                !toml.contains("[galaxy]"),
+                "{} was offered a galaxy section:\n{toml}",
+                mode.label()
+            );
+        }
+
+        for mode in [Mode::Router, Mode::Both] {
+            let namespaces = if mode == Mode::Router {
+                Some(Vec::new())
+            } else {
+                Some(vec!["feeds".to_string()])
+            };
+            let toml = plan_as(&dir.0, Platform::Linux, true, mode, namespaces).config_toml();
+            assert!(
+                toml.contains("#[galaxy]"),
+                "{} has no galaxy template:\n{toml}",
+                mode.label()
+            );
+            // Commented, so the file still loads before the peers exist.
+            assert!(
+                !toml
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("[galaxy]")),
+                "the galaxy section is live and will fail to load:\n{toml}"
+            );
+            assert!(toml.contains("namespaces = [\"feeds\"]"), "{toml}");
+        }
+    }
+
+    /// The generated file is mostly explanation, which is the point: it is
+    /// where someone goes to change their mind.
+    #[test]
+    fn the_generated_configuration_explains_itself() {
+        let dir = TempDir::new("comments");
+        let toml = plan_as(
+            &dir.0,
+            Platform::Linux,
+            true,
+            Mode::Router,
+            Some(Vec::new()),
+        )
+        .config_toml();
+
+        let comments = toml
+            .lines()
+            .filter(|l| l.trim_start().starts_with('#'))
+            .count();
+        let settings = toml
+            .lines()
+            .filter(|l| l.contains('=') && !l.trim_start().starts_with('#'))
+            .count();
+        assert!(
+            comments > settings,
+            "only {comments} comment lines for {settings} settings:\n{toml}"
+        );
+
+        // Each section says what it is for.
+        for mentioned in ["[daemon]", "[storage]", "node_id", "snapshot_interval"] {
+            assert!(toml.contains(mentioned), "{mentioned} missing:\n{toml}");
+        }
+        assert!(
+            toml.contains("set up as a router"),
+            "the file does not say what mode it is:\n{toml}"
+        );
+    }
+
+    /// A node id has to be usable as one: the hostname is cleaned up rather
+    /// than written through, since a dotted or odd name would be refused by
+    /// the configuration loader this same setup just wrote a file for.
+    #[test]
+    fn the_default_node_id_is_a_usable_one() {
+        let id = default_node_id();
+
+        assert!(!id.is_empty());
+        assert!(id.len() <= 64, "{id}");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')),
+            "{id} has characters a node id may not carry"
+        );
+    }
+
     /// A plan that only touches the given directory: no user, no service.
     fn plan_in(dir: &Path, platform: Platform, tls: bool) -> Plan {
+        plan_as(dir, platform, tls, Mode::Standalone, None)
+    }
+
+    /// The same, in a chosen mode.
+    fn plan_as(
+        dir: &Path,
+        platform: Platform,
+        tls: bool,
+        mode: Mode,
+        namespaces: Option<Vec<String>>,
+    ) -> Plan {
         let config_dir = dir.join("etc");
         Plan {
             scope: Scope::User,
             platform,
+            mode,
+            namespaces,
+            node_id: if mode == Mode::Standalone {
+                crate::db::LOCAL_NODE.to_string()
+            } else {
+                "test-node".to_string()
+            },
             service_user: None,
             config_path: config_dir.join("sightingdb.toml"),
             acl_path: config_dir.join("acl.toml"),

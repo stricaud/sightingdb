@@ -252,6 +252,18 @@ Omit `val=` to list every value in a namespace:
 
 Reading is recorded as a "shadow sighting" under `_shadow/<namespace>`, so you can see how often a value was searched for. Add `noshadow` to the query string to suppress that.
 
+Namespaces whose first path segment begins with `_` are internal: `_all` is the
+consensus tally, `_shadow/*` is what was searched for, and `_config` held API
+keys on older deployments. The database writes them about itself, and **no
+write route can reach them** — `/w`, `/wb`, `/vwb` and `/d` all answer `403`,
+whatever the key. A client able to write `_all` could give a value a consensus
+no namespace supports.
+
+Reading them stays allowed apart from `_config`, so `/r/_all?val=<value>` is
+how you ask what a value's consensus is, and `/r/_shadow/<namespace>` is how
+you review searches. The underscore only counts at the front:
+`feeds/_private/ips` is an ordinary namespace.
+
 To ask how many values a namespace holds without fetching them:
 
 	$ curl -k 'https://localhost:9999/r/my/namespace/?count'
@@ -968,6 +980,221 @@ Name any namespace and the setting lands on its shard, which the reply says out
 loud: a change made from a row deep in a tree is a change to everything beside
 it. Either field takes `"default"` to stop overriding and go back to
 `[storage]`, and a change is written to `tiers_file` so it survives a restart.
+
+Setting one up
+--------------
+
+`sightingdb --setup` asks how the server should run before anything else:
+
+	How should this server run?
+	  1) standalone          stores everything, no other servers (the usual answer)
+	  2) node in a galaxy    stores namespaces; other servers forward to it
+	  3) router              stores nothing of its own; forwards to its peers
+	  4) node and router     stores some namespaces and forwards the rest
+
+Standalone is the usual answer, and the three others are the shapes a galaxy is
+built from. For anything but standalone it also asks which namespaces the server
+stores, and for a name — unique in the galaxy, defaulting to the hostname,
+because two servers sharing a name would each take the other's contribution for
+their own.
+
+The configuration it writes is commented throughout, so the file is where you go
+to change your mind rather than somewhere to look settings up from. For a
+forwarding mode it includes a `[galaxy]` template, **commented out**: a peer's
+key comes from that peer's own ACL, which does not exist until that peer has
+been set up. So install the other servers first, create a key on each for this
+one, then fill it in and restart. Until then the server has no peers and
+reports itself as a plain node, which is what it is.
+
+What a server stores
+--------------------
+
+By default a server stores every namespace, which is what a standalone one
+wants. `namespaces` in `[storage]` narrows it:
+
+	[storage]
+	namespaces = ["/"]                  # everything, said explicitly (the default)
+	#namespaces = ["feeds", "threats"]  # those subtrees and nothing else
+	#namespaces = []                    # nothing of its own: a pure router
+
+Prefixes match whole path segments, so `feeds` holds `feeds/misp/ips` and never
+`feeds-internal`. The internal namespaces — `_all`, `_shadow/*`, `_config` — are
+always held whatever this says, because a server cannot keep its own consensus
+tally otherwise; listing one is an error.
+
+A write to a namespace the server does not store is refused with **421
+Misdirected Request**: the request arrived somewhere that cannot serve it,
+which is neither forbidden nor missing and needs to stay distinguishable from
+both. Reads of a namespace it does not hold are `404`, as they already were.
+
+	$ curl -k 'https://localhost:9999/w/other?val=1.2.3.4'
+	{"message":"This server does not store 'other'. Its [storage] namespaces list
+	  says what it holds."}                                               # 421
+
+Counting, and node identity
+---------------------------
+
+A sighting is counted **per server**, not as one running total. The stored
+shape is a map from node id to count, and what a client is given is the sum —
+so nothing a reader sees changes.
+
+The reason is that an increment is not idempotent. `/w` means "add one", so any
+sync that read a peer and wrote back what it found would double the count, and
+double it again on the next round. Keeping each server's contribution separate
+makes merging two copies a union of disjoint entries: applying the same merge
+twice changes nothing, which is what makes replication safe to retry.
+
+	[daemon]
+	node_id = "local"
+
+`local` is right until the server joins a galaxy. Then give each one its own
+name — two sharing an id would each take the other's contribution for their own,
+and a merge would lose one of them. Letters, digits, `-`, `_` and `.`, up to 64
+characters.
+
+Changing it later is safe but not free: the old name keeps its contribution in
+the stored data and the new one starts from zero, so the total is unchanged
+while the attribution splits in two.
+
+Hourly statistics are kept the same way and reported merged, so `/rs` shows one
+bucket per hour however many servers contributed to it. `stats_retention` is
+counted within each server's own buckets, since retention means "how far back
+this server remembers" rather than something to be shared out.
+
+### Upgrading
+
+The snapshot format is version 2. A version 1 database — one total per value —
+**opens and is migrated on load**: the totals become the reading server's own
+contribution, which is the only thing they can be, and the file is rewritten in
+the new shape on the next save. Nothing to do by hand.
+
+	INFO  ...feeds-eacacfab.json.zst is version 1; migrating to version 2 on load
+
+A snapshot from a *newer* build is refused rather than rewritten, so a
+downgrade cannot quietly drop fields it does not know about.
+
+### Syncing between servers
+
+`POST /_api/merge` folds a peer's copy of a value into this server's. It is not
+a sighting — nothing is counted — and every field combines by a rule that
+ignores order and repetition, so the same merge can be sent twice and two peers'
+copies can arrive either way round:
+
+	counts      the greater of the two, per server
+	stats       the same, per hourly bucket
+	first_seen  the earlier          last_seen   the later
+	tags        the union
+	ttl         the shortest non-zero one, zero meaning never
+
+Read what to send with `?for_merge`, which answers in exactly the shape the
+merge route takes:
+
+	$ curl -k 'https://localhost:9999/r/feeds/ips?val=1.2.3.4&noshadow&for_merge'
+	{"counts":{"node-a":3},"stats":{"node-a":{"1791658800":3}},
+	 "first_seen":1791660347,"last_seen":1791660347,"tags":"","ttl":0}
+
+The counts are **per server**, which is the whole point: offering a total would
+make the receiver attribute every server's sightings to the sender, and two
+servers exchanging totals inflate each other without bound.
+
+An entry naming the receiving server is ignored and reported in
+`ignored_self` — a peer does not get to say what this server has seen.
+
+Merging is authorized as a write, so a peer's key bounds what it may merge
+exactly as it bounds what it may write.
+
+`changed: false` on an item means the local copy already held everything
+offered. That is a success: during catch-up it is how a caller learns it has
+converged.
+
+Galaxy
+------
+
+`[galaxy]` lists the other servers this one knows about:
+
+	[galaxy]
+	max_hops = 4
+	peers = [
+	  { url = "https://node-a.example:9999", key = "..." },
+	  { url = "https://node-b.example:9999", key = "..." },
+	]
+
+**Nothing is forwarded yet.** At this stage the peers are parsed, validated and
+reported — `/_management/api/info` carries a `role` object describing what this
+server stores and who it knows — so that a topology can be described before it
+can be used.
+
+Each peer carries the key this server authenticates to it with, and **that key
+is the bound on what this server may do there**. A key granted `rw:feeds` on the
+peer cannot write anywhere else, however this server is configured or
+compromised, because the peer's own ACL decides. Give each one the narrowest
+grant that does the job.
+
+`max_hops` is what stops a miswired cascade: a cycle inflates every count that
+travels round it, so it is a limit rather than a tuning knob. A peer may itself
+have peers, so a router in front of routers is allowed.
+
+### Forwarding
+
+A server that does not store a namespace passes the request to the peers that
+do, so a client talks only to the entry point and never needs to know the
+topology.
+
+	peers = [
+	  { url = "https://node-a:9999", key = "..." },
+	  { url = "https://node-b:9999", key = "...", namespaces = ["feeds"] },
+	]
+
+`namespaces` on a peer says what it holds — absent means a full mirror. It is
+declared here rather than asked of the peer, because discovery would need the
+peer key to carry an `admin` grant and the point of that key is to be the
+narrowest thing that works. The cost is that it must agree with the peer's own
+`[storage] namespaces`.
+
+**Writes fan out** to every live mirror of the namespace. **Reads go to one**,
+chosen by hashing the value over the mirrors, so the same value is always read
+from the same place while the mirror set is unchanged — without that, two
+consecutive reads could be served by mirrors at different stages of catching up
+and show a count going *down*.
+
+A mirror being down does not fail a write: the mirror that took it is what the
+others catch up from. What is refused is a write that reached no mirror at all.
+
+	$ curl -k 'https://lb:9999/w/feeds/ips?val=1.2.3.4'   # lb stores nothing
+	{"message":"ok","count":1,"new":true}
+
+Answers carry `X-SightingDB-Forwarded: 1`. A request for a namespace nowhere in
+reach is `421`; a cascade wired in a loop is `508`, caught by `max_hops`.
+
+**A forwarded write is counted for the server it came from**, not for each
+mirror that stores it. Without that, one write fanned out to two mirrors is
+counted twice over and merging them adds the two together — three writes
+through a load balancer became six once the mirrors synced. The origin travels
+in `X-SightingDB-Origin` and is passed along unchanged, so the attribution is
+the entry point the client actually talked to.
+
+### Seeing the galaxy
+
+`GET /_management/api/galaxy` walks the peers, so one request describes a whole
+cascade: this server, its peers with their health, and each peer's own answer
+under `below`. The management interface draws it under **Galaxy** — routers as
+diamonds, full mirrors and partial mirrors in different colours, and red kept
+for a server that is not answering.
+
+Misconfiguration is refused at startup rather than at the first forward — a
+peer without a key, a url without a scheme, the same peer listed twice, or
+`max_hops = 0`.
+
+The `role` object reports which of the three a server is:
+
+	$ curl -k -H 'Authorization: changeme' https://localhost:9999/_management/api/info
+	{..., "role": {"kind": "router", "mirrors_everything": false,
+	       "namespaces": [], "peers": ["https://node-a:9999"], "max_hops": 3}}
+
+`kind` is `node` (stores namespaces, forwards nothing), `router` (stores none of
+its own, exists to forward) or `both`. It describes a configuration, not a type:
+any server can be any of them. Peer **keys are never in the response** — they
+are credentials.
 It needs write access to the namespace, and a configured `tiers_file` — without
 one the tiers are whatever the configuration says and cannot be changed here.
 

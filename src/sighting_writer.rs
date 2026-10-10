@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 
-use crate::db::{CONFIG_PREFIX, Database, WriteOpts};
+use crate::db::{Database, WriteOpts};
 use crate::error::ApiError;
 
 /// Record one sighting, returning the new count for that value.
@@ -15,7 +15,7 @@ pub fn write(
     value: &str,
     when: Option<DateTime<Utc>>,
     ttl: Option<u64>,
-) -> Result<u64, ApiError> {
+) -> Result<crate::db::Written, ApiError> {
     write_tagged(db, namespace, value, when, ttl, "")
 }
 
@@ -31,10 +31,31 @@ pub fn write_tagged(
     when: Option<DateTime<Utc>>,
     ttl: Option<u64>,
     tags: &str,
-) -> Result<u64, ApiError> {
-    check(namespace, value)?;
+) -> Result<crate::db::Written, ApiError> {
+    write_tagged_as(db, None, namespace, value, when, ttl, tags)
+}
 
-    Ok(db.write_tagged(
+/// The same, counted for whoever the sighting came from.
+///
+/// `origin` is `Some` when the write was forwarded here: it is counted for the
+/// server it arrived from rather than for this one, so one write fanned out to
+/// several mirrors is one contribution on all of them instead of a separate one
+/// each. Merging mirrors that already agree then changes nothing, which is the
+/// point.
+pub fn write_tagged_as(
+    db: &Database,
+    origin: Option<&str>,
+    namespace: &str,
+    value: &str,
+    when: Option<DateTime<Utc>>,
+    ttl: Option<u64>,
+    tags: &str,
+) -> Result<crate::db::Written, ApiError> {
+    check(db, namespace, value)?;
+
+    let node = origin.unwrap_or_else(|| db.node());
+    Ok(db.write_tagged_as(
+        node,
         namespace,
         value,
         when.unwrap_or_else(Utc::now),
@@ -57,14 +78,22 @@ pub fn write_tagged(
 /// what makes the dry run possible — none of it depends on database state, so
 /// passing this check today means the write is accepted today. It says nothing
 /// about a later write, since the ACL can change underneath it.
-pub fn check(namespace: &str, value: &str) -> Result<(), ApiError> {
+pub fn check(db: &Database, namespace: &str, value: &str) -> Result<(), ApiError> {
     if value.is_empty() {
         return Err(ApiError::EmptyValue);
     }
-    // The `_config` tree holds API keys. Letting it be written over HTTP would
-    // let any key holder mint further keys for themselves.
-    if namespace.starts_with(CONFIG_PREFIX) {
-        return Err(ApiError::ConfigNamespace);
+    // `_all`, `_shadow/*` and `_config` are written by the database about
+    // itself. A client writing `_all` could claim a consensus no namespace
+    // supports; a client writing `_config` could mint itself keys on an older
+    // deployment. Neither is reachable from here — see [`crate::db::is_internal`].
+    if crate::db::is_internal(namespace) {
+        return Err(ApiError::InternalNamespace(namespace.to_string()));
+    }
+    // A server told which namespaces it holds will not quietly take one it was
+    // not given. Forwarding does not exist yet, so for now this is where such
+    // a write stops rather than where it is passed on.
+    if !db.holds(namespace) {
+        return Err(ApiError::NotStored(namespace.to_string()));
     }
     Ok(())
 }
@@ -116,8 +145,13 @@ mod tests {
     fn write_returns_the_running_count() {
         let db = Database::default();
 
-        assert_eq!(write(&db, "ns", "v", None, None).unwrap(), 1);
-        assert_eq!(write(&db, "ns", "v", None, None).unwrap(), 2);
+        let first = write(&db, "ns", "v", None, None).unwrap();
+        assert_eq!(first.count, 1);
+        assert!(first.new, "the first sighting was not reported as new");
+
+        let second = write(&db, "ns", "v", None, None).unwrap();
+        assert_eq!(second.count, 2);
+        assert!(!second.new, "a repeat sighting was reported as new");
     }
 
     #[test]
@@ -148,15 +182,72 @@ mod tests {
         );
     }
 
+    /// No internal namespace is writable from outside — not just `_config`.
+    ///
+    /// `_all` is the one that matters most: a client able to write it could
+    /// claim a consensus no namespace supports, and consensus is the number
+    /// this database exists to be trusted about.
     #[test]
-    fn config_namespace_is_not_writable() {
+    fn no_internal_namespace_is_writable() {
+        for namespace in [
+            "_all",
+            "_shadow/feeds/ips",
+            "_config/acl/apikeys/mine",
+            "_internal",
+            "_anything/at/all",
+        ] {
+            let db = Database::new();
+            assert_eq!(
+                write(&db, namespace, "x", None, None).unwrap_err(),
+                ApiError::InternalNamespace(namespace.to_string()),
+                "{namespace} was writable"
+            );
+            assert!(!db.namespace_exists(namespace), "{namespace} was created");
+        }
+    }
+
+    /// The underscore only counts at the front: a namespace is internal
+    /// because of its first segment, which is the same rule that decides
+    /// which shard holds it.
+    #[test]
+    fn an_underscore_further_in_is_an_ordinary_namespace() {
         let db = Database::new();
 
         assert_eq!(
-            write(&db, "_config/acl/apikeys/mine", "x", None, None).unwrap_err(),
-            ApiError::ConfigNamespace
+            write(&db, "feeds/_private/ips", "x", None, None)
+                .unwrap()
+                .count,
+            1
         );
-        assert!(!db.namespace_exists("_config/acl/apikeys/mine"));
+        assert!(db.namespace_exists("feeds/_private/ips"));
+    }
+
+    /// Refusing the writes must not stop the database writing them itself:
+    /// consensus is maintained through `Database::write_tagged`, which does
+    /// not go through this guard.
+    #[test]
+    fn the_guard_does_not_break_consensus_bookkeeping() {
+        let db = Database::new();
+
+        write(&db, "feeds/a", "1.2.3.4", None, None).unwrap();
+        assert_eq!(
+            db.view(
+                "feeds/a",
+                "1.2.3.4",
+                db.count(crate::db::ALL_NAMESPACE, "1.2.3.4"),
+                false
+            )
+            .unwrap()
+            .consensus,
+            1
+        );
+
+        write(&db, "feeds/b", "1.2.3.4", None, None).unwrap();
+        assert_eq!(
+            db.count(crate::db::ALL_NAMESPACE, "1.2.3.4"),
+            2,
+            "the consensus tally stopped being kept"
+        );
     }
 
     #[test]

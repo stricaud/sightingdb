@@ -12,6 +12,10 @@ use crate::db::NotFound;
 pub enum ApiError {
     /// The `_config` tree is server state and is not reachable over HTTP.
     ConfigNamespace,
+    /// A write aimed at a namespace the database keeps for itself.
+    InternalNamespace(String),
+    /// A write aimed at a namespace this server does not store.
+    NotStored(String),
     /// No such namespace, or no such value inside it.
     NotFound(NotFound),
     /// A write with nothing to record.
@@ -40,6 +44,15 @@ impl std::fmt::Display for ApiError {
             ApiError::ConfigNamespace => {
                 write!(f, "No access to _config namespace from outside!")
             }
+            ApiError::InternalNamespace(namespace) => write!(
+                f,
+                "'{namespace}' is an internal namespace and is not writable from outside."
+            ),
+            ApiError::NotStored(namespace) => write!(
+                f,
+                "This server does not store '{namespace}'. Its [storage] namespaces \
+                 list says what it holds."
+            ),
             ApiError::NotFound(nf) => write!(f, "{}", nf.error),
             ApiError::EmptyValue => write!(f, "Refusing to write an empty value."),
             ApiError::InvalidTimestamp(ts) => write!(f, "Timestamp out of range: {ts}"),
@@ -52,7 +65,12 @@ impl std::error::Error for ApiError {}
 impl ApiError {
     pub fn status(&self) -> StatusCode {
         match self {
-            ApiError::ConfigNamespace => StatusCode::FORBIDDEN,
+            ApiError::ConfigNamespace | ApiError::InternalNamespace(_) => StatusCode::FORBIDDEN,
+            // Not "forbidden" and not "missing": the request arrived somewhere
+            // that cannot serve it. Once forwarding exists this is what a
+            // router answers when no peer holds the namespace either, and it
+            // has to stay distinguishable from a genuine 404 to be debuggable.
+            ApiError::NotStored(_) => StatusCode::MISDIRECTED_REQUEST,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::EmptyValue | ApiError::InvalidTimestamp(_) => StatusCode::BAD_REQUEST,
         }
@@ -65,6 +83,9 @@ impl ApiError {
             ApiError::NotFound(nf) => serde_json::json!(nf),
             ApiError::ConfigNamespace => {
                 serde_json::json!(Message::new("No access to _config namespace from outside!"))
+            }
+            ApiError::InternalNamespace(_) | ApiError::NotStored(_) => {
+                serde_json::json!(Message::new(self.to_string()))
             }
             ApiError::EmptyValue => {
                 serde_json::json!(Message::new("Refusing to write an empty value."))

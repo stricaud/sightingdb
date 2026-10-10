@@ -73,6 +73,22 @@ paths:
       description: |
         Counts one sighting of `val` in `namespace`, creating the namespace if
         it is new, and answers with the running count.
+
+        A server that does not store this namespace forwards the write to every
+        live mirror that does, and answers with the first that accepted it. The
+        answer carries `X-SightingDB-Forwarded: 1`. A namespace nowhere in
+        reach is `421`; a galaxy wired in a loop is `508`.
+
+        A forwarded write is counted for the server it came from rather than
+        for each mirror that stores it, so fanning one write out to several
+        mirrors is one contribution on all of them. See `X-SightingDB-Origin`
+        in the README.
+
+        Namespaces whose first path segment begins with `_` — `_all`,
+        `_shadow/*`, `_config` — are written by the database about itself and
+        are not writable from outside, whatever the key: `403`. The same holds
+        for `/wb`, `/vwb` and `/d`. Reading them stays allowed apart from
+        `_config`, so `/r/_all?val=` is how a value's consensus is asked for.
       parameters:
         - $ref: "#/components/parameters/Namespace"
         - name: val
@@ -420,6 +436,80 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /_api/merge:
+    post:
+      tags: [bulk]
+      summary: Fold a peer's copy of values into ours
+      description: |
+        How a galaxy syncs. **Not a sighting**: nothing is counted here. The
+        sender states what each server has seen, and every field is combined by
+        a rule that does not care about order or repetition — so the same merge
+        may be sent twice, or two peers' copies may arrive either way round, and
+        the result is the same.
+
+        That is why this exists rather than reusing `/wb`. `/w` means "add one",
+        and replaying it doubles the count: measured on two instances, three
+        sightings became nine after two rounds of reading a peer and writing
+        back what was found.
+
+        The rules:
+
+          * `counts` — the greater of the two, per server. A server's own count
+            only rises, so taking the larger converges whichever copy arrives
+            first. Setting outright would let a stale copy undo a newer one.
+          * `stats` — the same, per bucket.
+          * `first_seen` — the earlier. `last_seen` — the later.
+          * `tags` — the union.
+          * `ttl` — the shortest non-zero one, zero meaning never. A value is
+            kept only as long as the most cautious server says.
+
+        An entry naming **this** server is ignored and counted in
+        `ignored_self`: a peer does not get to say what this server has seen.
+
+        Authorized as a write — the same ACL, the same refusal of internal
+        namespaces, the same `421` for a namespace this server does not store —
+        so a peer's key bounds what it may merge exactly as it bounds what it
+        may write.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/MergeItem" }
+            example:
+              items:
+                - namespace: feeds/misp/ips
+                  value: 1.2.3.4
+                  counts: { node-b: 3 }
+                  stats: { node-b: { "1600000000": 3 } }
+                  first_seen: 1600000000
+                  last_seen: 1600003600
+                  tags: tlp:amber
+      responses:
+        "200":
+          description: |
+            Every item merged, or only some. An item that changed nothing is a
+            success, not a failure: during catch-up it is how a caller learns it
+            has converged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MergeResponse" }
+        "400":
+          description: Nothing merged, for reasons that were not all refusals.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MergeResponse" }
+        "403":
+          description: Nothing merged, and every item was refused.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MergeResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /_api/stix:
     post:
       tags: [stix]
@@ -668,6 +758,63 @@ paths:
                       items:
                         type: array
                         items: { $ref: "#/components/schemas/TreeEntry" }
+
+  /_management/api/galaxy:
+    get:
+      tags: [management]
+      summary: This server and the peers it knows
+      description: |
+        What a topology view reads: this server's own role, and each peer's
+        health as last probed. One request against whichever server the
+        operator is connected to.
+
+        Peer **keys are never included** — they are credentials, and this
+        response is rendered in a browser.
+
+        Health is probed, not assumed: each peer's `/health` is called every
+        `health_interval` seconds. `/health` needs no key, so a probe carries no
+        credential. What is reported is reachability *from this server*, which
+        is the thing that matters to it.
+
+        Nothing is forwarded to peers yet, so this describes the configured
+        galaxy and whether its members answer — not a traversal of it. A
+        cascade is reported one level deep: each peer appears as a peer, and
+        asking *it* for its own galaxy reaches the next level.
+      responses:
+        "200":
+          description: The galaxy as this server sees it
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  self:
+                    type: object
+                    description: The server answering, so a view has a root.
+                    properties:
+                      node_id: { type: string }
+                      version: { type: string }
+                      uptime_seconds: { type: integer }
+                      role: { $ref: "#/components/schemas/Role" }
+                  peers:
+                    type: array
+                    items: { $ref: "#/components/schemas/PeerHealth" }
+                  below:
+                    type: object
+                    description: |
+                      Each peer's own answer to this request, keyed by its url,
+                      so one request describes a whole cascade. A peer that is
+                      itself a router has peers of its own in here.
+
+                      One level per hop, bounded by `max_hops`: a view of a
+                      miswired galaxy terminates like everything else. A peer
+                      that could not be reached is absent here and its health
+                      in `peers` says why — a topology view that failed
+                      because one server is down would be useless exactly when
+                      it is needed.
+                    additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
 
   /_management/api/rejections:
     get:
@@ -1048,6 +1195,11 @@ components:
         because nothing identified them. A value carrying an explicit
         `stix-type:` tag is never counted here.
       schema: { type: integer }
+    Forwarded:
+      description: |
+        Present when this answer came from another server in the galaxy rather
+        than from the one asked. The body is that server's answer, unchanged.
+      schema: { type: string }
     Namespaces:
       description: |
         How many namespaces contributed values to the bundle. Worth reading
@@ -1255,6 +1407,147 @@ components:
           type: boolean
           description: |
             Whether answering had to read an evicted shard back into memory.
+
+    Role:
+      type: object
+      description: |
+        What a server stores and who it knows about: the two things that decide
+        its place in a galaxy.
+      properties:
+        kind:
+          type: string
+          enum: [node, router, both]
+          description: |
+            `node` stores namespaces and forwards nothing; `router` stores none
+            of its own and exists to forward; `both` does each. A
+            configuration, not a type — any server can be any of them.
+        mirrors_everything:
+          type: boolean
+          description: Whether it stores every namespace — a full mirror.
+        namespaces:
+          type: array
+          items: { type: string }
+          description: |
+            The prefixes stored, when it is not everything. Empty on a router.
+        peers:
+          type: array
+          items: { type: string }
+          description: Peer urls. Keys are never included.
+        max_hops:
+          type: integer
+          description: |
+            How many hops a forwarded request may take. `0` when there is no
+            `[galaxy]`.
+
+    PeerHealth:
+      type: object
+      description: What the last probe of one peer found.
+      properties:
+        url: { type: string }
+        online:
+          type: boolean
+          description: Whether the last probe succeeded.
+        probed:
+          type: boolean
+          description: |
+            Whether this peer has been probed at all yet. `false` with
+            `online: false` means "not asked", which is not the same as down.
+        last_seen:
+          type: integer
+          format: int64
+          description: |
+            Unix seconds of the last *successful* probe, `0` if there has never
+            been one. Kept across failures, so it says how stale a peer is.
+        latency_ms:
+          type: integer
+          description: Round trip of the last successful probe.
+        version:
+          type: string
+          description: |
+            The peer's own version. A galaxy running mixed versions is worth
+            seeing before it misbehaves.
+        error:
+          type: string
+          description: Why the last probe failed.
+        failures:
+          type: integer
+          description: |
+            Consecutive failures, so a flapping peer reads differently from one
+            that has been gone all week.
+
+    MergeItem:
+      type: object
+      description: One value as a peer holds it.
+      required: [namespace, value, counts, first_seen, last_seen]
+      properties:
+        namespace: { type: string }
+        value: { type: string }
+        counts:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+          description: |
+            The peer's view of each server's contribution, keyed by node id. An
+            entry naming the receiving server is ignored.
+        stats:
+          type: object
+          description: |
+            The peer's view of each server's hourly buckets: node id, then the
+            Unix timestamp of the hour.
+          additionalProperties:
+            type: object
+            additionalProperties: { type: integer, format: int64 }
+        first_seen: { type: integer, format: int64 }
+        last_seen: { type: integer, format: int64 }
+        tags: { type: string }
+        ttl: { type: integer, format: int64 }
+
+    MergeResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          enum: [ok, partial, failed]
+        changed:
+          type: integer
+          description: How many items changed the local copy.
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/MergeResult" }
+        errors:
+          type: array
+          description: The failures alone; omitted when there are none.
+          items:
+            type: object
+            properties:
+              namespace: { type: string }
+              value: { type: string }
+              error: { type: string }
+
+    MergeResult:
+      type: object
+      properties:
+        index: { type: integer }
+        namespace: { type: string }
+        value: { type: string }
+        status:
+          type: string
+          enum: [ok, error]
+        changed:
+          type: boolean
+          description: |
+            Whether the local copy changed. `false` means it already held
+            everything offered, which during catch-up is how convergence is
+            recognised.
+        count:
+          type: integer
+          format: int64
+          description: The total after merging.
+        ignored_self:
+          type: integer
+          description: |
+            Entries naming the receiving server, which were ignored. Non-zero
+            means the sender is confused about who it is talking to.
+        error: { type: string }
 
     Rejection:
       type: object

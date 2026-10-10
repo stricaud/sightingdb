@@ -219,10 +219,28 @@ fn read_shard(path: &Path) -> Result<ShardData> {
     serde_json::from_reader(decoder).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Whether this build can read a snapshot of this version.
+///
+/// Older versions are read and migrated rather than refused: a build upgrade
+/// that would not open the existing database is indistinguishable from total
+/// data loss, and the next save would make it real. A *newer* version is still
+/// refused, because guessing at a format this build has never seen is how a
+/// downgrade silently drops fields.
 fn check_version(version: u32, path: &Path) -> Result<()> {
-    if version != SNAPSHOT_VERSION {
+    if version > SNAPSHOT_VERSION {
         bail!(
-            "{} has version {version}, but this build only understands version {}",
+            "{} has version {version}, which is newer than this build understands \
+             (version {}). Upgrade SightingDB rather than letting it rewrite the file.",
+            path.display(),
+            SNAPSHOT_VERSION
+        );
+    }
+    if version == 0 {
+        bail!("{} has no version and cannot be read", path.display());
+    }
+    if version < SNAPSHOT_VERSION {
+        log::info!(
+            "{} is version {version}; migrating to version {} on load",
             path.display(),
             SNAPSHOT_VERSION
         );

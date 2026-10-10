@@ -95,6 +95,7 @@
   <span class="muted" id="version"></span>
   <button id="nav-browse">Browse</button>
   <button id="nav-keys">Keys</button>
+  <button id="nav-galaxy">Galaxy</button>
   <button id="nav-config">Configuration</button>
   <button id="signout">Sign out</button>
 </header>
@@ -157,6 +158,22 @@
       <tbody id="v-rows"></tbody>
     </table></div>
     <p class="muted" id="v-empty"></p>
+  </section>
+
+  <!-- The galaxy: this server and everything below it -->
+  <section id="view-galaxy" class="hidden">
+    <div class="row">
+      <h3 style="margin:0">Galaxy</h3>
+      <span class="muted" id="g-summary"></span>
+      <span class="spacer"></span>
+      <label class="muted" style="display:flex;gap:.3rem;align-items:center">
+        <input type="checkbox" id="g-auto"> refresh every 5s
+      </label>
+      <button id="g-refresh">Refresh</button>
+    </div>
+    <div id="g-chart" style="width:100%;height:60vh"></div>
+    <p class="muted" id="g-legend"></p>
+    <p class="muted" id="g-empty"></p>
   </section>
 
   <!-- API keys -->
@@ -369,7 +386,8 @@ const state = {
   value: null,
 };
 
-const VIEWS = ["view-namespaces", "view-values", "view-value", "view-keys", "view-config"];
+const VIEWS = ["view-namespaces", "view-values", "view-value", "view-keys",
+               "view-config", "view-galaxy"];
 const $ = (id) => document.getElementById(id);
 const show = (...ids) => {
   for (const v of VIEWS) $(v).classList.toggle("hidden", !ids.includes(v));
@@ -1206,6 +1224,156 @@ async function exportStix(untyped, recursive) {
 }
 
 /**
+ * Draw the galaxy: this server, its peers, and everything below them.
+ *
+ * One request to /_management/api/galaxy, which walks the cascade, so a view
+ * of a galaxy several levels deep needs no per-server polling from here.
+ *
+ * Colour says what a server *holds*, because that is the question a galaxy
+ * raises — whether a namespace has a second copy anywhere. Red is kept for
+ * trouble, as it is everywhere else: a server that is not answering. Using it
+ * for a full mirror, which is the healthy case, would read as an alarm at a
+ * glance and that is the opposite of what a glance is for.
+ */
+const GALAXY_COLOURS = {
+  full:    "#2f7ed8",  // stores every namespace
+  partial: "#8bbc21",  // stores some
+  router:  "#9b7ac0",  // stores none of its own; forwards
+  down:    "#d9534f",  // not answering
+  unknown: "#999999",  // not probed yet, or never reached
+};
+
+/** Flatten the walked tree into nodes and links echarts can draw. */
+function galaxyGraph(view) {
+  const nodes = [];
+  const links = [];
+  const seen = new Map();
+
+  // Health is reported by the server *above* a peer, since reachability is
+  // from somewhere. Collected as we descend so a node can be coloured by what
+  // its parent sees.
+  const healthOf = new Map();
+  const collect = (level) => {
+    for (const peer of level.peers || []) healthOf.set(peer.url, peer);
+    for (const below of Object.values(level.below || {})) collect(below);
+  };
+  collect(view);
+
+  const add = (url, me, parentUrl) => {
+    if (!seen.has(url)) {
+      const role = me.role || {};
+      const health = healthOf.get(url);
+      let kind = role.kind === "router" ? "router"
+               : role.mirrors_everything ? "full" : "partial";
+      // What the parent sees beats what the server says about itself: a
+      // server that answered our walk is up, but one we could not reach has
+      // no `self` at all and is only known through its parent.
+      if (health && health.probed && !health.online) kind = "down";
+
+      const held = role.kind === "router" ? "forwards only"
+                 : role.mirrors_everything ? "full mirror"
+                 : `holds ${(role.namespaces || []).join(", ") || "nothing"}`;
+
+      seen.set(url, nodes.length);
+      nodes.push({
+        name: url,
+        value: kind,
+        symbolSize: kind === "router" ? 46 : 34,
+        // A router is where requests enter, so it is drawn as the hub it is.
+        symbol: kind === "router" ? "diamond" : "circle",
+        itemStyle: { color: GALAXY_COLOURS[kind] || GALAXY_COLOURS.unknown },
+        label: { show: true, formatter: me.node_id || url },
+        tooltip: {
+          formatter: [
+            `<b>${me.node_id || "(unknown)"}</b>`,
+            url,
+            held,
+            me.version ? `version ${me.version}` : "",
+            health
+              ? (health.online
+                  ? `up, ${health.latency_ms ?? "?"}ms`
+                  : health.probed
+                    ? `not answering: ${health.error || "unknown"}`
+                    : "not probed yet")
+              : "this server",
+          ].filter(Boolean).join("<br>"),
+        },
+      });
+    }
+    if (parentUrl !== null) {
+      links.push({ source: parentUrl, target: url });
+    }
+  };
+
+  const walk = (level, url, parentUrl) => {
+    add(url, level.self || {}, parentUrl);
+    const below = level.below || {};
+    for (const peer of level.peers || []) {
+      const child = below[peer.url];
+      if (child) {
+        walk(child, peer.url, url);
+      } else {
+        // Known only through its parent, because the walk could not reach it.
+        add(peer.url, {}, url);
+      }
+    }
+  };
+
+  walk(view, "this server", null);
+  return { nodes, links };
+}
+
+async function showGalaxy() {
+  setError("");
+  show("view-galaxy");
+  await loadGalaxy();
+}
+
+async function loadGalaxy() {
+  try {
+    const view = await api("/_management/api/galaxy");
+    const { nodes, links } = galaxyGraph(view);
+
+    const counts = nodes.reduce((acc, n) => ((acc[n.value] = (acc[n.value] || 0) + 1), acc), {});
+    $("g-summary").textContent =
+      `${nodes.length} server(s)` + (counts.down ? `, ${counts.down} not answering` : "");
+    $("g-empty").textContent = nodes.length > 1 ? "" :
+      "No peers configured. Add a [galaxy] section to connect this server to others.";
+    $("g-legend").innerHTML = Object.entries({
+      "full mirror": GALAXY_COLOURS.full,
+      "partial mirror": GALAXY_COLOURS.partial,
+      "router (forwards only)": GALAXY_COLOURS.router,
+      "not answering": GALAXY_COLOURS.down,
+    }).map(([label, colour]) =>
+      `<span class="chip" style="background:${colour};color:#fff;border-color:${colour}">${label}</span>`
+    ).join(" ");
+
+    if (!state.galaxyChart) {
+      state.galaxyChart = echarts.init($("g-chart"), null, { renderer: "canvas" });
+    }
+    state.galaxyChart.setOption({
+      tooltip: {},
+      series: [{
+        type: "graph",
+        layout: "force",
+        roam: true,
+        draggable: true,
+        edgeSymbol: ["none", "arrow"],
+        edgeSymbolSize: 8,
+        force: { repulsion: 420, edgeLength: 130, gravity: 0.08 },
+        lineStyle: { color: "#999", width: 1.5, curveness: 0 },
+        label: { position: "bottom", fontSize: 11 },
+        data: nodes,
+        links,
+      }],
+    }, true);
+    state.galaxyChart.resize();
+  } catch (e) {
+    setError(e.message);
+  }
+}
+
+/**
  * The server buckets sightings by hour, so the histogram is those buckets
  * straight through. Empty hours between buckets are filled in, otherwise a
  * value seen in January and June would look like two adjacent bars.
@@ -1483,6 +1651,16 @@ $("home").onclick = (e) => { e.preventDefault(); go(null); };
 $("signout").onclick = () => signOut("");
 $("nav-browse").onclick = () => render();
 $("nav-keys").onclick = () => { setError(""); show("view-keys"); loadKeys(); };
+$("nav-galaxy").onclick = showGalaxy;
+$("g-refresh").onclick = loadGalaxy;
+$("g-auto").onchange = (e) => {
+  clearInterval(state.galaxyTimer);
+  // Only while the view is showing: a timer left running would keep asking a
+  // galaxy to walk itself for nobody.
+  if (e.target.checked) state.galaxyTimer = setInterval(() => {
+    if (!$("view-galaxy").classList.contains("hidden")) loadGalaxy();
+  }, 5000);
+};
 $("nav-config").onclick = showConfig;
 $("ns-up").onclick = () => go(parentOf(state.namespace));
 $("ns-new").onclick = openNamespaceEditor;

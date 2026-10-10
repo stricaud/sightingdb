@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::attribute::{Attribute, AttributeView};
+use crate::attribute::{Attribute, AttributeView, Merge, Merged};
 use crate::db_log::log_attribute;
 use crate::tier::TierPolicy;
 
@@ -22,7 +22,20 @@ pub const APIKEYS_NAMESPACE: &str = "_config/acl/apikeys/";
 /// API key seeded on a fresh database, unless `-k` supplies one.
 pub const DEFAULT_APIKEY: &str = "changeme";
 /// Bumped whenever the on-disk snapshot layout changes incompatibly.
-pub const SNAPSHOT_VERSION: u32 = 1;
+/// The snapshot format this build writes.
+///
+/// 2 keeps counts and hourly buckets per node; 1 kept one total of each.
+/// Version 1 is still read and migrated on load — see [`Attribute::migrate`] —
+/// because refusing it would mean a build upgrade looked like total data loss.
+pub const SNAPSHOT_VERSION: u32 = 2;
+
+/// The node id a server uses when it has not been given one.
+///
+/// A standalone server keeps all its sightings under this name, so its counts
+/// sum to exactly what they always did. Set `node_id` in `[daemon]` before
+/// putting it in a galaxy: two servers sharing an id would each think the
+/// other's contribution was their own, and a merge would lose one of them.
+pub const LOCAL_NODE: &str = "local";
 
 /// A lookup that did not resolve, rendered as-is into the JSON body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -58,6 +71,116 @@ pub struct DatabasePolicy {
     pub stats_retention: usize,
     /// TTL applied to shadow sightings; 0 means they never expire.
     pub shadow_ttl: u64,
+}
+
+/// Which namespaces this server stores.
+///
+/// A server always holds the internal namespaces — see [`is_internal`] — because
+/// it cannot operate without its own consensus tally and shadow record. So this
+/// is about ordinary namespaces only, and an empty policy is a pure router:
+/// it stores nothing of its own and exists to forward.
+///
+/// Prefixes match on whole path segments, the same rule the ACL and
+/// [`Database::namespaces_under`] use, so `feeds` holds `feeds/misp/ips` and
+/// never `feeds-internal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoragePolicy {
+    /// Namespace prefixes held. Meaningless when `everything` is set.
+    prefixes: Vec<String>,
+    /// Hold every namespace. The default, and what every release before this
+    /// one did.
+    everything: bool,
+}
+
+impl Default for StoragePolicy {
+    fn default() -> Self {
+        StoragePolicy::everything()
+    }
+}
+
+impl StoragePolicy {
+    /// Hold everything, which is what a server with no `namespaces` setting
+    /// does.
+    pub fn everything() -> Self {
+        StoragePolicy {
+            prefixes: Vec::new(),
+            everything: true,
+        }
+    }
+
+    /// Hold only what these prefixes cover.
+    ///
+    /// `/` anywhere in the list means everything, since a prefix that covers
+    /// the root covers all of it. Entries are trimmed of slashes so that `/`,
+    /// `feeds/` and `feeds` all mean what they look like.
+    pub fn from_prefixes<I, S>(prefixes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut held: Vec<String> = Vec::new();
+        for prefix in prefixes {
+            let prefix = prefix.as_ref().trim().trim_matches('/').to_string();
+            if prefix.is_empty() {
+                // `/` on its own: the whole tree.
+                return StoragePolicy::everything();
+            }
+            if !held.contains(&prefix) {
+                held.push(prefix);
+            }
+        }
+        StoragePolicy {
+            prefixes: held,
+            everything: false,
+        }
+    }
+
+    /// Whether this server stores `namespace`.
+    pub fn holds(&self, namespace: &str) -> bool {
+        // Ours regardless: a router still keeps its own `_all`, which under a
+        // galaxy is the consensus every node below it rolls up into.
+        if is_internal(namespace) {
+            return true;
+        }
+        if self.everything {
+            return true;
+        }
+        let namespace = namespace.trim_matches('/');
+        self.prefixes.iter().any(|prefix| {
+            namespace == prefix
+                || namespace
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    /// Whether this server holds no ordinary namespace at all.
+    pub fn is_router(&self) -> bool {
+        !self.everything && self.prefixes.is_empty()
+    }
+
+    pub fn stores_everything(&self) -> bool {
+        self.everything
+    }
+
+    /// The prefixes as configured, for reporting. Empty when everything is
+    /// held, or when nothing is.
+    pub fn prefixes(&self) -> &[String] {
+        &self.prefixes
+    }
+}
+
+/// What a write did.
+///
+/// `new` is the fact a router cannot work out for itself: whether this was the
+/// first sighting of the value in this namespace, which is what decides a
+/// consensus increment. The node knows it under the write lock; without
+/// reporting it, anything in front of the node would have to hold the
+/// namespace to find out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Written {
+    pub count: u64,
+    pub new: bool,
 }
 
 /// How a single write should behave.
@@ -232,13 +355,19 @@ struct Namespace {
 }
 
 impl Namespace {
-    fn from_values(values: HashMap<String, Attribute>) -> Self {
+    fn from_values(values: HashMap<String, Attribute>, node: &str) -> Self {
         let has_ttl = values.values().any(|attr| attr.ttl > 0);
         Self {
             values: RwLock::new(
                 values
                     .into_iter()
-                    .map(|(value, attr)| (value, Mutex::new(attr)))
+                    .map(|(value, mut attr)| {
+                        // A snapshot from before counts were kept per node has
+                        // a total with nobody's name on it. This server wrote
+                        // it, so it is this server's.
+                        attr.migrate(node);
+                        (value, Mutex::new(attr))
+                    })
                     .collect(),
             ),
             has_ttl: AtomicBool::new(has_ttl),
@@ -249,6 +378,7 @@ impl Namespace {
     /// time the value appeared here, and a snapshot for the write log.
     fn record(
         &self,
+        node: &str,
         value: &str,
         when: DateTime<Utc>,
         ttl: Option<u64>,
@@ -271,7 +401,7 @@ impl Namespace {
                 if !tags.is_empty() {
                     attr.add_tags(tags);
                 }
-                attr.increment(when, retention);
+                attr.increment(node, when, retention);
                 return (attr.count(), false, attr.view(0, false));
             }
         }
@@ -292,8 +422,38 @@ impl Namespace {
         if !tags.is_empty() {
             attr.add_tags(tags);
         }
-        attr.increment(when, retention);
+        attr.increment(node, when, retention);
         (attr.count(), is_new, attr.view(0, false))
+    }
+
+    /// Fold a peer's copy in, reporting whether the value was absent here.
+    ///
+    /// Takes the map's write lock rather than the fast read-lock path, because
+    /// a merge may be bringing a value this namespace has never held.
+    fn merge(&self, node: &str, value: &str, incoming: &Merge) -> (Merged, bool) {
+        if incoming.ttl > 0 {
+            self.has_ttl.store(true, Ordering::Relaxed);
+        }
+
+        let mut values = self.values.write().unwrap_or_else(PoisonError::into_inner);
+        let is_new = !values.contains_key(value);
+        let cell = values
+            .entry(value.to_string())
+            .or_insert_with(|| Mutex::new(Attribute::new(value)));
+        // We hold the map's write lock, so the mutex needs no locking here.
+        let attr = cell.get_mut().unwrap_or_else(PoisonError::into_inner);
+        (attr.merge(incoming, node), is_new)
+    }
+
+    fn merge_payload(&self, value: &str, now: DateTime<Utc>) -> Option<Merge> {
+        let values = self.values.read().unwrap_or_else(PoisonError::into_inner);
+        let attr = values
+            .get(value)?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // An expired value is not offered: a peer that took it would hold
+        // something this server has already stopped showing.
+        (!attr.is_expired(now)).then(|| attr.as_merge())
     }
 
     /// An expired attribute is invisible to readers even before the sweeper
@@ -389,7 +549,7 @@ impl Namespace {
     /// Give back one consensus count, dropping the entry when it reaches zero.
     /// Done under the write lock so a concurrent write cannot resurrect a value
     /// between the decrement and the removal.
-    fn release(&self, value: &str) {
+    fn release(&self, node: &str, value: &str) {
         let mut values = self.values.write().unwrap_or_else(PoisonError::into_inner);
         let Some(cell) = values.get_mut(value) else {
             return;
@@ -397,7 +557,7 @@ impl Namespace {
         let remaining = cell
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
-            .decrement();
+            .decrement(node);
         if remaining == 0 {
             values.remove(value);
         }
@@ -474,6 +634,11 @@ pub struct Store {
 pub struct Database {
     namespaces: RwLock<HashMap<String, Arc<Namespace>>>,
     policy: DatabasePolicy,
+    /// Which namespaces this server is willing to store. Everything, unless
+    /// the configuration narrows it.
+    stores: StoragePolicy,
+    /// This server's name in its own counters. See [`LOCAL_NODE`].
+    node: String,
     /// Shards written to since the last save, so a snapshot costs what changed
     /// rather than what exists.
     dirty: Mutex<HashSet<String>>,
@@ -493,10 +658,29 @@ impl Database {
         Database::with_policy(DatabasePolicy::default())
     }
 
+    /// A database that stores everything. Only the tests reach for this now:
+    /// production goes through [`Database::with_storage`], because what a
+    /// server stores is a configured thing.
+    #[cfg(test)]
     pub fn with_policy(policy: DatabasePolicy) -> Database {
+        Database::with_storage(policy, StoragePolicy::everything())
+    }
+
+    /// The same, narrowed to the namespaces this server is willing to store.
+    /// Tests only: production names the server, because an unnamed one cannot
+    /// join a galaxy without taking a peer's contribution for its own.
+    #[cfg(test)]
+    pub fn with_storage(policy: DatabasePolicy, stores: StoragePolicy) -> Database {
+        Database::with_node(policy, stores, LOCAL_NODE.to_string())
+    }
+
+    /// The same, named: this server's sightings are counted under `node`.
+    pub fn with_node(policy: DatabasePolicy, stores: StoragePolicy, node: String) -> Database {
         Database {
             namespaces: RwLock::new(HashMap::new()),
             policy,
+            stores,
+            node,
             dirty: Mutex::new(HashSet::new()),
             shards: RwLock::new(HashMap::new()),
             store: RwLock::new(None),
@@ -506,11 +690,39 @@ impl Database {
 
     /// Rebuild a database from a snapshot. No API key is seeded here: the
     /// snapshot carries whatever keys were registered when it was written.
+    /// The same, restoring a snapshot. Tests only, as above.
+    #[cfg(test)]
     pub fn from_snapshot(data: SnapshotData, policy: DatabasePolicy) -> Database {
+        Database::from_snapshot_with(data, policy, StoragePolicy::everything())
+    }
+
+    /// The same, narrowed to what this server stores.
+    ///
+    /// A snapshot written when this server held more than it does now is loaded
+    /// as it stands: narrowing the policy is not a licence to discard data
+    /// silently. What it stops is *new* writes outside the policy.
+    /// Tests only, as above.
+    #[cfg(test)]
+    pub fn from_snapshot_with(
+        data: SnapshotData,
+        policy: DatabasePolicy,
+        stores: StoragePolicy,
+    ) -> Database {
+        Database::from_snapshot_as(data, policy, stores, LOCAL_NODE.to_string())
+    }
+
+    /// The same, named. Totals written by a build that kept one become this
+    /// server's own contribution, which is the only thing they can be.
+    pub fn from_snapshot_as(
+        data: SnapshotData,
+        policy: DatabasePolicy,
+        stores: StoragePolicy,
+        node: String,
+    ) -> Database {
         let namespaces: HashMap<String, Arc<Namespace>> = data
             .namespaces
             .into_iter()
-            .map(|(name, values)| (name, Arc::new(Namespace::from_values(values))))
+            .map(|(name, values)| (name, Arc::new(Namespace::from_values(values, &node))))
             .collect();
 
         let mut shards: HashMap<String, ShardMeta> = HashMap::new();
@@ -527,6 +739,8 @@ impl Database {
         Database {
             namespaces: RwLock::new(namespaces),
             policy,
+            stores,
+            node,
             dirty: Mutex::new(HashSet::new()),
             shards: RwLock::new(shards),
             store: RwLock::new(None),
@@ -557,7 +771,7 @@ impl Database {
     /// namespace, since consensus means "how many namespaces have seen this
     /// value", not "how many times was it written".
     pub fn write(&self, path: &str, value: &str, when: DateTime<Utc>, opts: WriteOpts) -> u64 {
-        self.write_tagged(path, value, when, opts, "")
+        self.write_tagged(path, value, when, opts, "").count
     }
 
     /// A sighting that also carries what is known about the value.
@@ -574,7 +788,19 @@ impl Database {
         when: DateTime<Utc>,
         opts: WriteOpts,
         tags: &str,
-    ) -> u64 {
+    ) -> Written {
+        self.record_write(&self.node, path, value, when, opts, tags)
+    }
+
+    fn record_write(
+        &self,
+        node: &str,
+        path: &str,
+        value: &str,
+        when: DateTime<Utc>,
+        opts: WriteOpts,
+        tags: &str,
+    ) -> Written {
         // Shadow sightings get their retention from policy rather than from the
         // caller, which is what bounds `_shadow/*` growth.
         let ttl = match opts.ttl {
@@ -587,7 +813,7 @@ impl Database {
 
         let namespace = self.namespace_or_create(path);
         let (count, is_new, mut view) =
-            namespace.record(value, when, ttl, self.policy.stats_retention, tags);
+            namespace.record(node, value, when, ttl, self.policy.stats_retention, tags);
 
         // The namespace's locks are released by now, so reaching into `_all`
         // here respects the ordering rule above.
@@ -599,7 +825,29 @@ impl Database {
         log_attribute(path, &view);
         self.mark_dirty(path);
 
-        count
+        Written { count, new: is_new }
+    }
+
+    /// Fold a peer's copy of one value into ours.
+    ///
+    /// Not a sighting: nothing is counted here, the peer's own counts are
+    /// taken as they are, and `_all` is updated only when this merge brings a
+    /// value into a namespace that did not have it — which is a new namespace
+    /// holding it, exactly as a first write would be.
+    ///
+    /// See [`Attribute::merge`] for the rules and why each is order
+    /// independent.
+    pub fn merge(&self, path: &str, value: &str, incoming: &Merge) -> Merged {
+        let namespace = self.namespace_or_create(path);
+        let (outcome, is_new) = namespace.merge(&self.node, value, incoming);
+
+        if is_new && counts_towards_consensus(path) {
+            self.write(ALL_NAMESPACE, value, Utc::now(), WriteOpts::default());
+        }
+        if outcome.changed {
+            self.mark_dirty(path);
+        }
+        outcome
     }
 
     /// Replace a value's tags outright, which is how a wrong one comes off.
@@ -626,6 +874,15 @@ impl Database {
     ) -> Option<AttributeView> {
         self.namespace(path)?
             .view(value, consensus, with_stats, Utc::now())
+    }
+
+    /// One value in the shape a peer should be offered it, or `None` if it is
+    /// not here or has expired.
+    ///
+    /// The read side of [`Database::merge`]: what comes back here is what goes
+    /// there, unchanged.
+    pub fn merge_payload(&self, path: &str, value: &str) -> Option<Merge> {
+        self.namespace(path)?.merge_payload(value, Utc::now())
     }
 
     pub fn count(&self, path: &str, value: &str) -> u64 {
@@ -843,6 +1100,34 @@ impl Database {
             total,
             offset,
         }
+    }
+
+    /// This server's name in its own counters. See [`LOCAL_NODE`].
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// Record a sighting counted for someone else.
+    ///
+    /// Used when a write was forwarded here: it is counted for the server it
+    /// arrived from rather than for this one. Without that, one write fanned
+    /// out to two mirrors is counted twice over — once under each mirror's own
+    /// name — and merging them adds the two together.
+    pub fn write_tagged_as(
+        &self,
+        origin: &str,
+        path: &str,
+        value: &str,
+        when: DateTime<Utc>,
+        opts: WriteOpts,
+        tags: &str,
+    ) -> Written {
+        self.record_write(origin, path, value, when, opts, tags)
+    }
+
+    /// Whether this server stores `namespace`. See [`StoragePolicy`].
+    pub fn holds(&self, namespace: &str) -> bool {
+        self.stores.holds(namespace)
     }
 
     /// Every namespace at or under `prefix`, in order, that `allowed` permits.
@@ -1252,7 +1537,7 @@ impl Database {
         let mut names = HashSet::new();
         for (name, values) in data {
             names.insert(name.clone());
-            namespaces.insert(name, Arc::new(Namespace::from_values(values)));
+            namespaces.insert(name, Arc::new(Namespace::from_values(values, &self.node)));
         }
         drop(namespaces);
 
@@ -1373,7 +1658,7 @@ impl Database {
 
     fn release_consensus(&self, value: &str) {
         if let Some(all) = self.namespace(ALL_NAMESPACE) {
-            all.release(value);
+            all.release(&self.node, value);
         }
     }
 
@@ -1513,6 +1798,27 @@ impl Database {
             meta.last_access = now_secs();
         }
     }
+}
+
+/// Whether a namespace is one of ours: the `_all` tally, `_shadow/*`, or
+/// `_config`.
+///
+/// Decided on the first path segment, which is the same rule
+/// [`crate::persistence::shard_of`] uses to send these to the internal shard,
+/// so "internal" means one thing throughout. `foo/_bar` is therefore an
+/// ordinary namespace — the underscore only counts at the front.
+///
+/// These are written by the database about itself: `_all` by the consensus
+/// bookkeeping in [`Database::write_tagged`], `_shadow/*` by reads. Letting a
+/// client write them would let it state a consensus the data does not support,
+/// so every write path over HTTP refuses them. Reading is another matter and
+/// stays allowed, apart from `_config`: `/r/_all` is how consensus is asked
+/// for, and `/r/_shadow/<ns>` is how searches are reviewed.
+pub fn is_internal(namespace: &str) -> bool {
+    namespace
+        .split('/')
+        .find(|segment| !segment.is_empty())
+        .is_some_and(|first| first.starts_with('_'))
 }
 
 /// Namespaces whose values were counted towards consensus when written, and so
@@ -1952,6 +2258,97 @@ mod tests {
     /// property that matters is the cost, and a later change could reintroduce
     /// a walk without changing any of the values this returns.
     #[test]
+    fn storing_everything_is_the_default_and_holds_anything() {
+        let policy = StoragePolicy::default();
+
+        assert!(policy.stores_everything());
+        assert!(!policy.is_router());
+        for namespace in ["feeds", "feeds/misp/ips", "anything", "_all"] {
+            assert!(policy.holds(namespace), "{namespace}");
+        }
+    }
+
+    /// `/` anywhere in the list means the whole tree, because a prefix that
+    /// covers the root covers everything under it.
+    #[test]
+    fn a_root_prefix_means_everything() {
+        for list in [vec!["/"], vec![""], vec!["feeds", "/"]] {
+            let policy = StoragePolicy::from_prefixes(&list);
+            assert!(policy.stores_everything(), "{list:?}");
+            assert!(policy.holds("anything/at/all"), "{list:?}");
+        }
+    }
+
+    /// Prefixes match whole segments, so a namespace that merely shares
+    /// leading characters is not held.
+    #[test]
+    fn a_narrowed_policy_holds_its_subtrees_and_nothing_beside_them() {
+        let policy = StoragePolicy::from_prefixes(["feeds", "threats/apt"]);
+
+        assert!(!policy.stores_everything());
+        assert!(!policy.is_router());
+
+        for held in ["feeds", "feeds/misp/ips", "threats/apt", "threats/apt/x"] {
+            assert!(policy.holds(held), "{held} should be held");
+        }
+        for not in ["feeds-internal", "threats", "threats/apt-other", "other"] {
+            assert!(!policy.holds(not), "{not} should not be held");
+        }
+    }
+
+    /// A router stores no ordinary namespace — but still its own internal
+    /// ones, because it cannot keep a consensus tally otherwise, and that
+    /// tally is the whole reason to put one in front of a galaxy.
+    #[test]
+    fn a_router_stores_nothing_but_the_internal_namespaces() {
+        let policy = StoragePolicy::from_prefixes(Vec::<String>::new());
+
+        assert!(policy.is_router());
+        assert!(!policy.stores_everything());
+
+        assert!(!policy.holds("feeds"));
+        assert!(!policy.holds("anything"));
+
+        for internal in ["_all", "_shadow/feeds/ips", "_config/acl/apikeys/x"] {
+            assert!(policy.holds(internal), "{internal} must stay held");
+        }
+    }
+
+    /// Internal namespaces are held whatever the policy says, so a narrowed
+    /// server still counts consensus for what it does hold.
+    #[test]
+    fn a_narrowed_database_still_keeps_its_own_consensus() {
+        let db = Database::with_storage(
+            DatabasePolicy::default(),
+            StoragePolicy::from_prefixes(["feeds"]),
+        );
+
+        assert!(db.holds("feeds/a"));
+        assert!(!db.holds("other"));
+        assert!(db.holds(ALL_NAMESPACE));
+
+        db.write(
+            "feeds/a",
+            "1.2.3.4",
+            Utc::now(),
+            WriteOpts {
+                consensus: true,
+                ttl: None,
+            },
+        );
+        db.write(
+            "feeds/b",
+            "1.2.3.4",
+            Utc::now(),
+            WriteOpts {
+                consensus: true,
+                ttl: None,
+            },
+        );
+        assert_eq!(db.count(ALL_NAMESPACE, "1.2.3.4"), 2);
+    }
+
+    #[test]
     fn counting_does_not_get_slower_as_a_namespace_grows() {
         let db = Database::default();
 
@@ -2097,12 +2494,149 @@ mod tests {
         assert_eq!(restored.sweep(Utc::now()).values_removed, 1);
     }
 
+    /// A version 1 snapshot must open, and its totals must become this
+    /// server's own contribution.
+    ///
+    /// This is the one migration that cannot be got wrong: a build that
+    /// refused the previous format would look exactly like total data loss,
+    /// and the next save would make it so.
+    #[test]
+    fn a_version_one_snapshot_is_migrated_on_load() {
+        // Written by hand in the old shape: one `count`, one flat `stats`.
+        let old = serde_json::json!({
+            "version": 1,
+            "namespaces": {
+                "feeds/ips": {
+                    "1.2.3.4": {
+                        "value": "1.2.3.4",
+                        "first_seen": 1_600_000_000,
+                        "last_seen": 1_600_003_600,
+                        "count": 7,
+                        "tags": "tlp:amber",
+                        "ttl": 0,
+                        "stats": { "1600000000": 3, "1600003600": 4 }
+                    }
+                }
+            }
+        });
+
+        let data: SnapshotData = serde_json::from_value(old).unwrap();
+        let db = Database::from_snapshot_as(
+            data,
+            DatabasePolicy::default(),
+            StoragePolicy::everything(),
+            "node-a".to_string(),
+        );
+
+        let view = db.view("feeds/ips", "1.2.3.4", 0, true).unwrap();
+
+        // The total survived, and the window and tags with it.
+        assert_eq!(view.count, 7, "the count was lost in migration");
+        assert_eq!(view.first_seen, 1_600_000_000);
+        assert_eq!(view.last_seen, 1_600_003_600);
+        assert_eq!(view.tags, "tlp:amber");
+
+        // The buckets survived, merged as a reader sees them.
+        let stats = view.stats.unwrap();
+        assert_eq!(stats.get(&1_600_000_000), Some(&3));
+        assert_eq!(stats.get(&1_600_003_600), Some(&4));
+
+        // And it is attributed to the server that read it, which is the only
+        // server that could have written it.
+        let next = db.write("feeds/ips", "1.2.3.4", Utc::now(), WriteOpts::default());
+        assert_eq!(next, 8, "the migrated total was not added to");
+    }
+
+    /// Writing a snapshot and reading it back must not change any count — the
+    /// round trip is where a per-node map could quietly collapse.
+    #[test]
+    fn counts_survive_a_round_trip_under_their_own_node() {
+        let db = Database::with_node(
+            DatabasePolicy::default(),
+            StoragePolicy::everything(),
+            "node-a".to_string(),
+        );
+        for _ in 0..3 {
+            db.write("feeds/ips", "1.2.3.4", Utc::now(), WriteOpts::default());
+        }
+
+        let json = serde_json::to_string(&db.snapshot()).unwrap();
+        // The new shape is what is written: a map, not a total.
+        assert!(json.contains("\"counts\""), "{json}");
+        assert!(json.contains("node-a"), "{json}");
+        assert!(
+            !json.contains("\"count\":"),
+            "a legacy total was written back out: {json}"
+        );
+
+        let restored = Database::from_snapshot_as(
+            serde_json::from_str(&json).unwrap(),
+            DatabasePolicy::default(),
+            StoragePolicy::everything(),
+            "node-a".to_string(),
+        );
+        assert_eq!(restored.count("feeds/ips", "1.2.3.4"), 3);
+    }
+
+    /// Two servers' contributions add up, and merging the same contribution
+    /// twice changes nothing. This is the property the whole change exists for.
+    #[test]
+    fn contributions_from_two_nodes_sum_and_are_idempotent() {
+        let mut attr = crate::attribute::Attribute::new("1.2.3.4");
+        for _ in 0..3 {
+            attr.increment("node-a", Utc::now(), 0);
+        }
+        for _ in 0..2 {
+            attr.increment("node-b", Utc::now(), 0);
+        }
+        assert_eq!(attr.count(), 5);
+
+        // What a merge does: take a peer's entry wholesale. Applying it again
+        // is a no-op, which is what makes sync safe to retry.
+        let peer = attr.counts.get("node-b").copied().unwrap();
+        attr.counts.insert("node-b".to_string(), peer);
+        assert_eq!(
+            attr.count(),
+            5,
+            "re-applying a peer's entry changed the sum"
+        );
+        attr.counts.insert("node-b".to_string(), peer);
+        assert_eq!(attr.count(), 5);
+    }
+
+    /// A server gives back only what it put in. Releasing consensus must not
+    /// spend a peer's contribution.
+    #[test]
+    fn releasing_takes_from_this_nodes_own_entry_only() {
+        let mut attr = crate::attribute::Attribute::new("1.2.3.4");
+        attr.increment("node-a", Utc::now(), 0);
+        attr.increment("node-b", Utc::now(), 0);
+        assert_eq!(attr.count(), 2);
+
+        assert_eq!(attr.decrement("node-a"), 1);
+        assert_eq!(
+            attr.counts.get("node-b").copied(),
+            Some(1),
+            "a peer's contribution was spent"
+        );
+        // Nothing left of its own, so it stops appearing as a contributor.
+        assert!(!attr.counts.contains_key("node-a"));
+
+        // And a server with nothing to give back cannot go negative.
+        assert_eq!(attr.decrement("node-a"), 1);
+    }
+
     #[test]
     fn an_empty_database_snapshots_cleanly() {
         let db = Database::default();
         let json = serde_json::to_string(&db.snapshot()).unwrap();
 
-        assert_eq!(json, r#"{"version":1,"namespaces":{}}"#);
+        // Pinned literally: the version in a written snapshot is a contract
+        // with every build that will read it.
+        assert_eq!(
+            json,
+            format!(r#"{{"version":{SNAPSHOT_VERSION},"namespaces":{{}}}}"#)
+        );
     }
 
     // -- paging ------------------------------------------------------------

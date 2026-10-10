@@ -7,6 +7,7 @@ mod db;
 mod db_log;
 mod dns;
 mod error;
+mod galaxy;
 mod handlers;
 mod ingest;
 mod maintenance;
@@ -105,18 +106,53 @@ struct Cli {
     verbose: u8,
 }
 
-fn main() -> Result<()> {
+/// A line on stderr, stamped the way the log is.
+///
+/// `sightingdb.err` is a file someone reads hours later, next to a log whose
+/// every line carries a time. A line without one cannot be placed against the
+/// rest, which is most of what reading it is for.
+///
+/// Shaped to match log4rs's default pattern so the two files interleave.
+fn stamped(message: &str) {
+    eprintln!(
+        "{} ERROR sightingdb - {message}",
+        chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    );
+}
+
+fn main() -> std::process::ExitCode {
+    // A panic reaches stderr through the runtime, which does not know about the
+    // log and does not stamp anything. Daemonized, that is a bare message in
+    // sightingdb.err with nothing to place it against.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::io::stderr().is_terminal() {
+            previous(info);
+        } else {
+            stamped(&format!("panicked: {info}"));
+            log::error!("panicked: {info}");
+        }
+    }));
+
     let result = run();
-    if let Err(e) = &result {
-        // On a terminal the `Error:` line printed below is the whole story.
+    let Err(e) = result else {
+        return std::process::ExitCode::SUCCESS;
+    };
+
+    if std::io::stderr().is_terminal() {
+        // Someone is reading it live, so keep anyhow's causal chain, which is
+        // more use at a prompt than a timestamp they can see on the clock.
+        eprintln!("Error: {e:?}");
+    } else {
         // Redirected — which is what a service manager does — stderr is a
         // different file from the log everyone tails, and a daemon that cannot
         // start then looks like it is starting over and over for no reason.
-        if !std::io::stderr().is_terminal() {
-            log::error!("{e:#}");
-        }
+        // Mirrored to the log, and stamped on stderr so either file alone says
+        // when it happened.
+        log::error!("{e:#}");
+        stamped(&format!("{e:#}"));
     }
-    result
+    std::process::ExitCode::FAILURE
 }
 
 fn run() -> Result<()> {
@@ -271,6 +307,7 @@ fn run() -> Result<()> {
         stix: settings.stix.clone(),
         started: std::time::Instant::now(),
         rejections: rejections::Rejections::new(settings.rejection_log),
+        galaxy: settings.galaxy.as_ref().map(galaxy::Galaxy::new),
     });
 
     let shutdown = Shutdown::new();
@@ -288,6 +325,10 @@ fn run() -> Result<()> {
                 }
             );
             actix_web::rt::spawn(ingest::run(Arc::clone(&state), zmq, Arc::clone(&shutdown)));
+        }
+
+        if state.galaxy.is_some() {
+            actix_web::rt::spawn(galaxy::run(Arc::clone(&state), Arc::clone(&shutdown)));
         }
 
         if settings.http_enabled {
@@ -379,7 +420,28 @@ fn server_info(
     db: &Database,
     acl: &Acl,
 ) -> admin::ServerInfo {
+    let stores = &settings.storage;
+    let (peers, max_hops) = match &settings.galaxy {
+        Some(galaxy) => (
+            galaxy.peers.iter().map(|peer| peer.url.clone()).collect(),
+            galaxy.max_hops,
+        ),
+        None => (Vec::new(), 0),
+    };
+    let kind = match (stores.is_router(), peers.is_empty()) {
+        (true, _) => "router",
+        (false, true) => "node",
+        (false, false) => "both",
+    };
+
     admin::ServerInfo {
+        role: admin::RoleInfo {
+            kind,
+            mirrors_everything: stores.stores_everything(),
+            namespaces: stores.prefixes().to_vec(),
+            peers,
+            max_hops,
+        },
         version: env!("CARGO_PKG_VERSION"),
         authenticate: settings.authenticate,
         http_enabled: settings.http_enabled,
@@ -588,14 +650,16 @@ fn build_acl(settings: &Settings, db: &Database, cli_apikey: Option<&str>) -> Ac
 /// look like catastrophic data loss, and the next save would make it real.
 fn open_database(settings: &Settings, dbdir: Option<&Path>) -> Result<Database> {
     let policy = settings.database_policy();
+    let stores = settings.storage.clone();
+    let node = settings.node_id.clone();
 
     let Some(path) = dbdir else {
-        return Ok(Database::with_policy(policy));
+        return Ok(Database::with_node(policy, stores, node));
     };
 
     match persistence::load(path)? {
         Some(data) => {
-            let db = Database::from_snapshot(data, policy);
+            let db = Database::from_snapshot_as(data, policy, stores, node);
             log::info!(
                 "Restored {} namespaces from {}",
                 db.namespace_count(),
@@ -605,7 +669,7 @@ fn open_database(settings: &Settings, dbdir: Option<&Path>) -> Result<Database> 
         }
         None => {
             log::info!("No shards in {}, starting empty", path.display());
-            Ok(Database::with_policy(policy))
+            Ok(Database::with_node(policy, stores, node))
         }
     }
 }

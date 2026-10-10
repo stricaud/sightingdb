@@ -1,12 +1,14 @@
 Storage, and running more than one of them
 ==========================================
 
-Notes towards a clustered SightingDB. Nothing here is implemented. The point of
-writing it down is to separate the parts that follow from how SightingDB already
-works from the parts that are still a choice.
+Notes towards a clustered SightingDB: a galaxy of servers behind an entry point,
+each holding some or all of the namespaces, syncing with each other over the
+same HTTP API a client uses.
 
-The numbers quoted below come from doc/sharding-experiment.py, which is in the
-repository so they can be re-checked:
+Some of this is built. Each section says which, because the difference matters:
+what is built can be relied on, and what is not is still a choice.
+
+The measurements quoted below come from doc/sharding-experiment.py:
 
     python3 doc/sharding-experiment.py
 
@@ -17,15 +19,20 @@ Storage today
 Default storage is a simple tree which contains the path + value. The path is
 usually the type of value, such as a host, an IP address, a hash etc.
 
-Two properties of it matter for everything that follows.
+Two properties of it decide everything that follows.
 
 **One file per top-level namespace.** persistence::shard_of() takes
-'feeds/misp/ips' to 'feeds', and that is the unit that is written out, paged in,
-evicted, and tiered hot/warm/cold. Namespaces beginning with '_' all share one
-internal shard: _all, every _shadow/*, and _config.
+'feeds/misp/ips' to 'feeds', and that is the unit written out, paged in,
+evicted and tiered. Namespaces beginning with '_' share one internal shard.
 
-**A sighting is a set of merge-safe operations.** This is the fact that makes
-clustering possible without a consensus protocol, and it is already true:
+Because the namespace is already the storage unit, a galaxy that divides work
+by namespace keeps every namespace-scoped operation local: listing a namespace,
+counting it, deleting it, exporting it as STIX. A galaxy that divided by value
+would turn each of those into a scatter-gather. That is why namespace mirroring
+is the model here.
+
+**A sighting is a set of merge-safe operations.** This is what makes clustering
+possible without a consensus protocol, and it is already true:
 
     count       += 1                     a counter
     first_seen  only ever moves back     a min register
@@ -34,217 +41,432 @@ clustering possible without a consensus protocol, and it is already true:
     ttl         assignment               a last-write-wins register
     stats       += 1 per hour bucket     a map of counters
 
-Every one of those converges whatever order it is applied in. Two nodes can
+Every one of those converges whatever order it is applied in. Two servers can
 take writes for the same value independently and merge afterwards without
 agreeing on anything first. No Raft, no quorum on the write path.
 
-There are two exceptions, and they are the whole difficulty. See "Consensus
-counting" and "Counters must be per node" below.
+The exception was `count`, since an increment is not idempotent. That is now
+kept per node and summed — see "Counters must be per node", which was the
+prerequisite everything else waited on.
 
 
-Read and Write on Multiple instances
-------------------------------------
+What a server is
+----------------
 
-Placement is a function of the value alone — not of the namespace, not of
-anything a client has to know — so that reading and writing need no consensus.
+    BUILT.
 
-**Hash the whole value, not a prefix.** The first four bytes do not work on this
-data. Every URL begins "http://", a large share of domains begin "www.", and
-addresses cluster in a handful of /8s. Measured over 20000 values shaped like a
-real feed:
+A server has a storage set and a peer set, both optional. "Node" and "load
+balancer" are not types — they are what those two settings add up to:
 
-      8 nodes, ideal share 12.5% each
-        XOR of first 4 bytes       min  5.7%  max 29.1%   imbalance 2.33x
-        first 4 bytes as a word    min  2.6%  max 35.0%   imbalance 2.80x
-        hash of whole value        min 12.1%  max 12.8%   imbalance 1.02x
+    [storage]
+    namespaces = ["/"]              everything: a full mirror (the default)
+    namespaces = ["feeds"]          that subtree and nothing else
+    namespaces = []                 nothing of its own: a pure router
 
-The busiest node does nearly three times the work of the quietest, and it gets
-worse with every node added.
+    [galaxy]
+    max_hops = 4
+    health_interval = 30
+    peers = [
+      { url = "https://node-a:9999", key = "..." },
+      { url = "https://lb2:9999",    key = "..." },
+    ]
 
-**Pick the node by rendezvous hashing, not by modulo.** For each value compute
-hash(value + node_id) for every member and take the highest. It needs no ring,
-no virtual nodes, and no state beyond the member list, and it moves the minimum
-possible amount of data when the membership changes — see "Adding a new Node".
+    stores something, no peers    node
+    stores nothing, has peers     router
+    stores something, has peers   both
 
-**The hash must have real avalanche, and must be stable forever.**
+Any server can be any of them, and a router's peer may itself be a router, so a
+router in front of routers is a cascade. /_management/api/info reports which
+under `role`, and /_management/api/galaxy reports the peers with their health.
 
- * FNV-1a spreads values perfectly well (1.02x above) but is *not* good enough
-   as a rendezvous weight: appending ':n0' / ':n1' perturbs it in a structured
-   way, the comparison between nodes becomes correlated, and it moves 50% of
-   the keyspace where the minimum is 11%. Use SHA-256, which is already a
-   dependency — stix.rs already leans on SHA-1-based UUIDv5, so there is
-   precedent for a cryptographic hash near a hot path.
+Prefixes match whole path segments, so `feeds` holds 'feeds/misp/ips' and never
+'feeds-internal'. The internal namespaces are always held whatever the setting
+says — a server cannot keep its own consensus tally otherwise — so listing one
+is an error.
 
- * Never use std's DefaultHasher. It is explicitly not stable across Rust
-   releases, and placement is persistent: a toolchain upgrade would silently
-   relocate the entire keyspace.
+A write to a namespace a server does not store answers 421 Misdirected Request.
+Not 403, which would say the caller may not; not 404, which would say there is
+no such thing. The request arrived somewhere that cannot serve it, and once
+forwarding exists that is what a router answers when no peer holds it either.
+It has to stay distinguishable from a real 404 to be debuggable.
 
-**What value-placement buys, beyond balance.** Because placement depends only on
-the value, every (namespace, value) pair for one value lands on the same node.
-So consensus — how many namespaces have seen this value — becomes a local
-count on that node. That is worth stating plainly:
+**The peer key is the capability bound.** Each peer carries the key this server
+authenticates to it with, and the peer's own ACL decides what that key may
+reach. A key granted `rw:feeds` on the peer cannot write anywhere else, however
+this server is configured or compromised. This is the existing ACL doing the
+work, not a new authorization model, and it is the reason a galaxy needs no
+trust between members beyond what each key allows. Give each one the narrowest
+grant that does the job.
 
- * _all stops existing as a structure. No cross-node counter, no decrement
-   invariant to preserve, and the '_' hotspot shard goes away.
- * /_management/api/sightings becomes one local lookup instead of a walk over
-   namespaces that may page shards in.
+Misconfiguration is refused at startup rather than at the first forward: a peer
+without a key, a url without a scheme, the same peer twice, max_hops of 0.
 
-This is the strongest argument for placing by value rather than by namespace,
-and it was not obvious: it removes the hardest problem rather than distributing
-it.
 
-**What it costs.** Namespace-scoped operations stop being local, because a
-namespace's values are now spread across every node. All of these become
-scatter-gather:
+Health
+------
 
- * /r/<namespace> listing a whole namespace
- * /r/<namespace>?count, including whether the count is exact
- * /d/<namespace>
- * /stix/<namespace>, and the recursive form especially
- * /_management/api/values and /_management/api/tree
+    BUILT.
 
-And hot/warm/cold tiering loses its meaning as it stands, because a tier is a
-property of a top-level namespace while each node now holds an arbitrary
-fraction of one. Either tiering becomes per node, or it is decided globally and
-applied to each node's fraction.
+Each peer's /health is probed every `health_interval` seconds and the result
+kept: online, consecutive failures, last successful probe, round trip, and the
+peer's own version — a galaxy running mixed versions is worth seeing before it
+starts behaving oddly.
 
-This is the real trade against placing by namespace. Placing by value wins on
-balance and on consensus locality; placing by namespace keeps every namespace
-operation local and leaves the storage and tiering model intact. Placing by
-value looks right, but the bill above is the bill.
+/health needs no API key, so a probe carries no credential.
+
+Three details that matter more than they look:
+
+ * "Not probed yet" is reported separately from "offline". A view that conflates
+   them says a galaxy is down for the first few seconds of its life.
+
+ * `last_seen` survives failure, so an operator can tell a peer that died a
+   minute ago from one that has been gone a week. Latency is cleared, because a
+   stale latency is a lie.
+
+ * What is reported is reachability *from this server*. A peer that is running
+   but unreachable from here is, for this server's purposes, down, and saying so
+   is more useful than saying it is up.
+
+`verify_tls = false` exists for a galaxy of self-signed instances, which is what
+--setup produces. It is on by default.
+
+
+Consensus
+---------
+
+    PARTLY BUILT: `_all` is readable and unwritable. The rest waits on
+    forwarding.
+
+Consensus means "how many namespaces have seen this value". Each server keeps
+its own tally in `_all`, which is a local fact: the namespaces *on this server*
+that hold the value.
+
+**The entry point is the right place for the global number**, because it sees
+the logical write — (namespace, value) — while mirroring is a physical detail
+below it. Its view is de-duplicated by construction, and it needs no polling, so
+a peer going away does not make consensus drop for a value that still exists.
+
+A router must therefore keep an `_all` of its own, which is why a storage set of
+`[]` still holds the internal namespaces.
+
+And because `_all` is an ordinary readable namespace, the global number needs no
+new endpoint:
+
+    GET /r/feeds/ips?val=V      the serving node's local consensus
+    GET /r/_all?val=V           on a router: the global one
+
+Leaving /r alone like this keeps a router a thin proxy for reads. The
+alternative — rewriting the `consensus` field in every forwarded response —
+couples it to the response schema and costs CPU per read.
+
+**No internal namespace is writable from outside.** `_all`, `_shadow/*` and
+`_config` answer 403 to every write route including /d. Before that guard a
+client could write `_all` directly and give a value a consensus no namespace
+supported — the one number this database exists to be trusted about. Reading
+them stays open apart from `_config`.
+
+Write responses now carry `new`: whether the sighting was the first of that
+value in that namespace, which is what gates a consensus increment and which a
+router cannot work out without holding the namespace. A router increments once
+when any downstream says new, and in a cascade each level reports upward the
+same way. The router side of that is step 6.
+
+One thing still to build:
+
+ * Removals never reach the router. Consensus is released when a namespace is
+   deleted and when the sweeper reclaims expired values, both on the node and
+   both invisible from above, so a router's tally drifts upward — faster the
+   more TTLs are in use. It needs periodic reconciliation against the nodes,
+   for which /_management/api/sightings already returns the namespace *names*
+   so they can be unioned rather than summed. Summing double-counts under
+   mirroring; unioning does not.
+
+**Parallel routers cannot share consensus.** Two entry points each see a
+fraction of the writes, and a count cannot be reconciled — you cannot tell a
+counter it has already counted something. So root-level redundancy costs either
+an active/standby router that rebuilds its tally from the nodes on promotion, or
+a router that stores presence pairs (value -> set of namespaces) instead of a
+count, because sets union idempotently. Data availability is unaffected either
+way; this is only about the global number.
+
+
+A forwarded write is counted for its origin
+------------------------------------------
+
+    BUILT. The subtlety that only appears once fan-out and syncing both work,
+    and it cost a round of measurement to find.
+
+Fanning one write out to two mirrors has each mirror count it — and with
+per-node counters, each counts it under *its own* name. The two then disagree
+about nothing and yet merging them adds the counts together. Measured on a real
+cascade: three writes through a load balancer became six once the mirrors
+synced.
+
+So the origin travels with the write, in X-SightingDB-Origin, and every mirror
+counts it under the same name. Merging mirrors that already agree is then the
+no-op it should be:
+
+    client writes 3 times to lb1 (lb1 -> lb2 -> two mirrors)
+      node-a {lb1: 3}   node-b {lb1: 3}
+    mirrors sync with each other, three times over
+      node-a 3          node-b 3
+
+In a cascade the header is passed along unchanged, so the attribution is the
+entry point the client actually talked to — lb1 above, not lb2.
+
+Honoured only on a request that also carries a hop count, which is to say only
+on a forwarded one: the origin is part of the forwarding protocol, not the
+client API. A client setting it anyway would mislabel its own writes without
+changing any total, since one write is still one increment.
 
 
 Counters must be per node
 -------------------------
 
-This is the one change to the data model that the rest depends on, and it is
-needed even without replication — see the migration window in "Adding a new
-Node".
+    BUILT. `count` and the hourly buckets are kept per node, the snapshot
+    format is version 2, and version 1 is migrated on load. What is still
+    missing is the merge verb below.
 
-Replaying an increment double-counts, so 'count: u64' cannot be shipped between
-nodes safely. Make it a map from node id to count, and report the sum:
+`count` is an increment, and increments are not idempotent. Over HTTP, where
+/w is the only write verb and it means "add one", any sync that reads a peer and
+writes what it finds compounds. Measured against two real instances:
 
-    count: HashMap<NodeId, u64>      reported as the sum of its values
+    client wrote 3 times.   A=3  B=3     correct
+    A syncs from B:         A=6  B=3     A doubled
+    B syncs back from A:    A=6  B=9
 
-Each node only ever writes its own entry, so replication is "send my entries",
-which is idempotent and order-independent. The same applies to each bucket in
-stats.
+Three sightings, two sync rounds, and the cluster claims nine. It is unbounded.
 
-This changes attribute.rs and the snapshot format. db::SnapshotData already
-carries 'version: u32', so there is a migration path — and this change can be
-made, shipped and tested on a single node long before any clustering exists.
+The fix, now in place, is a map from node id to count, reported as the sum:
 
+    counts:     node id -> count                 reported as the sum
+    node_stats: node id -> hour -> count         reported merged
 
-Adding a new Node
------------------
+Each server only ever writes its own entry, so replication becomes "send my
+entries", which is idempotent and order-independent. Releasing consensus takes
+from the releasing server's own entry, so a server gives back only what it put
+in and never spends a peer's contribution.
 
-Adding a node is a slow operation which moves the values the new node now wins.
-With rendezvous hashing that is the minimum share and no more:
+`node_id` in `[daemon]` names the server, defaulting to "local" so a standalone
+one sums to exactly what it always did.
 
-       change         mod-n   HRW+FNV   HRW+SHA   minimum
-       3 -> 4         75.0%     25.4%     25.1%     25.0%
-       4 -> 5         79.9%     50.0%     19.8%     20.0%
-       8 -> 9         88.9%     49.9%     11.0%     11.1%
-       8 -> 16        49.9%     75.2%     49.8%     50.0%
+The verb that goes with it is POST /_api/merge, which combines rather than
+increments, and GET /r/<ns>?val=V&for_merge, which answers in the shape that
+route takes. Both are built. The read side matters as much as the write side:
+offering a *total* rather than per-node counts would make the receiver
+attribute every server's sightings to the sender, and two servers exchanging
+totals inflate each other without bound. That was found by writing the sync and
+watching it do exactly that.
 
-mod-n renumbers nearly everything. Doubling is its one lucky case — hash % 8 and
-hash % 16 agree whenever the fourth bit is clear — and growing by a single node,
-which is what actually happens, is its worst.
-
-Migration takes one thread so the database stays fast. New writes go directly to
-the new node, while a read tries the new node first and falls back to the node
-that used to own the value.
-
-**The migration window needs a merge rule.** While a value is still on the old
-node and new writes are going to the new one, there are two counters for one
-value. Copying over the top loses the new writes; copying twice double-counts.
-Per-node counters make this safe: the copy carries the old node's entries, the
-new node keeps its own, and the sum is right either way.
-
-**Handing over needs a barrier.** Once a value's ownership has moved, a write
-must not still land on the old node — from a client that has not noticed, or
-from a node with a stale member list. The old node either refuses and redirects,
-or accepts and forwards. Silently accepting it is how a count goes missing.
+Reading a version 1 snapshot folds its totals into the reading server's entry,
+which is the only thing they can be. check_version was changed to accept older
+versions rather than refuse them: a build that would not open the existing
+database is indistinguishable from total data loss, and the next save would
+make it real. A *newer* version is still refused.
 
 
-One copy is not enough
-----------------------
+A node that was down, and comes back
+------------------------------------
 
-Placement by value puts each value on exactly one node. With no write-ahead log
-and snapshots held locally, that means:
+    PARTLY BUILT. Every piece a catch-up needs exists and has been driven by
+    hand; what is missing is something doing it on a timer, and the Joining
+    state that withholds reads while it runs.
 
- * losing a node permanently loses 1/n of the data
- * losing a node fails 1/n of requests outright
- * a hot value has one home, so there is no read scaling for it
+Done by hand against a real cascade, for a mirror that missed writes while down:
 
-For a cluster whose purpose is to serve many more clients transparently, a node
-failure is the least transparent thing that can happen. Replication factor of at
-least two is wanted. Rendezvous hashing gives it almost free: take the top R
-nodes by weight rather than the top one. The merge properties above are what
-make the replicas safe to reconcile without consensus.
+    node-b was down while these were written
+      5.5.5.5   node-a 2   node-b 0
+    node-b pulls each value from node-a
+      5.5.5.5   node-a 2   node-b 2    changed 1
+    pulling twice more
+      5.5.5.5   node-a 2   node-b 2    changed 0
+
+Writes kept succeeding on the surviving mirror throughout, so the outage cost
+availability on one server and nothing else.
+
+The obvious design is for the entry point to buffer what a dead node missed and
+push it on recovery. That is the wrong mechanism, for two reasons:
+
+ * The buffer is unbounded. A node down for an hour at ten thousand writes a
+   second is thirty-six million entries.
+
+ * There is no durable log anywhere in this system — snapshots only, no WAL. If
+   the router restarts while a node is away, the record of what was missed is
+   gone, and that node is permanently behind with nothing to say so.
+
+**The surviving mirror is the log.** Catch-up is not replay, it is "pull the
+delta from a peer that holds this namespace". Nothing unbounded, survives a
+router restart, and works even when a different router saw the writes. This is
+also the peer-to-peer sync a galaxy wants anyway.
+
+**Write to a recovering node; withhold reads from it.** Stopping writes while it
+catches up means the target keeps moving: under continuous load the sync has no
+point at which it provably finishes. Writing to it during catch-up is both
+correct and terminating, because new writes land directly while sync backfills
+the history behind them, and per-node counters make the two unable to conflict.
+
+What must be withheld is reads, because its data is genuinely incomplete and a
+read would under-report:
+
+    state       writes      reads
+    Joining     accepted    not served
+    Live        accepted    served
+    Down        -           -
+
+This is the opposite way round from the intuitive version, and it is the only
+version that terminates.
+
+**Never acknowledge a write that reached no holder.** If the entry point acks
+when every mirror of a namespace is down, the write exists nowhere and no later
+sync can recover it. This is the durability contract, and it is what makes
+"the mirror is the log" sound rather than hopeful.
+
+**Knowing how far behind.** There is no sequence number anywhere, so a
+recovering node either always syncs on startup or compares itself against a
+peer. /r/<namespace>?count is the cheap probe — it is O(1), and its `exact`
+flag already says when TTLs make the comparison approximate.
+
+Equal counts do *not* prove convergence: two servers can hold a hundred values
+each that the other lacks and report the same total. Count is a good progress
+indicator and is what a sync percentage in the interface should use. "Done"
+needs a digest or a Merkle root over values. Those are different questions and a
+sync that declares itself finished on count equality is quietly wrong.
+
+**Expiry during an outage looks after itself.** A node returning after a week
+holds values whose TTL expired while it was away, and may sync them to a peer
+that already swept them. It does not matter: expiry is derived from
+last_seen + ttl, so a resurrected value is immediately invisible and goes on the
+next sweep. Keep catch-up pull-only and this needs no special handling.
+
+
+Cascading and forwarding
+------------------------
+
+    BUILT. A client talks to the entry point; writes fan out to every mirror
+    that holds the namespace, reads come from one, and a cycle dies on the hop
+    limit.
+
+A router's peer may be a router. Three rules a cascade needs that a single
+level does not:
+
+ * **A hop limit, which is not optional.** A diamond or a miswired cycle makes
+   writes circulate and counts inflate without bound. max_hops travels in
+   X-SightingDB-Hops, is spent on each hop and refused at zero, answering 508.
+   Measured on two routers pointing at each other: the write collapses in
+   0.05s rather than circulating.
+
+ * **Writes fan out; reads pick one path.** Fanning reads multiplies cost for
+   nothing. The exception is namespace-scoped reads — listing, ?count, STIX
+   export — which must gather from every peer holding the namespace. Keep that
+   list short and deliberate.
+
+ * **Fan-out multiplies with depth.** A root to three routers to three nodes
+   each is nine physical writes per client write. Two levels is usually plenty.
+
+**Reads should be sticky per value.** Mirrors diverge transiently under async
+sync, so two consecutive reads served by different mirrors can show a count
+going *down*. Picking the mirror by rendezvous hashing over the mirror set for
+that value fixes it: same value, same mirror, monotonic. This is the one place
+rendezvous hashing belongs here — choosing among the servers that already hold a
+namespace, not deciding where data lives.
+
+Two things the measurements say about that choice, both in
+doc/sharding-experiment.py:
+
+ * Select by rendezvous hashing, not by modulo. mod-n renumbers nearly
+   everything when the mirror set changes: 88.9% of keys move going from eight
+   mirrors to nine, against the 11.1% minimum. Rendezvous moves the minimum.
+
+ * The hash needs real avalanche. FNV-1a spreads values perfectly well but
+   makes a poor rendezvous weight — appending ':n0' / ':n1' perturbs it in a
+   structured way and the comparison between servers becomes correlated, moving
+   50% where the minimum is 11%. Use SHA-256, already a dependency. Never
+   std's DefaultHasher: it is not stable across Rust releases, and a toolchain
+   upgrade would silently repoint every read.
+
+
+Shadow sightings belong at the entry point
+------------------------------------------
+
+    NOT BUILT.
+
+Every read records a shadow sighting, so there is no such thing as a read-only
+replica and serving more clients roughly doubles write load.
+
+A router is the right place for them, because it is where the client actually
+is. Have it record the shadow locally and forward the read with `noshadow`. A
+search is then counted once, at the entry point, instead of once on whichever
+mirror happened to serve it — which is better than today's behaviour, where the
+count lands arbitrarily. Nodes stop writing on read entirely.
+
+Under a router that stores only internal namespaces this costs nothing extra:
+`_shadow/*` is already held.
 
 
 Still unsolved
 --------------
 
-**Reads are writes.** Every /r records a shadow sighting under
-_shadow/<namespace>. So there is no such thing as a read-only replica, and
-serving more clients roughly doubles write load rather than adding cheap reads.
-The proposal here is to make shadow sightings node-local and never replicated —
-"how often was this searched for" is arguably a per-node observability fact
-anyway. That is a semantic decision and should be made deliberately rather than
-fallen into. Under placement by value a shadow entry lands on the same node as
-the value it shadows, which is at least convenient.
-
 **ACL and tier distribution.** acl_file and tiers_file are rewritten by
-whichever node served the management request. Save a key on one node and the
-others never learn it. This is the consequence of keys living in configuration
-rather than in the database. It needs a shared store, a gossiped ACL, or a
-management interface that writes cluster-wide.
+whichever server served the management request. Save a key on one and the others
+never learn it. This is the consequence of keys living in configuration rather
+than in the database. It needs a shared store, a gossiped ACL, or a management
+interface that writes galaxy-wide.
 
 **Durability.** Snapshots every snapshot_interval, 300s by default, and no WAL,
 so a crash loses up to five minutes. Replication can stand in for a log, but
-only if a write reaches a peer before it is acknowledged; otherwise every node
+only if a write reaches a peer before it is acknowledged; otherwise every server
 independently keeps the same five-minute hole. For sighting counts, replicating
 asynchronously and accepting the window is defensible — but it should be a
 choice rather than an accident.
 
-**Membership.** Discovery, failure detection, and an agreed member list, since
-rendezvous hashing is only as good as the list every node computes against. Two
-nodes disagreeing about membership will disagree about placement. ZeroMQ is
-already a dependency and could carry inter-node traffic.
+**Anti-entropy.** Something has to find and repair divergence between mirrors
+that are both up, as opposed to catching up one that was down. The per-shard
+snapshot files are a natural unit; a version vector per namespace, or Merkle
+trees over values once shards get large.
 
-**Anti-entropy.** Something has to find and repair divergence between replicas.
-The per-shard snapshot files are already a natural unit; a version vector per
-namespace, or Merkle trees over values once shards get large.
+**Membership.** Peers are configured, not discovered. A galaxy that gains and
+loses members by hand is fine to start with, and sticky read routing is only as
+consistent as the mirror list every server computes against — so two servers
+disagreeing about membership will disagree about which mirror serves a value.
 
 
 Order of work
 -------------
 
-The first three are single-node refactors with no distributed systems in them,
-and they are where the difficulty actually lives. Getting them wrong cannot be
-repaired by any amount of replication machinery.
+    DONE  1. Roles: storage set, peer set, 421 for what a server does not hold.
+    DONE  2. Internal namespaces unwritable, so `_all` cannot be forged.
+    DONE  3. Peer health, and the galaxy endpoint a topology view reads.
+    DONE  4. Per-node counters and the snapshot format bump.
+    DONE  5. The merge verb and its read side, and `new` on write responses.
+    DONE  6. Forwarding: writes fan out, reads pick one, the hop limit is
+             enforced, and a forwarded write is counted for its origin.
+    DONE  7. The galaxy view: one request walks the cascade, and the
+             management interface draws it.
 
- 1. Per-node counters, and the snapshot format version bump.
- 2. Derive consensus instead of maintaining it — or, under placement by value,
-    delete _all and count locally.
- 3. Decide that shadow sightings are node-local.
- 4. A shared store for the ACL and the tiers.
- 5. Membership, replication, anti-entropy.
- 6. Split the internal shard, if it is still a hotspot by then.
+          8. Catch-up as a running thing, and the Joining state. Every piece
+             is here — ?count to notice, ?for_merge to read, /_api/merge to
+             apply — so what is missing is a worker on a timer rather than a
+             person with curl.
+          9. Shadow sightings at the entry point.
+         10. Reconciling the router's consensus tally against the nodes.
+         11. A shared store for the ACL and the tiers.
+
+Steps 4 and 5 were refactors with no distributed systems in them, and they were
+where the difficulty lived. What remains is plumbing by comparison — with the
+exception of step 7, whose protocol is written down above.
 
 
-A note on whether to shard at all
----------------------------------
+A note on whether to divide the data at all
+-------------------------------------------
 
-Sharding scales data volume and write throughput. Serving many more *clients* is
-a connection and throughput problem, and full replication behind a plain load
-balancer solves that with no placement logic, no rebalancing, and no
-scatter-gather — every node answers everything, and clients change nothing.
+Dividing namespaces between servers scales data volume. Serving many more
+*clients* is a connection and throughput problem, and full mirrors behind an
+entry point solve that with no placement logic, no rebalancing and no
+scatter-gather — every server answers everything, and clients change nothing.
 
 The merge properties at the top of this document are what make that safe, and it
-is a great deal less work than the above.
+is a great deal less work than the rest.
 
-Shard when the data outgrows one node, not when the client count does. The
-measured snapshot limits are what say which ceiling is close.
+So: mirror everything until the data outgrows one server, then narrow each
+server's storage set. The measured snapshot limits are what say which ceiling is
+close.

@@ -20,12 +20,71 @@ pub struct Attribute {
     pub first_seen: DateTime<Utc>,
     #[serde(with = "ts_seconds")]
     pub last_seen: DateTime<Utc>,
-    pub count: u64,
+    /// Sightings contributed by each server, keyed by node id, reported as the
+    /// sum.
+    ///
+    /// Per node rather than one total, because an increment is not idempotent:
+    /// a sync that read a peer's total and replayed it would double the count,
+    /// and double it again next time round. Each server only ever writes its
+    /// own entry, so merging two copies is a union of disjoint contributions
+    /// and applying the same merge twice changes nothing.
+    ///
+    /// A server that has never been in a galaxy has one entry, under
+    /// [`crate::db::LOCAL_NODE`], and the sum is what it always was.
+    #[serde(default)]
+    pub counts: BTreeMap<String, u64>,
     pub tags: String,
     pub ttl: u64,
-    /// Count per hourly bucket. The key is a Unix timestamp because
-    /// `DateTime::timestamp()` returns an `i64`.
-    pub stats: BTreeMap<i64, u64>,
+    /// Hourly buckets, per node, for the same reason as `counts`. The inner key
+    /// is a Unix timestamp because `DateTime::timestamp()` returns an `i64`.
+    ///
+    /// Reported merged, so a reader sees one bucket per hour however many
+    /// servers contributed to it.
+    #[serde(default, rename = "node_stats")]
+    pub stats: BTreeMap<String, BTreeMap<i64, u64>>,
+
+    /// A total written by a build that kept one, folded into `counts` on load
+    /// by [`Attribute::migrate`]. Read, never written.
+    #[serde(default, rename = "count", skip_serializing)]
+    legacy_count: u64,
+    /// Buckets written by a build that did not keep them per node. As above.
+    #[serde(default, rename = "stats", skip_serializing)]
+    legacy_stats: BTreeMap<i64, u64>,
+}
+
+/// One value as a peer holds it, for merging into a local copy.
+///
+/// Every field merges by a rule that does not care about order or repetition,
+/// so applying the same merge twice is the same as applying it once and two
+/// peers exchanging copies converge. That is the whole point: a sync that has
+/// to be applied exactly once is a sync that cannot be retried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Merge {
+    /// The peer's view of each server's contribution.
+    pub counts: BTreeMap<String, u64>,
+    /// The peer's view of each server's hourly buckets.
+    #[serde(default)]
+    pub stats: BTreeMap<String, BTreeMap<i64, u64>>,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub ttl: u64,
+}
+
+/// What a merge changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Merged {
+    /// Whether anything about the local copy changed. A merge that already
+    /// held everything offered is reported rather than hidden, because during
+    /// catch-up it is how a caller knows it has converged.
+    pub changed: bool,
+    /// Entries for this server's own id that were ignored. A peer does not get
+    /// to say what this server has seen.
+    pub ignored_self: usize,
+    /// The total after merging.
+    pub count: u64,
 }
 
 /// The wire representation of an [`Attribute`].
@@ -77,26 +136,52 @@ impl Attribute {
             value: String::from(value),
             first_seen: DateTime::UNIX_EPOCH,
             last_seen: DateTime::UNIX_EPOCH,
-            count: 0,
+            counts: BTreeMap::new(),
             tags: String::new(),
             ttl: 0,
             stats: BTreeMap::new(),
+            legacy_count: 0,
+            legacy_stats: BTreeMap::new(),
         }
     }
 
+    /// Every server's sightings added together, which is the number a client
+    /// has always been given.
     pub fn count(&self) -> u64 {
-        self.count
+        self.counts.values().copied().sum()
+    }
+
+    /// Fold a total written by an older build into `node`'s entry.
+    ///
+    /// Called once per attribute when a snapshot is loaded. A build before this
+    /// one kept one total and one set of buckets with nobody's name on them;
+    /// the server reading them is the only server that can have written them,
+    /// so they become its own contribution.
+    pub fn migrate(&mut self, node: &str) {
+        if self.legacy_count > 0 {
+            *self.counts.entry(node.to_string()).or_insert(0) += self.legacy_count;
+            self.legacy_count = 0;
+        }
+        if !self.legacy_stats.is_empty() {
+            let buckets = self.stats.entry(node.to_string()).or_default();
+            for (bucket, hits) in std::mem::take(&mut self.legacy_stats) {
+                *buckets.entry(bucket).or_insert(0) += hits;
+            }
+        }
     }
 
     /// Record one sighting at `when`, keeping at most `stats_retention` hourly
     /// buckets (0 keeps all of them).
     ///
     /// The first sighting seeds both `first_seen` and `last_seen`; later ones
-    /// only widen the window. We key "is this the first sighting?" off `count`
-    /// rather than off a sentinel timestamp, so a legitimate sighting at the
-    /// Unix epoch is handled correctly.
-    pub fn increment(&mut self, when: DateTime<Utc>, stats_retention: usize) {
-        if self.count == 0 {
+    /// only widen the window. We key "is this the first sighting?" off the
+    /// count rather than off a sentinel timestamp, so a legitimate sighting at
+    /// the Unix epoch is handled correctly.
+    ///
+    /// `node` is this server's id: the sighting is counted as its contribution,
+    /// never as a peer's.
+    pub fn increment(&mut self, node: &str, when: DateTime<Utc>, stats_retention: usize) {
+        if self.count() == 0 {
             self.first_seen = when;
             self.last_seen = when;
         } else {
@@ -108,16 +193,27 @@ impl Attribute {
             }
         }
 
-        self.make_stats(when);
-        self.trim_stats(stats_retention);
-        self.count += 1;
+        self.make_stats(node, when);
+        self.trim_stats(node, stats_retention);
+        *self.counts.entry(node.to_string()).or_insert(0) += 1;
     }
 
     /// Undo one sighting. Only used to keep the `_all` consensus tally honest
     /// when a value is evicted from a namespace.
-    pub fn decrement(&mut self) -> u64 {
-        self.count = self.count.saturating_sub(1);
-        self.count
+    ///
+    /// Takes it off `node`'s own entry: a server gives back what it put in, and
+    /// never spends a peer's contribution. Returns the total that remains, so
+    /// the caller can see when the value is gone from everywhere.
+    pub fn decrement(&mut self, node: &str) -> u64 {
+        if let Some(mine) = self.counts.get_mut(node) {
+            *mine = mine.saturating_sub(1);
+            if *mine == 0 {
+                // Dropped rather than left at zero, so a server that has given
+                // everything back stops appearing as a contributor.
+                self.counts.remove(node);
+            }
+        }
+        self.count()
     }
 
     pub fn set_ttl(&mut self, ttl: u64) {
@@ -141,6 +237,123 @@ impl Attribute {
         }
         if changed {
             self.tags = merged.join(",");
+        }
+    }
+
+    /// This value as a peer should be offered it.
+    ///
+    /// Exactly the shape [`Attribute::merge`] takes, so a sync reads it from
+    /// one server and posts it to another unchanged. The per-node counts are
+    /// the point: offering a *total* would make the receiver attribute every
+    /// server's sightings to the sender, and two servers exchanging totals
+    /// inflate each other without bound.
+    pub fn as_merge(&self) -> Merge {
+        Merge {
+            counts: self.counts.clone(),
+            stats: self.stats.clone(),
+            first_seen: self.first_seen.timestamp(),
+            last_seen: self.last_seen.timestamp(),
+            tags: self.tags.clone(),
+            ttl: self.ttl,
+        }
+    }
+
+    /// Fold a peer's copy of this value into ours.
+    ///
+    /// The rules, and why each one cannot care about order:
+    ///
+    ///  * **counts** — the greater of the two, per server. A server's own
+    ///    count only ever rises, so taking the larger converges whichever
+    ///    copy arrives first, and re-applying one changes nothing. Setting it
+    ///    outright would let a stale copy undo a newer one.
+    ///  * **stats** — the same, per bucket.
+    ///  * **first_seen** — the earlier. **last_seen** — the later.
+    ///  * **tags** — the union, which is what [`Attribute::add_tags`] already
+    ///    does.
+    ///  * **ttl** — the shortest of the non-zero ones, with zero meaning never.
+    ///    Order-independent, and it errs towards expiring: a value is kept only
+    ///    as long as the most cautious server says.
+    ///
+    /// **An entry under `mine` is ignored.** A peer does not get to tell this
+    /// server what it has seen; that entry is the one thing here this server is
+    /// the authority on, and accepting it would let a stale copy roll local
+    /// writes backwards.
+    pub fn merge(&mut self, incoming: &Merge, mine: &str) -> Merged {
+        let mut changed = false;
+        let mut ignored_self = 0;
+
+        // Captured before anything is merged. Once a count has landed the
+        // value no longer looks unseen, and the window below would then take
+        // the earlier of a real time and the epoch.
+        let unseen = self.count() == 0 && self.first_seen == DateTime::UNIX_EPOCH;
+
+        for (node, count) in &incoming.counts {
+            if node == mine {
+                ignored_self += 1;
+                continue;
+            }
+            let entry = self.counts.entry(node.clone()).or_insert(0);
+            if *count > *entry {
+                *entry = *count;
+                changed = true;
+            }
+        }
+
+        for (node, buckets) in &incoming.stats {
+            if node == mine {
+                continue;
+            }
+            let ours = self.stats.entry(node.clone()).or_default();
+            for (bucket, hits) in buckets {
+                let entry = ours.entry(*bucket).or_insert(0);
+                if *hits > *entry {
+                    *entry = *hits;
+                    changed = true;
+                }
+            }
+        }
+
+        // A value we had not seen at all starts at the epoch, so seed the
+        // window rather than taking the earlier of a real time and 1970.
+        if let Some(theirs) = DateTime::from_timestamp(incoming.first_seen, 0)
+            && (unseen || theirs < self.first_seen)
+        {
+            if theirs != self.first_seen {
+                changed = true;
+            }
+            self.first_seen = theirs;
+        }
+        if let Some(theirs) = DateTime::from_timestamp(incoming.last_seen, 0)
+            && (unseen || theirs > self.last_seen)
+        {
+            if theirs != self.last_seen {
+                changed = true;
+            }
+            self.last_seen = theirs;
+        }
+
+        if !incoming.tags.is_empty() {
+            let before = self.tags.clone();
+            self.add_tags(&incoming.tags);
+            if self.tags != before {
+                changed = true;
+            }
+        }
+
+        let merged_ttl = match (self.ttl, incoming.ttl) {
+            (0, theirs) => theirs,
+            (ours, 0) => ours,
+            (ours, theirs) => ours.min(theirs),
+        };
+        if merged_ttl != self.ttl {
+            self.ttl = merged_ttl;
+            changed = true;
+        }
+
+        Merged {
+            changed,
+            ignored_self,
+            count: self.count(),
         }
     }
 
@@ -174,24 +387,48 @@ impl Attribute {
             .is_some_and(|deadline| now.timestamp() > deadline)
     }
 
-    fn make_stats(&mut self, when: DateTime<Utc>) {
+    fn make_stats(&mut self, node: &str, when: DateTime<Utc>) {
         // `div_euclid` so that pre-epoch timestamps round down rather than
         // toward zero, keeping buckets uniformly one hour wide.
         let bucket = when.timestamp().div_euclid(STATS_BUCKET_SECS) * STATS_BUCKET_SECS;
-        *self.stats.entry(bucket).or_insert(0) += 1;
+        *self
+            .stats
+            .entry(node.to_string())
+            .or_default()
+            .entry(bucket)
+            .or_insert(0) += 1;
     }
 
     /// Drop the oldest buckets so that statistics cannot grow without bound.
     /// `BTreeMap` is ordered by timestamp, so the oldest are simply the first.
-    fn trim_stats(&mut self, keep: usize) {
-        if keep == 0 || self.stats.len() <= keep {
+    ///
+    /// Trimmed within this server's own buckets. Retention is "how far back
+    /// this server remembers", and spending it on a peer's history would make
+    /// one server's retention depend on how many others there are.
+    fn trim_stats(&mut self, node: &str, keep: usize) {
+        let Some(buckets) = self.stats.get_mut(node) else {
+            return;
+        };
+        if keep == 0 || buckets.len() <= keep {
             return;
         }
-        let excess = self.stats.len() - keep;
-        let oldest: Vec<i64> = self.stats.keys().take(excess).copied().collect();
+        let excess = buckets.len() - keep;
+        let oldest: Vec<i64> = buckets.keys().take(excess).copied().collect();
         for bucket in oldest {
-            self.stats.remove(&bucket);
+            buckets.remove(&bucket);
         }
+    }
+
+    /// Every server's buckets added together, so a reader sees one entry per
+    /// hour however many contributed to it.
+    fn merged_stats(&self) -> BTreeMap<i64, u64> {
+        let mut merged = BTreeMap::new();
+        for buckets in self.stats.values() {
+            for (bucket, hits) in buckets {
+                *merged.entry(*bucket).or_insert(0) += hits;
+            }
+        }
+        merged
     }
 
     /// Build the wire representation. `consensus` is supplied by the caller
@@ -201,11 +438,11 @@ impl Attribute {
             value: self.value.clone(),
             first_seen: self.first_seen.timestamp(),
             last_seen: self.last_seen.timestamp(),
-            count: self.count,
+            count: self.count(),
             tags: self.tags.clone(),
             ttl: self.ttl,
             consensus,
-            stats: with_stats.then(|| self.stats.clone()),
+            stats: with_stats.then(|| self.merged_stats()),
         }
     }
 }
@@ -216,7 +453,7 @@ impl fmt::Debug for Attribute {
             .field("value", &self.value)
             .field("first_seen", &self.first_seen)
             .field("last_seen", &self.last_seen)
-            .field("count", &self.count)
+            .field("count", &self.count())
             .field("tags", &self.tags)
             .field("ttl", &self.ttl)
             .finish_non_exhaustive()
@@ -283,7 +520,7 @@ mod tests {
     fn view_round_trips_through_json() {
         let mut attr = Attribute::new("test");
         for i in 0..5 {
-            attr.increment(at(i * STATS_BUCKET_SECS), 0);
+            attr.increment(crate::db::LOCAL_NODE, at(i * STATS_BUCKET_SECS), 0);
         }
 
         let serialized = serde_json::to_string(&attr.view(3, true)).unwrap();
@@ -294,7 +531,7 @@ mod tests {
     #[test]
     fn view_omits_stats_unless_requested() {
         let mut attr = Attribute::new("test");
-        attr.increment(at(1_600_000_000), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(1_600_000_000), 0);
 
         let without = serde_json::to_string(&attr.view(0, false)).unwrap();
         assert!(!without.contains("stats"), "{without}");
@@ -306,7 +543,7 @@ mod tests {
     #[test]
     fn first_sighting_seeds_both_timestamps() {
         let mut attr = Attribute::new("v");
-        attr.increment(at(1_000_000), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(1_000_000), 0);
 
         assert_eq!(attr.first_seen.timestamp(), 1_000_000);
         assert_eq!(attr.last_seen.timestamp(), 1_000_000);
@@ -316,34 +553,228 @@ mod tests {
     #[test]
     fn out_of_order_sightings_widen_the_window() {
         let mut attr = Attribute::new("v");
-        attr.increment(at(1_000_000), 0);
-        attr.increment(at(500_000), 0); // older than first_seen
-        attr.increment(at(2_000_000), 0); // newer than last_seen
+        attr.increment(crate::db::LOCAL_NODE, at(1_000_000), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(500_000), 0); // older than first_seen
+        attr.increment(crate::db::LOCAL_NODE, at(2_000_000), 0); // newer than last_seen
 
         assert_eq!(attr.first_seen.timestamp(), 500_000);
         assert_eq!(attr.last_seen.timestamp(), 2_000_000);
         assert_eq!(attr.count(), 3);
     }
 
+    fn merge_of(counts: &[(&str, u64)], first: i64, last: i64, tags: &str, ttl: u64) -> Merge {
+        Merge {
+            counts: counts.iter().map(|(n, c)| ((*n).to_string(), *c)).collect(),
+            stats: BTreeMap::new(),
+            first_seen: first,
+            last_seen: last,
+            tags: tags.to_string(),
+            ttl,
+        }
+    }
+
+    /// Applying the same merge twice must be the same as applying it once.
+    /// Without this a sync cannot be retried, and a sync that cannot be
+    /// retried is no use.
+    #[test]
+    fn merging_is_idempotent() {
+        let mut attr = Attribute::new("1.2.3.4");
+        attr.increment("node-a", at(1_600_000_000), 0);
+
+        let incoming = merge_of(
+            &[("node-b", 5)],
+            1_500_000_000,
+            1_700_000_000,
+            "tlp:amber",
+            3600,
+        );
+
+        let first = attr.merge(&incoming, "node-a");
+        assert!(first.changed);
+        assert_eq!(first.count, 6);
+        let after_once = attr.clone();
+
+        let again = attr.merge(&incoming, "node-a");
+        assert!(!again.changed, "a repeat merge reported a change");
+        assert_eq!(again.count, 6);
+        assert_eq!(attr, after_once, "a repeat merge altered the value");
+    }
+
+    /// Two peers' copies must converge to the same thing whichever arrives
+    /// first.
+    #[test]
+    fn merging_is_order_independent() {
+        let b = merge_of(
+            &[("node-b", 5)],
+            1_500_000_000,
+            1_650_000_000,
+            "tlp:amber",
+            7200,
+        );
+        let c = merge_of(
+            &[("node-c", 2)],
+            1_550_000_000,
+            1_700_000_000,
+            "confidence:80",
+            3600,
+        );
+
+        let mut one = Attribute::new("1.2.3.4");
+        one.increment("node-a", at(1_600_000_000), 0);
+        one.merge(&b, "node-a");
+        one.merge(&c, "node-a");
+
+        let mut other = Attribute::new("1.2.3.4");
+        other.increment("node-a", at(1_600_000_000), 0);
+        other.merge(&c, "node-a");
+        other.merge(&b, "node-a");
+
+        assert_eq!(one.count(), 8);
+        assert_eq!(one.counts, other.counts);
+        assert_eq!(one.first_seen, other.first_seen);
+        assert_eq!(one.last_seen, other.last_seen);
+        assert_eq!(one.ttl, other.ttl, "ttl merge depended on order");
+        // Tags are a set, so compare as one rather than by string order.
+        let mut a: Vec<&str> = split_tags(&one.tags).collect();
+        let mut d: Vec<&str> = split_tags(&other.tags).collect();
+        a.sort_unstable();
+        d.sort_unstable();
+        assert_eq!(a, d);
+    }
+
+    /// A stale copy must not roll a newer one backwards. Taking the greater
+    /// per server is what prevents it; setting outright would not.
+    #[test]
+    fn a_stale_merge_cannot_lower_a_count() {
+        let mut attr = Attribute::new("1.2.3.4");
+        attr.merge(
+            &merge_of(&[("node-b", 9)], 1_600_000_000, 1_600_000_000, "", 0),
+            "node-a",
+        );
+        assert_eq!(attr.count(), 9);
+
+        attr.merge(
+            &merge_of(&[("node-b", 4)], 1_600_000_000, 1_600_000_000, "", 0),
+            "node-a",
+        );
+        assert_eq!(attr.count(), 9, "a stale merge lowered the count");
+    }
+
+    /// A peer does not get to say what this server has seen.
+    #[test]
+    fn a_merge_cannot_rewrite_this_servers_own_entry() {
+        let mut attr = Attribute::new("1.2.3.4");
+        for _ in 0..3 {
+            attr.increment("node-a", at(1_600_000_000), 0);
+        }
+
+        // A peer offers a wildly different figure for us, and one for itself.
+        let outcome = attr.merge(
+            &merge_of(
+                &[("node-a", 999), ("node-b", 2)],
+                1_600_000_000,
+                1_600_000_000,
+                "",
+                0,
+            ),
+            "node-a",
+        );
+
+        assert_eq!(outcome.ignored_self, 1);
+        assert_eq!(
+            attr.counts.get("node-a").copied(),
+            Some(3),
+            "our own count was rewritten"
+        );
+        assert_eq!(attr.counts.get("node-b").copied(), Some(2));
+        assert_eq!(attr.count(), 5);
+    }
+
+    /// Merging a value this server has never seen seeds the window rather than
+    /// taking the earlier of a real time and the epoch.
+    #[test]
+    fn merging_into_an_unseen_value_seeds_the_window() {
+        let mut attr = Attribute::new("1.2.3.4");
+        attr.merge(
+            &merge_of(&[("node-b", 2)], 1_600_000_000, 1_600_003_600, "", 0),
+            "node-a",
+        );
+
+        assert_eq!(
+            attr.first_seen.timestamp(),
+            1_600_000_000,
+            "first_seen stayed at the epoch"
+        );
+        assert_eq!(attr.last_seen.timestamp(), 1_600_003_600);
+        assert_eq!(attr.count(), 2);
+    }
+
+    /// Zero means never, so it loses to any real expiry: a value is kept only
+    /// as long as the most cautious server says.
+    #[test]
+    fn ttl_merges_to_the_shortest_real_expiry() {
+        let cases = [
+            (0u64, 0u64, 0u64),
+            (0, 3600, 3600),
+            (3600, 0, 3600),
+            (7200, 3600, 3600),
+        ];
+        for (ours, theirs, expected) in cases {
+            let mut attr = Attribute::new("v");
+            attr.set_ttl(ours);
+            attr.merge(
+                &merge_of(&[("node-b", 1)], 1_600_000_000, 1_600_000_000, "", theirs),
+                "node-a",
+            );
+            assert_eq!(attr.ttl, expected, "ours={ours} theirs={theirs}");
+        }
+    }
+
+    /// Hourly buckets merge the same way, and the view shows them merged.
+    #[test]
+    fn merging_stats_takes_the_greater_bucket() {
+        let mut attr = Attribute::new("v");
+        attr.increment("node-a", at(3600), 0);
+
+        let mut incoming = merge_of(&[("node-b", 4)], 3600, 7200, "", 0);
+        incoming.stats.insert(
+            "node-b".to_string(),
+            [(3600_i64, 3_u64), (7200, 1)].into_iter().collect(),
+        );
+        attr.merge(&incoming, "node-a");
+
+        let stats = attr.view(0, true).stats.unwrap();
+        // 1 of ours plus 3 of theirs in the first hour, 1 of theirs in the next.
+        assert_eq!(stats.get(&3600), Some(&4));
+        assert_eq!(stats.get(&7200), Some(&1));
+
+        // And again changes nothing.
+        attr.merge(&incoming, "node-a");
+        let stats = attr.view(0, true).stats.unwrap();
+        assert_eq!(stats.get(&3600), Some(&4));
+    }
+
     #[test]
     fn sightings_in_the_same_hour_share_a_bucket() {
         let mut attr = Attribute::new("v");
-        attr.increment(at(3600), 0);
-        attr.increment(at(3600 + 59), 0);
-        attr.increment(at(7200), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(3600), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(3600 + 59), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(7200), 0);
 
-        assert_eq!(attr.stats.get(&3600), Some(&2));
-        assert_eq!(attr.stats.get(&7200), Some(&1));
+        // Asserted through the view, which is the merged shape a reader gets.
+        let stats = attr.view(0, true).stats.unwrap();
+        assert_eq!(stats.get(&3600), Some(&2));
+        assert_eq!(stats.get(&7200), Some(&1));
     }
 
     #[test]
     fn stats_retention_drops_the_oldest_buckets() {
         let mut attr = Attribute::new("v");
         for hour in 0..10 {
-            attr.increment(at(hour * STATS_BUCKET_SECS), 3);
+            attr.increment(crate::db::LOCAL_NODE, at(hour * STATS_BUCKET_SECS), 3);
         }
 
-        let buckets: Vec<i64> = attr.stats.keys().copied().collect();
+        let buckets: Vec<i64> = attr.view(0, true).stats.unwrap().into_keys().collect();
         assert_eq!(
             buckets,
             [
@@ -361,16 +792,16 @@ mod tests {
     fn zero_retention_keeps_every_bucket() {
         let mut attr = Attribute::new("v");
         for hour in 0..10 {
-            attr.increment(at(hour * STATS_BUCKET_SECS), 0);
+            attr.increment(crate::db::LOCAL_NODE, at(hour * STATS_BUCKET_SECS), 0);
         }
 
-        assert_eq!(attr.stats.len(), 10);
+        assert_eq!(attr.view(0, true).stats.unwrap().len(), 10);
     }
 
     #[test]
     fn a_zero_ttl_never_expires() {
         let mut attr = Attribute::new("v");
-        attr.increment(at(1000), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(1000), 0);
 
         assert_eq!(attr.expires_at(), None);
         assert!(!attr.is_expired(at(FAR_FUTURE)));
@@ -379,7 +810,7 @@ mod tests {
     #[test]
     fn a_ttl_is_measured_from_the_last_sighting() {
         let mut attr = Attribute::new("v");
-        attr.increment(at(1000), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(1000), 0);
         attr.set_ttl(60);
 
         assert_eq!(attr.expires_at(), Some(1060));
@@ -387,7 +818,7 @@ mod tests {
         assert!(attr.is_expired(at(1061)));
 
         // Being seen again pushes the deadline out.
-        attr.increment(at(2000), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(2000), 0);
         assert!(!attr.is_expired(at(2060)));
         assert!(attr.is_expired(at(2061)));
     }
@@ -395,7 +826,7 @@ mod tests {
     #[test]
     fn an_enormous_ttl_saturates_instead_of_overflowing() {
         let mut attr = Attribute::new("v");
-        attr.increment(at(1000), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(1000), 0);
         attr.set_ttl(u64::MAX);
 
         assert_eq!(attr.expires_at(), Some(i64::MAX));
@@ -405,17 +836,17 @@ mod tests {
     #[test]
     fn decrement_saturates_at_zero() {
         let mut attr = Attribute::new("v");
-        attr.increment(at(1000), 0);
+        attr.increment(crate::db::LOCAL_NODE, at(1000), 0);
 
-        assert_eq!(attr.decrement(), 0);
-        assert_eq!(attr.decrement(), 0);
+        assert_eq!(attr.decrement(crate::db::LOCAL_NODE), 0);
+        assert_eq!(attr.decrement(crate::db::LOCAL_NODE), 0);
     }
 
     #[test]
     fn epoch_sighting_is_not_treated_as_unset() {
         let mut attr = Attribute::new("v");
-        attr.increment(DateTime::UNIX_EPOCH, 0);
-        attr.increment(at(3600), 0);
+        attr.increment(crate::db::LOCAL_NODE, DateTime::UNIX_EPOCH, 0);
+        attr.increment(crate::db::LOCAL_NODE, at(3600), 0);
 
         assert_eq!(attr.first_seen, DateTime::UNIX_EPOCH);
         assert_eq!(attr.last_seen.timestamp(), 3600);
