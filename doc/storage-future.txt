@@ -1,18 +1,250 @@
-Storage
-=======
+Storage, and running more than one of them
+==========================================
 
-Default storage is a simple tree which contains the path + value. The path is usually the type of value, such as a host, an IP address, a hash etc.
+Notes towards a clustered SightingDB. Nothing here is implemented. The point of
+writing it down is to separate the parts that follow from how SightingDB already
+works from the parts that are still a choice.
+
+The numbers quoted below come from doc/sharding-experiment.py, which is in the
+repository so they can be re-checked:
+
+    python3 doc/sharding-experiment.py
+
+
+Storage today
+-------------
+
+Default storage is a simple tree which contains the path + value. The path is
+usually the type of value, such as a host, an IP address, a hash etc.
+
+Two properties of it matter for everything that follows.
+
+**One file per top-level namespace.** persistence::shard_of() takes
+'feeds/misp/ips' to 'feeds', and that is the unit that is written out, paged in,
+evicted, and tiered hot/warm/cold. Namespaces beginning with '_' all share one
+internal shard: _all, every _shadow/*, and _config.
+
+**A sighting is a set of merge-safe operations.** This is the fact that makes
+clustering possible without a consensus protocol, and it is already true:
+
+    count       += 1                     a counter
+    first_seen  only ever moves back     a min register
+    last_seen   only ever moves forward  a max register
+    tags        union, de-duplicated     a grow-only set
+    ttl         assignment               a last-write-wins register
+    stats       += 1 per hour bucket     a map of counters
+
+Every one of those converges whatever order it is applied in. Two nodes can
+take writes for the same value independently and merge afterwards without
+agreeing on anything first. No Raft, no quorum on the write path.
+
+There are two exceptions, and they are the whole difficulty. See "Consensus
+counting" and "Counters must be per node" below.
+
 
 Read and Write on Multiple instances
-====================================
+------------------------------------
 
-We do a XOR on the available machines with the first four bytes of our value in order to avoid using a consensus to read and write our data. This
-allow a blazingly fast access to our values.
+Placement is a function of the value alone — not of the namespace, not of
+anything a client has to know — so that reading and writing need no consensus.
+
+**Hash the whole value, not a prefix.** The first four bytes do not work on this
+data. Every URL begins "http://", a large share of domains begin "www.", and
+addresses cluster in a handful of /8s. Measured over 20000 values shaped like a
+real feed:
+
+      8 nodes, ideal share 12.5% each
+        XOR of first 4 bytes       min  5.7%  max 29.1%   imbalance 2.33x
+        first 4 bytes as a word    min  2.6%  max 35.0%   imbalance 2.80x
+        hash of whole value        min 12.1%  max 12.8%   imbalance 1.02x
+
+The busiest node does nearly three times the work of the quietest, and it gets
+worse with every node added.
+
+**Pick the node by rendezvous hashing, not by modulo.** For each value compute
+hash(value + node_id) for every member and take the highest. It needs no ring,
+no virtual nodes, and no state beyond the member list, and it moves the minimum
+possible amount of data when the membership changes — see "Adding a new Node".
+
+**The hash must have real avalanche, and must be stable forever.**
+
+ * FNV-1a spreads values perfectly well (1.02x above) but is *not* good enough
+   as a rendezvous weight: appending ':n0' / ':n1' perturbs it in a structured
+   way, the comparison between nodes becomes correlated, and it moves 50% of
+   the keyspace where the minimum is 11%. Use SHA-256, which is already a
+   dependency — stix.rs already leans on SHA-1-based UUIDv5, so there is
+   precedent for a cryptographic hash near a hot path.
+
+ * Never use std's DefaultHasher. It is explicitly not stable across Rust
+   releases, and placement is persistent: a toolchain upgrade would silently
+   relocate the entire keyspace.
+
+**What value-placement buys, beyond balance.** Because placement depends only on
+the value, every (namespace, value) pair for one value lands on the same node.
+So consensus — how many namespaces have seen this value — becomes a local
+count on that node. That is worth stating plainly:
+
+ * _all stops existing as a structure. No cross-node counter, no decrement
+   invariant to preserve, and the '_' hotspot shard goes away.
+ * /_management/api/sightings becomes one local lookup instead of a walk over
+   namespaces that may page shards in.
+
+This is the strongest argument for placing by value rather than by namespace,
+and it was not obvious: it removes the hardest problem rather than distributing
+it.
+
+**What it costs.** Namespace-scoped operations stop being local, because a
+namespace's values are now spread across every node. All of these become
+scatter-gather:
+
+ * /r/<namespace> listing a whole namespace
+ * /r/<namespace>?count, including whether the count is exact
+ * /d/<namespace>
+ * /stix/<namespace>, and the recursive form especially
+ * /_management/api/values and /_management/api/tree
+
+And hot/warm/cold tiering loses its meaning as it stands, because a tier is a
+property of a top-level namespace while each node now holds an arbitrary
+fraction of one. Either tiering becomes per node, or it is decided globally and
+applied to each node's fraction.
+
+This is the real trade against placing by namespace. Placing by value wins on
+balance and on consensus locality; placing by namespace keeps every namespace
+operation local and leaves the storage and tiering model intact. Placing by
+value looks right, but the bill above is the bill.
+
+
+Counters must be per node
+-------------------------
+
+This is the one change to the data model that the rest depends on, and it is
+needed even without replication — see the migration window in "Adding a new
+Node".
+
+Replaying an increment double-counts, so 'count: u64' cannot be shipped between
+nodes safely. Make it a map from node id to count, and report the sum:
+
+    count: HashMap<NodeId, u64>      reported as the sum of its values
+
+Each node only ever writes its own entry, so replication is "send my entries",
+which is idempotent and order-independent. The same applies to each bucket in
+stats.
+
+This changes attribute.rs and the snapshot format. db::SnapshotData already
+carries 'version: u32', so there is a migration path — and this change can be
+made, shipped and tested on a single node long before any clustering exists.
+
 
 Adding a new Node
-=================
+-----------------
 
-This is a slow operation which requires to re-XOR our values in order to move the appropriate ones to the new node. We take only one thread for this
-so the DB is still fast, new writes go directly to the new node, while read is first fetch to the new node and then looked on the original node handling
-them if the data has not been moved.
+Adding a node is a slow operation which moves the values the new node now wins.
+With rendezvous hashing that is the minimum share and no more:
 
+       change         mod-n   HRW+FNV   HRW+SHA   minimum
+       3 -> 4         75.0%     25.4%     25.1%     25.0%
+       4 -> 5         79.9%     50.0%     19.8%     20.0%
+       8 -> 9         88.9%     49.9%     11.0%     11.1%
+       8 -> 16        49.9%     75.2%     49.8%     50.0%
+
+mod-n renumbers nearly everything. Doubling is its one lucky case — hash % 8 and
+hash % 16 agree whenever the fourth bit is clear — and growing by a single node,
+which is what actually happens, is its worst.
+
+Migration takes one thread so the database stays fast. New writes go directly to
+the new node, while a read tries the new node first and falls back to the node
+that used to own the value.
+
+**The migration window needs a merge rule.** While a value is still on the old
+node and new writes are going to the new one, there are two counters for one
+value. Copying over the top loses the new writes; copying twice double-counts.
+Per-node counters make this safe: the copy carries the old node's entries, the
+new node keeps its own, and the sum is right either way.
+
+**Handing over needs a barrier.** Once a value's ownership has moved, a write
+must not still land on the old node — from a client that has not noticed, or
+from a node with a stale member list. The old node either refuses and redirects,
+or accepts and forwards. Silently accepting it is how a count goes missing.
+
+
+One copy is not enough
+----------------------
+
+Placement by value puts each value on exactly one node. With no write-ahead log
+and snapshots held locally, that means:
+
+ * losing a node permanently loses 1/n of the data
+ * losing a node fails 1/n of requests outright
+ * a hot value has one home, so there is no read scaling for it
+
+For a cluster whose purpose is to serve many more clients transparently, a node
+failure is the least transparent thing that can happen. Replication factor of at
+least two is wanted. Rendezvous hashing gives it almost free: take the top R
+nodes by weight rather than the top one. The merge properties above are what
+make the replicas safe to reconcile without consensus.
+
+
+Still unsolved
+--------------
+
+**Reads are writes.** Every /r records a shadow sighting under
+_shadow/<namespace>. So there is no such thing as a read-only replica, and
+serving more clients roughly doubles write load rather than adding cheap reads.
+The proposal here is to make shadow sightings node-local and never replicated —
+"how often was this searched for" is arguably a per-node observability fact
+anyway. That is a semantic decision and should be made deliberately rather than
+fallen into. Under placement by value a shadow entry lands on the same node as
+the value it shadows, which is at least convenient.
+
+**ACL and tier distribution.** acl_file and tiers_file are rewritten by
+whichever node served the management request. Save a key on one node and the
+others never learn it. This is the consequence of keys living in configuration
+rather than in the database. It needs a shared store, a gossiped ACL, or a
+management interface that writes cluster-wide.
+
+**Durability.** Snapshots every snapshot_interval, 300s by default, and no WAL,
+so a crash loses up to five minutes. Replication can stand in for a log, but
+only if a write reaches a peer before it is acknowledged; otherwise every node
+independently keeps the same five-minute hole. For sighting counts, replicating
+asynchronously and accepting the window is defensible — but it should be a
+choice rather than an accident.
+
+**Membership.** Discovery, failure detection, and an agreed member list, since
+rendezvous hashing is only as good as the list every node computes against. Two
+nodes disagreeing about membership will disagree about placement. ZeroMQ is
+already a dependency and could carry inter-node traffic.
+
+**Anti-entropy.** Something has to find and repair divergence between replicas.
+The per-shard snapshot files are already a natural unit; a version vector per
+namespace, or Merkle trees over values once shards get large.
+
+
+Order of work
+-------------
+
+The first three are single-node refactors with no distributed systems in them,
+and they are where the difficulty actually lives. Getting them wrong cannot be
+repaired by any amount of replication machinery.
+
+ 1. Per-node counters, and the snapshot format version bump.
+ 2. Derive consensus instead of maintaining it — or, under placement by value,
+    delete _all and count locally.
+ 3. Decide that shadow sightings are node-local.
+ 4. A shared store for the ACL and the tiers.
+ 5. Membership, replication, anti-entropy.
+ 6. Split the internal shard, if it is still a hotspot by then.
+
+
+A note on whether to shard at all
+---------------------------------
+
+Sharding scales data volume and write throughput. Serving many more *clients* is
+a connection and throughput problem, and full replication behind a plain load
+balancer solves that with no placement logic, no rebalancing, and no
+scatter-gather — every node answers everything, and clients change nothing.
+
+The merge properties at the top of this document are what make that safe, and it
+is a great deal less work than the above.
+
+Shard when the data outgrows one node, not when the client count does. The
+measured snapshot limits are what say which ceiling is close.
