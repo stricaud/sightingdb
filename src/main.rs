@@ -17,6 +17,7 @@ mod setup;
 mod sighting_reader;
 mod sighting_writer;
 mod stix;
+mod tags;
 mod tier;
 mod tls;
 
@@ -309,6 +310,8 @@ fn run() -> Result<()> {
         info,
         acl_file: settings.acl_file.clone(),
         tiers_file: settings.tiers_file.clone(),
+        tags: std::sync::RwLock::new(settings.tags.clone()),
+        tags_file: settings.tags_file.clone(),
         stix: settings.stix.clone(),
         started: std::time::Instant::now(),
         rejections: rejections::Rejections::new(settings.rejection_log),

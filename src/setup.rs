@@ -634,6 +634,33 @@ impl Plan {
                 "# does not reach it and must be repeated. 0 switches it off.",
             );
             w(&mut out, "#gossip_interval = 600");
+            w(&mut out, "#");
+            w(
+                &mut out,
+                "# One place to manage keys. The offer above is additive and cannot",
+            );
+            w(
+                &mut out,
+                "# carry a revocation to a server that was offline for it. Set",
+            );
+            w(
+                &mut out,
+                "# acl_authority on the server that owns the galaxy's keys and",
+            );
+            w(
+                &mut out,
+                "# acl_replaceable on each that accepts them, and the owner's offer",
+            );
+            w(
+                &mut out,
+                "# becomes the whole list, held exactly — which does remove. Both",
+            );
+            w(
+                &mut out,
+                "# ends must agree, and setting both on one server is refused.",
+            );
+            w(&mut out, "#acl_authority = false");
+            w(&mut out, "#acl_replaceable = false");
             w(
                 &mut out,
                 "# Off for a galaxy of self-signed instances, which is what",

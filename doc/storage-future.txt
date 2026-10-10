@@ -508,8 +508,21 @@ authoritative instead — peers mirroring one server's ACL exactly — would nee
 server to be declared the owner of the galaxy's keys, and that is a decision for
 whoever runs it rather than one to assume.
 
-Tiers are not gossiped. tiers_file has the same shape of problem and the same
-answer available; it is simply not done.
+Tiers travel the same way and under the same rule. A tier has no "unset", only
+a different value, so unlike a key it has no deletion to miss: offering what
+this server holds leaves a peer with exactly that.
+
+**One place to manage keys, if a galaxy wants one.** The additive offer cannot
+carry a revocation to a server that was offline for it. `acl_authority` on the
+owner makes its offer the whole list, to be held exactly, which does remove —
+and `acl_replaceable` on each server that accepts one is what lets it. Both ends
+must agree, so arriving here takes two deliberate settings rather than one, and
+a server that has not opted in keeps its own keys with the offer falling back to
+additive. Setting both on one server is refused at startup: they would take
+turns overwriting each other.
+
+A replace must contain an admin key and the key making the request, or it locks
+out either the interface or the server doing the replacing.
 
 
 Still unsolved
@@ -554,9 +567,10 @@ Order of work
              against the nodes.
     DONE 11. Keys gossiped to the peers a server administers.
 
-         12. Tiers gossiped the same way.
-         13. Authoritative ACL, if a galaxy wants one server to own its keys —
-             which would make a revocation reach a server that was offline.
+    DONE 12. Tiers gossiped the same way.
+    DONE 13. Authoritative ACL, for a galaxy that wants one server to own its
+             keys — which is what makes a revocation reach one that was
+             offline.
 
 Steps 4 and 5 were refactors with no distributed systems in them, and they were
 where the difficulty lived. What remains is plumbing by comparison — with the

@@ -63,6 +63,12 @@ pub struct Settings {
     pub acl: Option<Acl>,
     /// File holding the keys, which the management interface rewrites.
     pub acl_file: Option<PathBuf>,
+    /// How tags are shown: a colour and a description each.
+    pub tags: crate::tags::Vocabulary,
+    /// File holding the tag vocabulary, which the management interface
+    /// rewrites. Without one, tags can still be read and set on values; only
+    /// their colours become read-only.
+    pub tags_file: Option<PathBuf>,
     /// Which shards stay in memory, and for how long.
     pub tiers: TierPolicy,
     /// File the management interface rewrites when a tier is changed. Without
@@ -267,6 +273,7 @@ struct RawDaemon {
     /// take the other's contribution for their own.
     node_id: Option<String>,
     acl_file: Option<PathBuf>,
+    tags_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -552,6 +559,9 @@ impl RawConfig {
         let acl_file = daemon.acl_file.map(|file| resolve(base, &file));
         let acl = load_acl(self.acl, acl_file.as_deref(), path)?;
 
+        let tags_file = daemon.tags_file.map(|file| resolve(base, &file));
+        let tags = load_tags(tags_file.as_deref());
+
         let dns = match self.dns {
             Some(dns) => dns.into_settings(path)?,
             None => None,
@@ -592,6 +602,8 @@ impl RawConfig {
             node_id,
             acl,
             acl_file,
+            tags,
+            tags_file,
             tiers,
             tiers_file,
             dns,
@@ -877,6 +889,44 @@ fn namespace_option(value: Option<String>, table: &str) -> Result<Option<String>
 
 /// Keys come from the separate file when there is one, since that is the file
 /// the management interface maintains.
+/// The tag vocabulary, from its file or seeded.
+///
+/// A missing file is normal rather than an error: it is written the first time
+/// a tag is edited, and until then MISP's own TLP colours plus a colour per
+/// family of SightingDB's vocabulary are a better starting point than nothing.
+/// A file that will not parse is reported and the seed used, because this
+/// decides colours and refusing to start over them would be a poor trade.
+fn load_tags(file: Option<&Path>) -> crate::tags::Vocabulary {
+    let Some(path) = file else {
+        return crate::tags::Vocabulary::seeded();
+    };
+    if !path.exists() {
+        log::info!(
+            "tags_file {} does not exist yet; it will be created when a tag is \
+             edited, and the standard colours are used until then",
+            path.display()
+        );
+        return crate::tags::Vocabulary::seeded();
+    }
+    match std::fs::read_to_string(path).map(|text| crate::tags::Vocabulary::from_toml(&text)) {
+        Ok(Ok(vocabulary)) => vocabulary,
+        Ok(Err(e)) => {
+            log::error!(
+                "parsing tags_file {}: {e}; using the standard colours",
+                path.display()
+            );
+            crate::tags::Vocabulary::seeded()
+        }
+        Err(e) => {
+            log::error!(
+                "reading tags_file {}: {e}; using the standard colours",
+                path.display()
+            );
+            crate::tags::Vocabulary::seeded()
+        }
+    }
+}
+
 fn load_acl(
     inline: Option<HashMap<String, String>>,
     acl_file: Option<&Path>,

@@ -36,6 +36,26 @@
   button:disabled { opacity: .45; cursor: default; }
   input, select { font: inherit; padding: .35rem .6rem; border: 1px solid var(--line);
           border-radius: 6px; background: var(--bg); color: var(--fg); }
+  /* A tag, in its own colour. The text colour is computed from the
+     background in `readableOn`, because a vocabulary colour is arbitrary and
+     white-on-#FFFFFF would make tlp:clear invisible. */
+  .chip { display: inline-block; padding: .05rem .4rem; border-radius: 999px;
+          border: 1px solid rgba(0,0,0,.25); font-size: .82rem; line-height: 1.5;
+          font-family: var(--mono); white-space: nowrap; }
+  .chips { display: inline-flex; flex-wrap: wrap; gap: .25rem; vertical-align: middle; }
+  .swatch { display: inline-block; width: 1rem; height: 1rem; border-radius: 4px;
+            border: 1px solid var(--line); vertical-align: -3px; }
+  /* The suggestion list floats over the page, so its container is the
+     positioning context rather than the input itself. */
+  .complete { position: relative; display: inline-block; }
+  .suggest { position: absolute; z-index: 20; left: 0; top: 100%; min-width: 14rem;
+             max-height: 14rem; overflow-y: auto; background: var(--bg);
+             border: 1px solid var(--line); border-radius: 6px; margin-top: 2px;
+             box-shadow: 0 4px 14px rgba(0,0,0,.18); padding: .15rem; }
+  .suggest div { padding: .2rem .4rem; border-radius: 4px; cursor: pointer;
+                 display: flex; gap: .4rem; align-items: center; }
+  .suggest div.on, .suggest div:hover { background: var(--panel); }
+  .suggest .hint { color: var(--muted); font-size: .8rem; margin-left: auto; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line);
            vertical-align: top; }
@@ -94,6 +114,7 @@
   <span class="spacer"></span>
   <span class="muted" id="version"></span>
   <button id="nav-browse">Browse</button>
+  <button id="nav-tags">Tags</button>
   <button id="nav-keys">Keys</button>
   <button id="nav-galaxy">Galaxy</button>
   <button id="nav-config">Configuration</button>
@@ -176,6 +197,56 @@
     <p class="muted" id="g-empty"></p>
   </section>
 
+  <!-- The tag vocabulary: what a tag means and what colour it is shown in -->
+  <section id="view-tags" class="hidden">
+    <div class="row">
+      <h3 style="margin:0">Tags</h3>
+      <span class="muted" id="t-count"></span>
+      <span class="spacer"></span>
+      <input id="t-filter" placeholder="Filter" size="18">
+      <button id="t-new">Define a tag</button>
+      <button id="t-refresh">Refresh</button>
+    </div>
+
+    <!-- Add or edit one tag. Hidden until there is something to edit. -->
+    <div id="t-form" class="hidden" style="margin:.6rem 0;padding:.6rem;border:1px solid var(--line);border-radius:8px">
+      <div class="row">
+        <label>Tag <input id="t-name" size="26" placeholder="tlp:amber or stix-type:"></label>
+        <label>Colour <input id="t-colour" type="color" value="#6b7280" style="padding:0;width:3rem;height:2rem"></label>
+        <input id="t-hex" size="9" placeholder="#rrggbb">
+        <span id="t-preview" class="chips"></span>
+      </div>
+      <div class="row" style="margin-top:.4rem">
+        <label style="flex:1">Description
+          <input id="t-desc" style="width:100%" placeholder="What this tag means, shown as a tooltip">
+        </label>
+      </div>
+      <div class="row" style="margin-top:.4rem">
+        <button id="t-save">Save</button>
+        <button id="t-cancel">Cancel</button>
+        <span class="muted" id="t-form-note"></span>
+      </div>
+    </div>
+
+    <div class="scroll"><table>
+      <thead><tr>
+        <th>Tag</th><th>Shown as</th><th>Colour</th><th>Used by</th><th>Description</th><th></th>
+      </tr></thead>
+      <tbody id="t-rows"></tbody>
+    </table></div>
+    <p class="muted" id="t-empty"></p>
+    <p class="muted" id="t-readonly"></p>
+    <p class="muted">A tag is free text on a value, so this table decides only how one
+       is <i>shown</i> — nothing here stops a feed writing a tag nobody has defined.
+       A name ending in <code>:</code> is a family and colours everything under it,
+       which is how an open set like <code>stix-type:ipv4-addr</code> can be coloured
+       at all. Tags found on values but not defined here are listed too, greyed, so
+       adopting one is a click rather than a discovery. <b>Used by</b> counts the
+       values loaded in memory; namespaces paged out to disk are not read back to
+       count them, which would make opening this page the most expensive thing the
+       server does.</p>
+  </section>
+
   <!-- API keys -->
   <section id="view-keys" class="hidden">
     <div class="row">
@@ -226,6 +297,7 @@
       </label>
       <button id="d-save-tags" style="align-self:flex-end">Save tags</button>
     </div>
+    <div class="row"><span id="d-chips" class="chips"></span></div>
     <p class="muted">Comma separated, and replacing rather than merging: this is
        where a wrong tag comes off. What each one means to the STIX export is in
        the README.</p>
@@ -397,9 +469,11 @@ const state = {
   chart: null, graph: null,
   // The value the detail view is showing, so its tags can be saved back.
   value: null,
+  // The tag vocabulary, fetched once: every value row asks it for a colour.
+  tags: null,
 };
 
-const VIEWS = ["view-namespaces", "view-values", "view-value", "view-keys",
+const VIEWS = ["view-namespaces", "view-values", "view-value", "view-keys", "view-tags",
                "view-config", "view-galaxy"];
 const $ = (id) => document.getElementById(id);
 const show = (...ids) => {
@@ -828,6 +902,7 @@ async function loadValue(value) {
 
     state.value = item.value;
     $("d-tags").value = item.tags || "";
+    $("d-chips").replaceChildren(tagChips(item.tags));
 
     const cards = [
       ["Count", item.count],
@@ -1038,6 +1113,408 @@ function stixTypeOf(item) {
   return null;
 }
 
+/* ---------------------------------------------------------------------------
+ * Tags: their colours, the table that edits them, and completing one as it is
+ * typed.
+ *
+ * The vocabulary is fetched once and cached on `state`, because every value
+ * row asks it for a colour and a request per row would be absurd. It is
+ * refetched after any edit, and after a tag is set on a value — a tag nobody
+ * had used before becomes a new row in the table.
+ * ------------------------------------------------------------------------- */
+
+/** The cached vocabulary, or null before it has been fetched. */
+function vocabulary() { return state.tags; }
+
+/** Fetch the vocabulary, tolerating a key that may not be allowed to. */
+async function loadVocabulary() {
+  try {
+    state.tags = await api("/_management/api/tags");
+  } catch (e) {
+    // Not fatal: tags still render, just in one neutral colour.
+    state.tags = null;
+  }
+  return state.tags;
+}
+
+/** A tag's colour: its own, else its family's, else the neutral one. */
+function tagColour(tag) {
+  const vocab = vocabulary();
+  if (!vocab) return "#6b7280";
+  const exact = vocab.tags.find((t) => t.name === tag && t.defined);
+  if (exact) return exact.colour;
+  // The longest matching family wins, mirroring the server so a chip here and
+  // a chip in an export agree.
+  let best = null;
+  for (const known of vocab.tags) {
+    if (!known.family || !tag.startsWith(known.name)) continue;
+    if (!best || known.name.length > best.name.length) best = known;
+  }
+  return best ? best.colour : (vocab.unknown_colour || "#6b7280");
+}
+
+/** What this tag means, if anything was written down. */
+function tagTitle(tag) {
+  const vocab = vocabulary();
+  if (!vocab) return tag;
+  const exact = vocab.tags.find((t) => t.name === tag && t.description);
+  if (exact) return `${tag} — ${exact.description}`;
+  for (const known of vocab.tags) {
+    if (known.family && tag.startsWith(known.name) && known.description) {
+      return `${tag} — ${known.description}`;
+    }
+  }
+  return tag;
+}
+
+/**
+ * Black or white, whichever can be read on this background.
+ *
+ * Needed because a vocabulary colour is whatever someone picked: MISP's own
+ * tlp:clear is #FFFFFF, and white text on it would be an invisible chip.
+ * The sRGB relative-luminance threshold from WCAG, which is what browsers'
+ * own contrast tooling uses.
+ */
+function readableOn(hex) {
+  const h = (hex || "").replace("#", "");
+  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
+  if (full.length !== 6) return "#000";
+  const channel = (pair) => {
+    const v = parseInt(pair, 16) / 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  const luminance = 0.2126 * channel(full.slice(0, 2))
+                  + 0.7152 * channel(full.slice(2, 4))
+                  + 0.0722 * channel(full.slice(4, 6));
+  return luminance > 0.36 ? "#111" : "#fff";
+}
+
+/** One chip for a tag. */
+function tagChip(tag) {
+  const chip = document.createElement("span");
+  chip.className = "chip";
+  chip.textContent = tag;
+  const colour = tagColour(tag);
+  chip.style.background = colour;
+  chip.style.color = readableOn(colour);
+  chip.title = tagTitle(tag);
+  return chip;
+}
+
+/** A value's tags as chips, or a muted "none". */
+function tagChips(tags) {
+  const wrap = document.createElement("span");
+  const parts = (tags || "").split(",").map((t) => t.trim()).filter(Boolean);
+  if (!parts.length) {
+    wrap.className = "muted";
+    wrap.textContent = "none";
+    return wrap;
+  }
+  wrap.className = "chips";
+  for (const tag of parts) wrap.append(tagChip(tag));
+  return wrap;
+}
+
+/**
+ * Complete a tag as it is typed.
+ *
+ * Tags are a comma-separated set in one field, so the thing being completed is
+ * the token after the last comma rather than the whole value — which is why
+ * this is a small dropdown and not a `<datalist>`, whose matching is against
+ * the entire field and so never fires past the first tag.
+ *
+ * Suggestions come from the vocabulary and from tags already in use, since the
+ * point is to type a tag the same way twice. A family is offered with its
+ * colon kept, so picking `stix-type:` leaves the cursor ready for the value.
+ */
+function attachTagComplete(input) {
+  // The input keeps its place in the layout; the dropdown is positioned
+  // against a wrapper so it can overflow the row.
+  const wrap = document.createElement("span");
+  wrap.className = "complete";
+  input.parentNode.insertBefore(wrap, input);
+  wrap.append(input);
+
+  let list = null;
+  let options = [];
+  let at = -1;
+
+  const close = () => {
+    if (list) { list.remove(); list = null; }
+    options = []; at = -1;
+  };
+
+  /** The token being typed: between the last comma and the caret. */
+  const token = () => {
+    const upto = input.value.slice(0, input.selectionStart ?? input.value.length);
+    const comma = upto.lastIndexOf(",");
+    return { text: upto.slice(comma + 1).trimStart(), start: comma + 1 };
+  };
+
+  const candidates = (prefix) => {
+    const vocab = vocabulary();
+    if (!vocab) return [];
+    const already = new Set(
+      input.value.split(",").map((t) => t.trim()).filter(Boolean));
+    const needle = prefix.toLowerCase();
+    return vocab.tags
+      .filter((t) => t.name.toLowerCase().includes(needle))
+      // A tag already in this field is no use as a suggestion, but a family
+      // always is: it is a prefix, not a tag.
+      .filter((t) => t.family || !already.has(t.name))
+      .sort((a, b) => {
+        // What starts with what was typed first, then by use, then by name.
+        const sa = a.name.toLowerCase().startsWith(needle) ? 0 : 1;
+        const sb = b.name.toLowerCase().startsWith(needle) ? 0 : 1;
+        if (sa !== sb) return sa - sb;
+        if ((b.used || 0) !== (a.used || 0)) return (b.used || 0) - (a.used || 0);
+        return a.name.localeCompare(b.name);
+      })
+      .slice(0, 8);
+  };
+
+  const highlight = () => {
+    if (!list) return;
+    [...list.children].forEach((row, i) => row.classList.toggle("on", i === at));
+  };
+
+  const accept = (option) => {
+    const { start } = token();
+    const after = input.value.slice(input.selectionStart ?? input.value.length);
+    // A family is a prefix, so the caret stays put for the value; a whole tag
+    // is followed by the separator, ready for the next one.
+    const insert = option.family ? option.name : option.name + ", ";
+    const before = input.value.slice(0, start);
+    const spaced = before && !before.endsWith(" ") ? before + " " : before;
+    input.value = spaced + insert + after;
+    const caret = (spaced + insert).length;
+    input.setSelectionRange(caret, caret);
+    close();
+    input.dispatchEvent(new Event("input"));
+  };
+
+  const open = () => {
+    const { text } = token();
+    options = candidates(text);
+    if (!options.length) { close(); return; }
+    if (!list) {
+      list = document.createElement("div");
+      list.className = "suggest";
+      wrap.append(list);
+    }
+    list.replaceChildren();
+    options.forEach((option, i) => {
+      const row = document.createElement("div");
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = option.colour;
+      const name = document.createElement("span");
+      name.textContent = option.name;
+      name.style.fontFamily = "var(--mono)";
+      row.append(swatch, name);
+      if (option.used) {
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = `${option.used} value${option.used === 1 ? "" : "s"}`;
+        row.append(hint);
+      } else if (!option.defined) {
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = "seen";
+        row.append(hint);
+      }
+      // mousedown, not click: the input blurs first on click and the list
+      // would be gone before the handler ran.
+      row.onmousedown = (e) => { e.preventDefault(); accept(option); };
+      list.append(row);
+    });
+    at = 0;
+    highlight();
+  };
+
+  input.addEventListener("input", open);
+  input.addEventListener("focus", open);
+  input.addEventListener("blur", () => setTimeout(close, 120));
+  input.addEventListener("keydown", (e) => {
+    if (!list) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault(); at = (at + 1) % options.length; highlight();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault(); at = (at - 1 + options.length) % options.length; highlight();
+    } else if (e.key === "Enter" || e.key === "Tab") {
+      // Only swallowed while a suggestion is highlighted, so Enter still
+      // submits the form when the list is closed.
+      if (at >= 0 && options[at]) { e.preventDefault(); e.stopPropagation(); accept(options[at]); }
+    } else if (e.key === "Escape") {
+      e.preventDefault(); e.stopPropagation(); close();
+    }
+  });
+}
+
+/* ----------------------------- the Tags view ----------------------------- */
+
+async function showTags() {
+  setError("");
+  show("view-tags");
+  $("t-form").classList.add("hidden");
+  await loadTags();
+}
+
+async function loadTags() {
+  try {
+    await loadVocabulary();
+    renderTags();
+  } catch (e) {
+    setError(e.message);
+  }
+}
+
+function renderTags() {
+  const vocab = vocabulary();
+  const rows = $("t-rows");
+  rows.replaceChildren();
+  if (!vocab) {
+    $("t-empty").textContent = "The tag vocabulary could not be read.";
+    return;
+  }
+
+  const filter = $("t-filter").value.trim().toLowerCase();
+  const shown = vocab.tags.filter((t) =>
+    !filter || t.name.toLowerCase().includes(filter)
+    || (t.description || "").toLowerCase().includes(filter));
+
+  for (const tag of shown) {
+    const tr = document.createElement("tr");
+
+    const name = document.createElement("td");
+    const code = document.createElement("code");
+    code.textContent = tag.name;
+    name.append(code);
+    if (tag.family) {
+      const note = document.createElement("span");
+      note.className = "muted";
+      note.textContent = " family";
+      name.append(note);
+    }
+    if (!tag.defined) {
+      const note = document.createElement("span");
+      note.className = "muted";
+      note.textContent = " not defined";
+      note.title = "Found on values but given no colour here.";
+      name.append(note);
+    }
+
+    // How it actually renders, which is the whole reason for the table.
+    const preview = document.createElement("td");
+    preview.append(tagChip(tag.family ? tag.name + "example" : tag.name));
+
+    const colour = document.createElement("td");
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = tag.colour;
+    const hex = document.createElement("code");
+    hex.textContent = tag.colour;
+    colour.append(swatch, " ", hex);
+
+    const used = document.createElement("td");
+    used.textContent = tag.used ? String(tag.used) : "—";
+    used.className = tag.used ? "" : "muted";
+
+    const description = document.createElement("td");
+    description.textContent = tag.description || "—";
+    if (!tag.description) description.className = "muted";
+
+    const actions = document.createElement("td");
+    actions.className = "actions";
+    if (vocab.editable) {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.textContent = tag.defined ? "Edit" : "Adopt";
+      edit.onclick = () => openTagForm(tag);
+      actions.append(edit);
+      if (tag.defined) {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "Remove";
+        remove.title = "Forget this tag's colour. Values keep the tag itself.";
+        remove.onclick = () => removeTag(tag.name);
+        actions.append(" ", remove);
+      }
+    }
+
+    tr.append(name, preview, colour, used, description, actions);
+    rows.append(tr);
+  }
+
+  const defined = vocab.tags.filter((t) => t.defined).length;
+  const seen = vocab.tags.length - defined;
+  $("t-count").textContent =
+    `${defined} defined${seen ? `, ${seen} seen on values but not defined` : ""}`;
+  $("t-empty").textContent = shown.length ? "" : "Nothing matches that filter.";
+  $("t-readonly").textContent = vocab.editable ? "" :
+    "Colours are read-only: no tags_file is configured. Set tags_file in [daemon] and restart.";
+  const counted = vocab.counted_namespaces, total = vocab.total_namespaces;
+  if (total && counted < total) {
+    $("t-empty").textContent += (shown.length ? "" : " ") +
+      `Counted over ${counted} of ${total} namespaces — the rest are paged out.`;
+  }
+}
+
+/** Open the form, either blank or on an existing tag. */
+function openTagForm(tag) {
+  $("t-form").classList.remove("hidden");
+  $("t-name").value = tag ? tag.name : "";
+  const colour = tag ? tag.colour : "#6b7280";
+  $("t-colour").value = /^#[0-9a-f]{6}$/i.test(colour) ? colour : "#6b7280";
+  $("t-hex").value = colour;
+  $("t-desc").value = tag ? tag.description || "" : "";
+  $("t-form-note").textContent = tag && !tag.defined
+    ? `Used by ${tag.used} value${tag.used === 1 ? "" : "s"} already.` : "";
+  previewTag();
+  $("t-name").focus();
+}
+
+function previewTag() {
+  const name = $("t-name").value.trim() || "example";
+  const colour = $("t-hex").value.trim();
+  const chip = document.createElement("span");
+  chip.className = "chip";
+  chip.textContent = name.endsWith(":") ? name + "value" : name;
+  chip.style.background = colour;
+  chip.style.color = readableOn(colour);
+  $("t-preview").replaceChildren(chip);
+}
+
+async function saveTagDefinition() {
+  $("t-save").disabled = true;
+  try {
+    state.tags = await api("/_management/api/tags/vocabulary", "POST", {
+      name: $("t-name").value,
+      colour: $("t-hex").value.trim(),
+      description: $("t-desc").value,
+    });
+    setError("");
+    $("t-form").classList.add("hidden");
+    renderTags();
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    $("t-save").disabled = false;
+  }
+}
+
+async function removeTag(name) {
+  if (!confirm(`Forget the colour for "${name}"? Values keep the tag itself.`)) return;
+  try {
+    state.tags = await api(
+      `/_management/api/tags/vocabulary?tag=${encodeURIComponent(name)}`, "DELETE");
+    setError("");
+    renderTags();
+  } catch (e) {
+    setError(e.message);
+  }
+}
+
 /** The first `key:value` tag with this key. */
 function tagValue(tags, key) {
   for (const tag of (tags || "").split(",")) {
@@ -1065,14 +1542,7 @@ function tagCell(item, onSaved) {
 
   const show = () => {
     td.replaceChildren();
-    const shown = document.createElement("span");
-    if (item.tags) {
-      shown.textContent = item.tags;
-      shown.className = "crumbs";
-    } else {
-      shown.textContent = "none";
-      shown.className = "muted";
-    }
+    const shown = tagChips(item.tags);
     const edit = document.createElement("button");
     edit.type = "button";
     edit.textContent = "Edit";
@@ -1110,6 +1580,11 @@ function tagCell(item, onSaved) {
         setError("");
         show();
         onSaved();
+        // A tag nobody had used before is now in use, so the vocabulary's
+        // counts and its "seen but not defined" rows are stale. Refreshed
+        // after the row is drawn rather than before: the chip is already
+        // right, and only its colour could change.
+        loadVocabulary().then(show);
       } catch (e) {
         setError(e.message);
         save.disabled = false;
@@ -1123,6 +1598,7 @@ function tagCell(item, onSaved) {
     };
 
     td.append(input, " ", save, " ", cancel);
+    attachTagComplete(input);
     input.focus();
     input.select();
   };
@@ -1142,6 +1618,9 @@ async function saveTags() {
       tags: $("d-tags").value,
     });
     setError("");
+    // The vocabulary's counts and its undefined-tag rows are stale once a
+    // tag has been set, so it is refetched before the redraw that uses it.
+    await loadVocabulary();
     // Redrawn so the observable type card agrees with the tags just saved.
     loadValue(item.value || state.value);
   } catch (e) {
@@ -1767,6 +2246,9 @@ async function start() {
     const info = await api("/_management/api/info");
     $("version").textContent = `v${info.version}`;
   } catch { /* the browser still works without the version */ }
+  // Fetched before the first listing so tags are drawn in their own colours
+  // straight away rather than turning coloured a moment later.
+  await loadVocabulary();
   state.namespace = namespaceFromPath();
   render();
 }
@@ -1794,6 +2276,25 @@ $("g-auto").onchange = (e) => {
   }, 5000);
 };
 $("nav-config").onclick = showConfig;
+$("nav-tags").onclick = showTags;
+$("t-refresh").onclick = loadTags;
+$("t-filter").addEventListener("input", renderTags);
+$("t-new").onclick = () => openTagForm(null);
+$("t-cancel").onclick = () => $("t-form").classList.add("hidden");
+$("t-save").onclick = saveTagDefinition;
+$("t-name").addEventListener("input", previewTag);
+// The picker and the hex field are two views of one colour: a hand-typed
+// #abc is valid here and the picker cannot represent it, so the text field
+// is the source of truth and the picker only writes into it.
+$("t-colour").addEventListener("input", (e) => {
+  $("t-hex").value = e.target.value;
+  previewTag();
+});
+$("t-hex").addEventListener("input", (e) => {
+  const value = e.target.value.trim();
+  if (/^#[0-9a-f]{6}$/i.test(value)) $("t-colour").value = value;
+  previewTag();
+});
 $("ns-up").onclick = () => go(parentOf(state.namespace));
 $("ns-new").onclick = openNamespaceEditor;
 $("ns-add").onclick = openValueEditor;
@@ -1803,6 +2304,8 @@ $("export-form").onsubmit = () => {
   exportStix($("export-form").elements["x-untyped"].value, $("x-recursive").checked);
 };
 $("d-save-tags").onclick = saveTags;
+attachTagComplete($("d-tags"));
+attachTagComplete($("av-tags"));
 $("nn-cancel").onclick = () => $("ns-editor").close();
 $("nn-name").addEventListener("input", previewNamespace);
 $("ns-form").addEventListener("submit", (e) => { e.preventDefault(); createNamespace(); });

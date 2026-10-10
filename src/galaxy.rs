@@ -481,6 +481,49 @@ impl Galaxy {
             .await
     }
 
+    /// Which live mirror should serve a read of `value`, by URL.
+    ///
+    /// The same choice [`forward_read`](Self::forward_read) makes, exposed so
+    /// a bulk read can group its items by mirror before sending anything. The
+    /// error says which of the two "not here" cases it is, so a batch can
+    /// report it per item instead of failing whole.
+    pub fn reader_url(&self, namespace: &str, value: &str) -> Result<String, ForwardError> {
+        if self.holders(namespace).is_empty() {
+            return Err(ForwardError::NoHolder);
+        }
+        self.reader_for(namespace, value)
+            .map(|peer| peer.url.clone())
+            .ok_or_else(|| ForwardError::AllDown {
+                namespace: namespace.to_string(),
+            })
+    }
+
+    /// Send a request to one mirror already chosen by URL.
+    ///
+    /// For a request the caller has worked out the destination for itself —
+    /// a bulk read grouped by mirror, where sending the whole batch to every
+    /// holder would both cost more and break the per-value stickiness that
+    /// [`reader_for`](Self::reader_for) exists to provide.
+    pub async fn forward_to(
+        &self,
+        url: &str,
+        method: awc::http::Method,
+        path: &str,
+        body: Option<&[u8]>,
+        hops_left: u8,
+        origin: &str,
+    ) -> Result<Forwarded, ForwardError> {
+        if hops_left == 0 {
+            return Err(ForwardError::TooManyHops);
+        }
+        let peer = self
+            .peers
+            .iter()
+            .find(|peer| peer.url == url)
+            .ok_or_else(|| ForwardError::Unreachable(format!("{url} is not a configured peer")))?;
+        self.send(peer, method, path, body, hops_left, origin).await
+    }
+
     /// Forward a write to every live mirror of the namespace.
     ///
     /// Returns what each said. The caller decides what a partial success

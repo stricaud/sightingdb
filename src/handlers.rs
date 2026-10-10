@@ -24,6 +24,12 @@ pub struct SharedState {
     pub acl_file: Option<std::path::PathBuf>,
     /// Where tiers are written back. `None` makes them read-only.
     pub tiers_file: Option<std::path::PathBuf>,
+    /// How tags are shown: a colour and a description each. Behind a lock so
+    /// an edit takes effect without a restart, like the ACL.
+    pub tags: std::sync::RwLock<crate::tags::Vocabulary>,
+    /// Where the tag vocabulary is written back. `None` makes colours
+    /// read-only; tags on values are unaffected either way.
+    pub tags_file: Option<std::path::PathBuf>,
     /// What the STIX export needs: who we publish as, and which observable
     /// type each namespace is configured to hold.
     pub stix: crate::config::StixSettings,
@@ -77,6 +83,8 @@ impl SharedState {
             info: crate::admin::ServerInfo::default(),
             acl_file: None,
             tiers_file: None,
+            tags: std::sync::RwLock::new(crate::tags::Vocabulary::seeded()),
+            tags_file: None,
             stix: crate::config::StixSettings::default(),
             started: std::time::Instant::now(),
             rejections: crate::rejections::Rejections::default(),
@@ -369,6 +377,13 @@ struct BulkReadResponse {
 enum BulkReadItem {
     Found(Box<AttributeView>),
     Error(serde_json::Value),
+    /// What a mirror answered for this item, passed through unchanged.
+    ///
+    /// Untagged like the rest, so a relayed answer is indistinguishable on
+    /// the wire from one this server read itself — which is the point: a
+    /// client talking to a router sees the same shape either way. Separate
+    /// from `Error` because a mirror's answer is usually a found value.
+    Relayed(serde_json::Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -1364,7 +1379,7 @@ pub async fn read_bulk(
     body: web::Json<BulkRequest>,
     req: HttpRequest,
 ) -> HttpResponse {
-    do_read_bulk(&state, &req, &body, false)
+    do_read_bulk(&state, &req, &body, false).await
 }
 
 pub async fn read_bulk_with_stats(
@@ -1372,35 +1387,181 @@ pub async fn read_bulk_with_stats(
     body: web::Json<BulkRequest>,
     req: HttpRequest,
 ) -> HttpResponse {
-    do_read_bulk(&state, &req, &body, true)
+    do_read_bulk(&state, &req, &body, true).await
 }
 
-fn do_read_bulk(
+/// Read one item from this server's own database.
+fn read_here(state: &SharedState, item: &BulkSighting, with_stats: bool) -> BulkReadItem {
+    match sighting_reader::read(
+        &state.db,
+        &item.namespace,
+        &item.value,
+        with_stats,
+        !item.noshadow,
+    ) {
+        Ok(view) => BulkReadItem::Found(Box::new(view)),
+        Err(e) => BulkReadItem::Error(e.body()),
+    }
+}
+
+/// Answer a bulk read, gathering from mirrors whatever this server does not hold.
+///
+/// Items are grouped by the mirror that should serve each one and sent as one
+/// sub-batch per mirror, rather than the whole batch to every holder the way
+/// `/wb` does. A write has to reach every mirror; a read has to reach exactly
+/// one, the one [`crate::galaxy::Galaxy::reader_for`] picks, or two consecutive
+/// reads of a value could be served by mirrors at different stages of catching
+/// up and show a count going down.
+///
+/// Each item keeps its request index through the round trip, so a mixed batch
+/// — some namespaces here, some on two different mirrors, some nowhere at all
+/// — still answers in request order.
+async fn do_read_bulk(
     state: &State,
     req: &HttpRequest,
     body: &BulkRequest,
     with_stats: bool,
 ) -> HttpResponse {
-    let mut items = Vec::with_capacity(body.items.len());
-
+    // The whole call is authorized up front. An item this key may not read
+    // fails the request rather than the item, which is how `/rb` has always
+    // behaved; deciding it before anything is read also keeps a refusal from
+    // depending on how far down the batch it sits.
     for item in &body.items {
         if let Err(resp) = authorize(state, req, &item.namespace, Access::Read) {
             return resp;
         }
-
-        let result = sighting_reader::read(
-            &state.db,
-            &item.namespace,
-            &item.value,
-            with_stats,
-            !item.noshadow,
-        );
-
-        items.push(match result {
-            Ok(view) => BulkReadItem::Found(Box::new(view)),
-            Err(e) => BulkReadItem::Error(e.body()),
-        });
     }
+
+    let mut answers: Vec<Option<BulkReadItem>> = (0..body.items.len()).map(|_| None).collect();
+
+    // Items to fetch, grouped by the mirror that will serve them. Each entry
+    // keeps the request indices so the answers can be put back in order.
+    let mut grouped: Vec<(String, Vec<usize>)> = Vec::new();
+
+    let hops = match state.galaxy.as_ref() {
+        Some(galaxy) => crate::galaxy::hops_left(req, galaxy.max_hops()),
+        None => None,
+    };
+
+    for (index, item) in body.items.iter().enumerate() {
+        let elsewhere = state.galaxy.as_ref().filter(|_| {
+            !state.db.holds(&item.namespace) && !crate::db::is_internal(&item.namespace)
+        });
+
+        let Some(galaxy) = elsewhere else {
+            answers[index] = Some(read_here(state, item, with_stats));
+            continue;
+        };
+
+        // Out of hops: this batch has been around a cascade already.
+        if hops.is_none() {
+            answers[index] = Some(BulkReadItem::Error(serde_json::json!(Message::new(
+                crate::galaxy::ForwardError::TooManyHops.to_string()
+            ))));
+            continue;
+        }
+
+        match galaxy.reader_url(&item.namespace, &item.value) {
+            Ok(url) => {
+                // The search is recorded here, where the client is, for the
+                // same reason a single read records it here — see
+                // `forwarded_read`. The forwarded copy asks for no shadow, so
+                // one search is not counted in two places.
+                if !item.noshadow {
+                    state.db.write(
+                        &format!("{}{}", crate::db::SHADOW_PREFIX, item.namespace),
+                        &item.value,
+                        chrono::Utc::now(),
+                        crate::db::WriteOpts::default(),
+                    );
+                }
+                match grouped.iter_mut().find(|(known, _)| *known == url) {
+                    Some((_, indices)) => indices.push(index),
+                    None => grouped.push((url, vec![index])),
+                }
+            }
+            // Nowhere in reach holds it. Reported per item, so the rest of
+            // the batch still answers.
+            Err(e) => {
+                answers[index] = Some(BulkReadItem::Error(serde_json::json!(Message::new(
+                    e.to_string()
+                ))));
+            }
+        }
+    }
+
+    if let Some(galaxy) = state.galaxy.as_ref()
+        && !grouped.is_empty()
+    {
+        let hops = hops.unwrap_or(0);
+        let path = if with_stats { "/rbs" } else { "/rb" };
+        let origin = origin_to_send(state, req);
+
+        for (url, indices) in &grouped {
+            let sub = BulkRequest {
+                items: indices
+                    .iter()
+                    .map(|&index| {
+                        let mut item = body.items[index].clone();
+                        // The entry point already recorded the search.
+                        item.noshadow = true;
+                        item
+                    })
+                    .collect(),
+            };
+            let payload = match serde_json::to_vec(&sub) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    return HttpResponse::InternalServerError()
+                        .json(Message::new(format!("could not forward the batch: {e}")));
+                }
+            };
+
+            let relayed = galaxy
+                .forward_to(
+                    url,
+                    awc::http::Method::POST,
+                    path,
+                    Some(&payload),
+                    hops,
+                    &origin,
+                )
+                .await;
+
+            // A mirror that fails answers for its own items only. Reported
+            // rather than swallowed: a batch quietly missing entries is the
+            // bug that made bulk reads look empty through a router.
+            let parsed = match &relayed {
+                Ok(answer) => serde_json::from_slice::<serde_json::Value>(&answer.body)
+                    .ok()
+                    .and_then(|body| body.get("items")?.as_array().cloned()),
+                Err(e) => {
+                    log::warn!("Bulk read from {url} failed: {e}");
+                    None
+                }
+            };
+
+            for (position, &index) in indices.iter().enumerate() {
+                answers[index] = Some(match parsed.as_ref().and_then(|got| got.get(position)) {
+                    Some(entry) => BulkReadItem::Relayed(entry.clone()),
+                    None => BulkReadItem::Error(serde_json::json!(Message::new(format!(
+                        "No answer from {url} for this item."
+                    )))),
+                });
+            }
+        }
+    }
+
+    // Every index was filled: either read here, answered by a mirror, or
+    // given a reason it could not be.
+    let items = answers
+        .into_iter()
+        .map(|answer| {
+            answer.unwrap_or_else(|| {
+                BulkReadItem::Error(serde_json::json!(Message::new("No answer for this item.")))
+            })
+        })
+        .collect();
 
     HttpResponse::Ok().json(BulkReadResponse { items })
 }
@@ -1699,14 +1860,27 @@ async fn merged_batch(
                 });
             }
             None => {
-                // Whatever the mirrors said, or nothing if none answered about
-                // it at all.
-                let message = peer_items
-                    .iter()
-                    .filter_map(|answer| answer.get(index))
-                    .find_map(|entry| entry.get("error").and_then(|e| e.as_str()))
-                    .unwrap_or("no server holding this namespace accepted it")
-                    .to_string();
+                // No mirror in reach stores the namespace at all, which is a
+                // fact about the galaxy and not about any one mirror. Said
+                // here rather than relaying a peer's own "this server does not
+                // store it", which is true of that peer but reads as a claim
+                // about the server the client is talking to.
+                let message = if state
+                    .galaxy
+                    .as_ref()
+                    .is_some_and(|galaxy| galaxy.holders(&item.namespace).is_empty())
+                {
+                    crate::galaxy::ForwardError::NoHolder.to_string()
+                } else {
+                    // Mirrors do hold it and still refused: their reason is
+                    // the useful one.
+                    peer_items
+                        .iter()
+                        .filter_map(|answer| answer.get(index))
+                        .find_map(|entry| entry.get("error").and_then(|e| e.as_str()))
+                        .unwrap_or("no server holding this namespace accepted it")
+                        .to_string()
+                };
                 errors.push(BulkWriteError {
                     namespace: item.namespace.clone(),
                     value: item.value.clone(),
@@ -2905,6 +3079,226 @@ mod tests {
             3,
             "the searches were not recorded at the entry point"
         );
+    }
+
+    /// A galaxy of one mirror that cannot be reached.
+    ///
+    /// Unreachable on purpose: these tests are about where a request is sent,
+    /// not about what comes back, and a port nothing listens on fails fast
+    /// and without a fixture.
+    fn unreachable_galaxy(stores: &[&str]) -> crate::galaxy::Galaxy {
+        crate::galaxy::Galaxy::new(&crate::config::GalaxySettings {
+            peers: vec![crate::config::Peer {
+                url: "http://127.0.0.1:1".to_string(),
+                key: "k".to_string(),
+                stores: if stores == ["/"] {
+                    crate::db::StoragePolicy::everything()
+                } else {
+                    crate::db::StoragePolicy::from_prefixes(stores)
+                },
+            }],
+            max_hops: 4,
+            health_interval: 30,
+            sync_interval: 300,
+            reconcile_interval: 3600,
+            gossip_interval: 600,
+            acl_authority: false,
+            acl_replaceable: false,
+            verify_tls: true,
+        })
+    }
+
+    /// A router: stores nothing of its own, one mirror that holds `stores`.
+    fn router_towards(stores: &[&str]) -> State {
+        let mut inner = SharedState::new(false);
+        inner.db = crate::db::Database::with_storage(
+            crate::db::DatabasePolicy::default(),
+            crate::db::StoragePolicy::from_prefixes(Vec::<&str>::new()),
+        );
+        inner.galaxy = Some(unreachable_galaxy(stores));
+        web::Data::new(inner)
+    }
+
+    /// A router holding nothing must still answer a bulk read, by asking the
+    /// mirrors that hold it.
+    ///
+    /// It did not: `/rb` had no forwarding path at all, so a router answered
+    /// every bulk read out of its own empty database and reported "Path not
+    /// found" for data that existed one hop away. That made the client's
+    /// `exists()` and `read_many()` return nothing through a load balancer
+    /// while working perfectly against a node.
+    ///
+    /// The peer here is deliberately unreachable, because what is under test
+    /// is that the router *tries the mirror* rather than what the mirror says.
+    #[actix_web::test]
+    async fn a_router_forwards_a_bulk_read_instead_of_answering_it_empty() {
+        let st = router_towards(&["/"]);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/rb")
+                .set_json(json!({"items": [{"namespace": "feeds/ips", "value": "1.2.3.4"}]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: Value = test::read_body_json(resp).await;
+        let answer = body["items"][0].to_string();
+        assert!(
+            !answer.contains("Path not found"),
+            "the router answered a bulk read from its own empty database: {answer}"
+        );
+        assert!(
+            answer.contains("No answer from"),
+            "expected the unreachable mirror to be reported, got {answer}"
+        );
+    }
+
+    /// A bulk read of a namespace nowhere in the galaxy says so, per item,
+    /// and the items beside it still answer.
+    #[actix_web::test]
+    async fn a_bulk_read_reports_a_namespace_no_mirror_holds() {
+        let st = router_towards(&["feeds/ips"]);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/rb")
+                .set_json(json!({"items": [
+                    {"namespace": "other/thing", "value": "nowhere"},
+                    {"namespace": "feeds/ips", "value": "1.2.3.4"},
+                ]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: Value = test::read_body_json(resp).await;
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2, "a batch answers every item it was given");
+        assert!(
+            items[0].to_string().contains("no server in this galaxy"),
+            "a namespace nobody holds should say so: {}",
+            items[0]
+        );
+        // The second went to the mirror, which is down -- but it was *tried*,
+        // which is what distinguishes it from the first.
+        assert!(
+            items[1].to_string().contains("No answer from"),
+            "the held namespace should have been forwarded: {}",
+            items[1]
+        );
+    }
+
+    /// A batch half this server's and half a mirror's answers in request
+    /// order.
+    ///
+    /// Items are grouped by mirror before being sent, so they come back in
+    /// the mirror's order rather than the client's. Putting them back by
+    /// index is what keeps a client able to match answers to what it asked.
+    #[actix_web::test]
+    async fn a_mixed_bulk_read_answers_in_request_order() {
+        let mut inner = SharedState::new(false);
+        // Stores `mine/*` itself; everything else is the mirror's.
+        inner.db = crate::db::Database::with_storage(
+            crate::db::DatabasePolicy::default(),
+            crate::db::StoragePolicy::from_prefixes(["mine"]),
+        );
+        inner.galaxy = Some(unreachable_galaxy(&["/"]));
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/mine/here?val=kept")
+                .to_request(),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/rb")
+                .set_json(json!({"items": [
+                    {"namespace": "theirs/far", "value": "a", "noshadow": true},
+                    {"namespace": "mine/here", "value": "kept", "noshadow": true},
+                    {"namespace": "theirs/far", "value": "b", "noshadow": true},
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        let body: Value = test::read_body_json(resp).await;
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items[1]["value"], "kept",
+            "the local item did not come back in its own position: {body}"
+        );
+        assert!(items[0].get("value").is_none() && items[2].get("value").is_none());
+    }
+
+    /// The search is counted where the client is, once, even though the read
+    /// happened on a mirror.
+    #[actix_web::test]
+    async fn a_forwarded_bulk_read_records_one_search_at_the_entry_point() {
+        let st = router_towards(&["/"]);
+        let app = app!(st);
+
+        for _ in 0..3 {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/rb")
+                    .set_json(json!({"items": [{"namespace": "feeds/ips", "value": "1.2.3.4"}]}))
+                    .to_request(),
+            )
+            .await;
+            // Asserted alongside the count, because a router answering out of
+            // its own database would record the shadow too and the count
+            // alone would pass for the wrong reason.
+            let body: Value = test::read_body_json(resp).await;
+            assert!(
+                body["items"][0].to_string().contains("No answer from"),
+                "this read was not forwarded, so the count below proves nothing: {body}"
+            );
+        }
+
+        assert_eq!(
+            st.db.count("_shadow/feeds/ips", "1.2.3.4"),
+            3,
+            "a bulk read did not record its search at the entry point"
+        );
+    }
+
+    /// `noshadow` is honoured for a forwarded bulk read too.
+    #[actix_web::test]
+    async fn a_bulk_read_asking_for_no_shadow_records_nothing() {
+        let st = router_towards(&["/"]);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/rb")
+                .set_json(json!({"items": [
+                    {"namespace": "feeds/ips", "value": "1.2.3.4", "noshadow": true}
+                ]}))
+                .to_request(),
+        )
+        .await;
+
+        let body: Value = test::read_body_json(resp).await;
+        assert!(
+            body["items"][0].to_string().contains("No answer from"),
+            "this read was not forwarded, so the count below proves nothing: {body}"
+        );
+        assert_eq!(st.db.count("_shadow/feeds/ips", "1.2.3.4"), 0);
     }
 
     /// `noshadow` from the client is still honoured: the entry point records

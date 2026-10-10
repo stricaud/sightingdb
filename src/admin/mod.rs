@@ -971,6 +971,253 @@ pub async fn set_tags(state: State, body: web::Json<TagChange>, req: HttpRequest
 }
 
 // ---------------------------------------------------------------------------
+// The tag vocabulary
+// ---------------------------------------------------------------------------
+
+/// One row of the tags table.
+#[derive(Debug, Serialize)]
+pub struct TagRow {
+    /// The tag, or a family if it ends in `:`.
+    pub name: String,
+    pub colour: String,
+    pub description: String,
+    /// Whether this is a family, colouring every tag under it.
+    pub family: bool,
+    /// How many loaded values carry it. For a family, how many carry a tag
+    /// under it. `None` for a tag that is defined but not in use.
+    pub used: Option<u64>,
+    /// Whether the vocabulary defines it, or it was only found on values.
+    pub defined: bool,
+}
+
+/// `GET /_management/api/tags` — the vocabulary, and what is actually in use.
+///
+/// Two things at once, deliberately: the tags someone has given a colour to,
+/// and the tags found on values. A feed brings whatever tags it brings, so the
+/// second set is not a subset of the first, and seeing an undefined tag in the
+/// same table is what makes it one click to adopt rather than something to
+/// discover by accident.
+#[derive(Debug, Serialize)]
+pub struct TagsView {
+    pub tags: Vec<TagRow>,
+    /// The colour an undefined tag is shown in.
+    pub unknown_colour: String,
+    /// Whether the vocabulary can be edited here. False without a
+    /// `tags_file`.
+    pub editable: bool,
+    /// Usage was counted over this many namespaces, of this many that exist.
+    /// Less than all of them means cold namespaces were not paged in to count
+    /// — see [`crate::db::Database::tag_usage`].
+    pub counted_namespaces: usize,
+    pub total_namespaces: usize,
+}
+
+pub async fn list_tags(state: State, req: HttpRequest) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    let (usage, counted, total) = state.db.tag_usage();
+
+    // A key that cannot read everything would otherwise learn which tags
+    // exist in namespaces it has no access to. Counted over what it may read
+    // only — which needs the per-namespace walk, so it is done the simple way
+    // here: a scoped key sees the vocabulary but no counts.
+    let everywhere = state
+        .acl
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .can_read(&caller, "/");
+    let usage = if everywhere {
+        usage
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    let vocabulary = state
+        .tags
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let mut rows: Vec<TagRow> = Vec::new();
+    for (name, tag) in vocabulary.entries() {
+        let family = name.ends_with(':');
+        // A family's count is everything under it, which is the only number
+        // that means anything for a name no value carries literally.
+        let used: u64 = if family {
+            usage
+                .iter()
+                .filter(|(found, _)| found.starts_with(name.as_str()))
+                .map(|(_, count)| *count)
+                .sum()
+        } else {
+            usage.get(name).copied().unwrap_or(0)
+        };
+        rows.push(TagRow {
+            name: name.clone(),
+            colour: tag.colour.clone(),
+            description: tag.description.clone(),
+            family,
+            used: (used > 0).then_some(used),
+            defined: true,
+        });
+    }
+
+    // Tags found on values that the vocabulary does not define.
+    for (name, count) in &usage {
+        if vocabulary.get(name).is_some() {
+            continue;
+        }
+        rows.push(TagRow {
+            name: name.clone(),
+            // What it is shown in today, so adopting it can start from that
+            // rather than from an empty field.
+            colour: vocabulary
+                .colour_of(name)
+                .unwrap_or(crate::tags::UNKNOWN_COLOUR)
+                .to_string(),
+            description: String::new(),
+            family: false,
+            used: Some(*count),
+            defined: false,
+        });
+    }
+
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+
+    HttpResponse::Ok().json(TagsView {
+        tags: rows,
+        unknown_colour: crate::tags::UNKNOWN_COLOUR.to_string(),
+        editable: state.tags_file.is_some(),
+        counted_namespaces: counted,
+        total_namespaces: total,
+    })
+}
+
+/// A tag's presentation, as the interface sends it.
+#[derive(Debug, Deserialize)]
+pub struct TagDefinition {
+    name: String,
+    colour: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// Where the vocabulary is written. Without one, colours are read-only: the
+/// main configuration is hand-maintained and this does not rewrite it.
+fn tags_file(state: &SharedState) -> Result<&PathBuf, HttpResponse> {
+    state.tags_file.as_ref().ok_or_else(|| {
+        HttpResponse::Conflict().json(Message::new(
+            "No tags_file is configured, so tag colours cannot be edited here. Set \
+             tags_file in [daemon] and restart.",
+        ))
+    })
+}
+
+/// Persist the vocabulary, then adopt it. Temp file and rename, like the ACL.
+fn save_tags(
+    state: &SharedState,
+    vocabulary: crate::tags::Vocabulary,
+) -> Result<(), HttpResponse> {
+    let path = tags_file(state)?;
+
+    let write = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, vocabulary.to_toml())?;
+        std::fs::rename(&temp, path)
+    };
+
+    if let Err(e) = write() {
+        log::error!("Could not write {}: {e}", path.display());
+        return Err(HttpResponse::InternalServerError().json(Message::new(format!(
+            "Could not write the tag vocabulary: {e}"
+        ))));
+    }
+
+    *state
+        .tags
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = vocabulary;
+    Ok(())
+}
+
+/// `POST /_management/api/tags/vocabulary` — define or redefine one tag.
+pub async fn define_tag(
+    state: State,
+    body: web::Json<TagDefinition>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = tags_file(&state) {
+        return resp;
+    }
+
+    let definition = body.into_inner();
+    let mut vocabulary = state
+        .tags
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+
+    if let Err(e) = vocabulary.set(&definition.name, &definition.colour, &definition.description) {
+        return HttpResponse::BadRequest().json(Message::new(e));
+    }
+    if let Err(resp) = save_tags(&state, vocabulary) {
+        return resp;
+    }
+
+    log::info!("Tag '{}' defined by '{caller}'", definition.name.trim());
+    list_tags(state, req).await
+}
+
+/// `DELETE /_management/api/tags/vocabulary?tag=...` — forget a tag's colour.
+///
+/// By query rather than path segment because a tag contains `:` and often `/`,
+/// which a path would have to encode and middleware would be free to
+/// normalise. **Values keep the tag itself**: this is a presentation setting,
+/// and deleting data from a colour picker would be a trap.
+pub async fn undefine_tag(
+    state: State,
+    query: web::Query<TagQuery>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = tags_file(&state) {
+        return resp;
+    }
+
+    let mut vocabulary = state
+        .tags
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if !vocabulary.remove(&query.tag) {
+        return HttpResponse::NotFound().json(Message::new("No such tag in the vocabulary."));
+    }
+    if let Err(resp) = save_tags(&state, vocabulary) {
+        return resp;
+    }
+
+    log::info!("Tag '{}' undefined by '{caller}'", query.tag);
+    list_tags(state, req).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TagQuery {
+    tag: String,
+}
+
+// ---------------------------------------------------------------------------
 // Key management
 // ---------------------------------------------------------------------------
 
@@ -1439,6 +1686,15 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/_management/api/values", web::get().to(values))
         .route("/_management/api/values", web::post().to(add_values))
         .route("/_management/api/tags", web::post().to(set_tags))
+        .route("/_management/api/tags", web::get().to(list_tags))
+        .route(
+            "/_management/api/tags/vocabulary",
+            web::post().to(define_tag),
+        )
+        .route(
+            "/_management/api/tags/vocabulary",
+            web::delete().to(undefine_tag),
+        )
         .route("/_management/api/value", web::get().to(value))
         .route("/_management/api/sightings", web::get().to(sightings))
         .route("/_management/api/keys", web::get().to(list_keys))

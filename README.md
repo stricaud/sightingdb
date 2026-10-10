@@ -1323,7 +1323,33 @@ one, a revocation that never landed moves from `revoked_but_present` into
 `only_on_peer` and stops being flagged. Checking the peer's own key list is then
 the way to find it.
 
-Tiers are not gossiped yet; `tiers_file` has the same shape of problem.
+Tier changes travel the same way and under the same rule. A tier has no
+"unset" — only a different value — so unlike a key it has no deletion to miss,
+and offering what this server holds leaves a peer with exactly that.
+
+### One place to manage keys
+
+The additive offer above cannot carry a revocation to a server that was
+offline. If you want one, a server can be declared the owner of the galaxy's
+keys:
+
+	# on the server that owns them
+	[galaxy]
+	acl_authority = true
+
+	# on each server that accepts them
+	[galaxy]
+	acl_replaceable = true
+
+The owner then offers its **whole** list, to be held exactly, which does remove.
+Both ends must agree: a server with `acl_replaceable` off keeps its own keys and
+the offer falls back to being additive, so nothing is lost by not opting in.
+Setting both on one server is refused at startup — they would take turns
+overwriting each other.
+
+Two guards on a replace, the same shape as on a single-key change: the set must
+contain an admin key, and it must contain the key making the request, or the
+server doing the replacing locks itself out of the one it just took over.
 
 ### Seeing the galaxy
 

@@ -300,6 +300,18 @@ tiers_file = "tiers.toml"
 # Note that the offer is additive — a revocation made while a peer was down
 # does not reach it, and must be repeated.
 #gossip_interval = 600
+#
+# One place to manage keys. The offer above is additive and so cannot carry a
+# revocation to a server that was offline for it. Set acl_authority on the
+# server that owns the galaxy's keys and acl_replaceable on each server that
+# accepts them, and the owner's offer becomes the whole list, to be held
+# exactly — which does remove.
+#
+# Both ends must agree, so a server with acl_replaceable off keeps its own
+# keys and nothing is lost by not opting in. Setting both on one server is
+# refused at startup: they would take turns overwriting each other.
+#acl_authority = false
+#acl_replaceable = false
 #verify_tls = true
 #peers = [
 #  { url = "https://node-a.example:9999", key = "..." },

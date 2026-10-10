@@ -1179,6 +1179,57 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "409":
           description: That would leave no admin key, or no acl_file is configured
+    put:
+      tags: [management]
+      summary: Hold exactly these keys and no others
+      description: |
+        What gives a galaxy one place to manage keys, and the only thing that
+        carries a revocation to a server that was offline for it — the periodic
+        offer of individual keys is additive and cannot delete.
+
+        **Refused unless the receiving server has `acl_replaceable` set in
+        `[galaxy]`.** Off by default: a server quietly having its key list
+        rewritten is not a state to arrive at by accident. With it off the
+        offer falls back to being additive and nothing is lost.
+
+        Two guards, the same shape as on a single-key change: the set must
+        contain an admin key, and it must contain the key making the request —
+        otherwise the server doing the replacing locks itself out of the one it
+        just took over.
+
+        Keys removed are noted as revoked, so the sending server's own drift
+        view can point out any peer that still holds them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                keys:
+                  type: array
+                  items: { $ref: "#/components/schemas/KeyEntry" }
+      responses:
+        "200":
+          description: The list now held, and what was revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  held: { type: integer }
+                  revoked:
+                    type: array
+                    items: { type: string }
+        "403":
+          description: |
+            This server does not let another replace its keys, or the caller is
+            not an admin.
+        "409":
+          description: |
+            The set has no admin key, or does not include the key making the
+            request.
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
   /_management/api/keys/drift:
     get:

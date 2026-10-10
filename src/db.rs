@@ -1179,6 +1179,63 @@ impl Database {
             .sum()
     }
 
+    /// Which tags are in use, and on how many values.
+    ///
+    /// **Only what is in memory is counted**, and the second return value says
+    /// how many namespaces that was out of how many exist. Reading every tag
+    /// otherwise means paging every cold shard back in, which would turn
+    /// opening a page in the management interface into the most expensive thing
+    /// the server does — and on a large install would evict the working set to
+    /// do it. An approximate count of what is loaded, labelled as such, is
+    /// worth more than an exact one nobody can afford.
+    ///
+    /// Internal namespaces are left out: `_shadow` values carry no tags and
+    /// `_all` is a tally.
+    pub fn tag_usage(&self) -> (std::collections::BTreeMap<String, u64>, usize, usize) {
+        // Counted the same way as the tally below — ordinary namespaces only —
+        // so that "2 of 3" means two were read and one is paged out, rather
+        // than counting `_shadow` in the total and never in the tally.
+        let total = {
+            let shards = self.shards.read().unwrap_or_else(PoisonError::into_inner);
+            shards
+                .values()
+                .flat_map(|meta| meta.namespaces.iter())
+                .filter(|name| !is_internal(name))
+                .count()
+        };
+        let resident: Vec<(String, Arc<Namespace>)> = {
+            let namespaces = self
+                .namespaces
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            namespaces
+                .iter()
+                .filter(|(name, _)| !is_internal(name))
+                .map(|(name, namespace)| (name.clone(), Arc::clone(namespace)))
+                .collect()
+        };
+
+        let now = Utc::now();
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let looked_at = resident.len();
+        for (_, namespace) in resident {
+            let values = namespace
+                .values
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            for cell in values.values() {
+                let attr = cell.lock().unwrap_or_else(PoisonError::into_inner);
+                if attr.is_expired(now) {
+                    continue;
+                }
+                for tag in crate::tags::split(&attr.tags) {
+                    *counts.entry(tag.to_string()).or_default() += 1;
+                }
+            }
+        }
+        (counts, looked_at, total)
+    }
+
     /// Namespace names matching `filter`, sorted, one page at a time.
     ///
     /// `_config` (server state) and `_all` (the consensus tally) are left out:
