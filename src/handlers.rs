@@ -1476,6 +1476,11 @@ async fn gathered_export(
     }
 
     let mut parts: Vec<crate::stix::Export> = Vec::new();
+    // Namespaces a mirror holds but could not be asked about. Kept apart from
+    // the ones nowhere in the galaxy: one means there is no such namespace,
+    // the other means we could not find out, and a client can retry only one
+    // of those.
+    let mut unreachable: Vec<String> = Vec::new();
 
     // Whatever this server does hold, exported here.
     let mine: Vec<&str> = wanted
@@ -1544,6 +1549,7 @@ async fn gathered_export(
                 Some(part) => parts.push(part),
                 None => {
                     log::warn!("{url} answered an unreadable STIX bundle");
+                    unreachable.extend(names.iter().cloned());
                     parts.push(unreachable_part(names));
                 }
             },
@@ -1551,15 +1557,26 @@ async fn gathered_export(
             // for the namespaces that did: its share is reported as missing,
             // which the response already has a field for.
             Ok(answer) => {
-                log::warn!(
-                    "{url} refused to export {}: {}",
-                    names.join(", "),
-                    answer.status
-                );
+                // 404 from the mirror means it does not have it, which is an
+                // answer rather than a failure — the namespace simply is not
+                // there. Anything else is the mirror being unable to tell us,
+                // and the two must not be reported the same way: a mirror
+                // declared as a full mirror answers 404 for a namespace
+                // nobody ever created, and calling that unreachable would
+                // claim the namespace exists.
+                if answer.status != 404 {
+                    log::warn!(
+                        "{url} refused to export {}: {}",
+                        names.join(", "),
+                        answer.status
+                    );
+                    unreachable.extend(names.iter().cloned());
+                }
                 parts.push(unreachable_part(names));
             }
             Err(e) => {
                 log::warn!("Could not ask {url} to export {}: {e}", names.join(", "));
+                unreachable.extend(names.iter().cloned());
                 parts.push(unreachable_part(names));
             }
         }
@@ -1568,14 +1585,24 @@ async fn gathered_export(
     let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
     let merged = crate::stix::merge_exports(&names, parts);
 
-    // Nothing anywhere had anything, which is a mistake worth reporting rather
-    // than an empty bundle to be puzzled over. Matches what a single server
-    // does with a namespace that does not exist.
+    // Nothing came back at all. Which failure it was decides the answer:
+    // conflating them would be the difference between "there is no such
+    // namespace" and "the server that has it is down".
     if merged.exported == 0 && merged.missing.len() == wanted.len() {
+        if !unreachable.is_empty() {
+            return Some(HttpResponse::BadGateway().json(Message::new(format!(
+                "No mirror holding {} could be asked to export it. It exists in this \
+                 galaxy; this server could not reach what holds it.",
+                unreachable.join(", ")
+            ))));
+        }
         return Some(error_response(&ApiError::NotFound(NotFound::namespace(
             &wanted[0], "",
         ))));
     }
+
+    // Part of it came back. The export reports the rest in `missing`, which
+    // `X-SightingDB-Missing` carries, so a partial answer says it is partial.
     Some(stix_response(merged))
 }
 
@@ -3597,19 +3624,26 @@ mod tests {
 
         let resp = test::call_service(
             &app,
-            test::TestRequest::get()
-                .uri("/stix/feeds/ips")
-                .to_request(),
+            test::TestRequest::get().uri("/stix/feeds/ips").to_request(),
         )
         .await;
 
-        // Nowhere to get it from, so still a miss -- but reported as the
-        // namespace being missing from the galaxy, after trying, rather than
-        // as this server's own 404 before trying.
-        let body: Value = test::read_body_json(resp).await;
+        // 502, not 404: a mirror holds this and could not be reached, which is
+        // not the same as the namespace not existing. A router answering from
+        // its own empty database would say 404, so this is also what proves it
+        // asked at all.
         assert_eq!(
-            body["error"], "Path not found",
-            "an unreachable mirror should still read as a miss: {body}"
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "the router did not try the mirror"
+        );
+        let body: Value = test::read_body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("could not reach"),
+            "{body}"
         );
     }
 
@@ -3624,6 +3658,24 @@ mod tests {
             test::TestRequest::post()
                 .uri("/_api/stix")
                 .set_json(json!({"namespaces": ["feeds/ips"]}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// A namespace nowhere in the galaxy is still a 404. The mirror here holds
+    /// only `feeds`, so `other/thing` is genuinely absent rather than
+    /// unreachable, and the two must not read the same.
+    #[actix_web::test]
+    async fn a_namespace_no_mirror_holds_is_still_not_found() {
+        let st = router_towards(&["feeds"]);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/other/thing")
                 .to_request(),
         )
         .await;
@@ -3654,7 +3706,10 @@ mod tests {
             "application/stix+json;version=2.1"
         );
         assert_eq!(resp.headers().get("x-sightingdb-exported").unwrap(), "7");
-        assert_eq!(resp.headers().get("x-sightingdb-truncated").unwrap(), "true");
+        assert_eq!(
+            resp.headers().get("x-sightingdb-truncated").unwrap(),
+            "true"
+        );
         // Still marked as having come from somewhere else.
         assert_eq!(resp.headers().get("X-SightingDB-Forwarded").unwrap(), "1");
     }
@@ -3668,7 +3723,10 @@ mod tests {
             body: b"{}".to_vec(),
             headers: Vec::new(),
         });
-        assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
     }
 
     /// `noshadow` from the client is still honoured: the entry point records
