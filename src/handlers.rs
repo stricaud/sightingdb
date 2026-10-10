@@ -1293,10 +1293,26 @@ fn suppressing_shadow(req: &HttpRequest) -> String {
 fn relayed(answer: crate::galaxy::Forwarded) -> HttpResponse {
     let status = actix_web::http::StatusCode::from_u16(answer.status)
         .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
-    HttpResponse::build(status)
-        .insert_header(("X-SightingDB-Forwarded", "1"))
-        .content_type("application/json")
-        .body(answer.body)
+    let mut response = HttpResponse::build(status);
+    response.insert_header(("X-SightingDB-Forwarded", "1"));
+
+    // The mirror's own content type and `X-SightingDB-*` headers. A STIX
+    // export is `application/stix+json` and says in headers how much it left
+    // out, so replacing them with `application/json` and nothing else would
+    // lose the part of the answer that is not in the body.
+    let mut typed = false;
+    for (name, value) in &answer.headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            typed = true;
+            response.content_type(value.as_str());
+        } else {
+            response.insert_header((name.as_str(), value.as_str()));
+        }
+    }
+    if !typed {
+        response.content_type("application/json");
+    }
+    response.body(answer.body)
 }
 
 /// What to answer when a request could not be forwarded.

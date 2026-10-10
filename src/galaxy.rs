@@ -475,6 +475,15 @@ pub async fn run(state: Arc<crate::handlers::SharedState>, shutdown: Arc<Shutdow
 pub struct Forwarded {
     pub status: u16,
     pub body: Vec<u8>,
+    /// Headers worth passing back to our client: the content type, and
+    /// anything this API says about the answer in a header rather than in the
+    /// body.
+    ///
+    /// A STIX export puts how much it exported and what it skipped in
+    /// `X-SightingDB-*`, so relaying only the status and the body would hand
+    /// the client a bundle and silently drop the part that says whether
+    /// anything was left out of it.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Galaxy {
@@ -518,6 +527,18 @@ impl Galaxy {
         .map_err(|e| ForwardError::Unreachable(e.to_string()))?;
 
         let status = response.status().as_u16();
+        // Taken before the body, which consumes the response.
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| {
+                let name = name.as_str().to_ascii_lowercase();
+                name == "content-type" || name.starts_with("x-sightingdb-")
+            })
+            .filter_map(|(name, value)| {
+                Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+            })
+            .collect();
         let body = response
             .body()
             .limit(FORWARD_BODY_LIMIT)
@@ -525,7 +546,11 @@ impl Galaxy {
             .map_err(|e| ForwardError::Unreachable(e.to_string()))?
             .to_vec();
 
-        Ok(Forwarded { status, body })
+        Ok(Forwarded {
+            status,
+            body,
+            headers,
+        })
     }
 
     /// Forward a read to the one mirror that should serve it.
