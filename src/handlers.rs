@@ -4873,6 +4873,49 @@ mod tests {
     /// a line in the document fails this rather than being found by whoever
     /// imports it into Postman.
     #[actix_web::test]
+    async fn doc_routes_md_mentions_every_route() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let doc = std::fs::read_to_string(root.join("doc/routes.md")).expect("doc/routes.md");
+
+        // The routes are read out of the source rather than listed here, so
+        // this cannot be satisfied by updating the test. Adding a route and
+        // forgetting the document is how four of them went undocumented.
+        let mut missing = Vec::new();
+        for file in ["src/handlers.rs", "src/admin/mod.rs"] {
+            let source = std::fs::read_to_string(root.join(file)).expect(file);
+            for found in source.split(".route(").skip(1) {
+                // `.route("<path>", web::<method>()`, possibly wrapped across
+                // lines by rustfmt.
+                let Some(open) = found.find('"') else {
+                    continue;
+                };
+                let rest = &found[open + 1..];
+                let Some(close) = rest.find('"') else {
+                    continue;
+                };
+                let path = &rest[..close];
+                if !path.starts_with('/') {
+                    continue;
+                }
+                // The literal part, before any `{placeholder}`.
+                let stem = path.split('{').next().unwrap_or(path).trim_end_matches('/');
+                if stem.is_empty() || doc.contains(stem) {
+                    continue;
+                }
+                missing.push(format!("{path} (in {file})"));
+            }
+        }
+        missing.sort();
+        missing.dedup();
+
+        assert!(
+            missing.is_empty(),
+            "these routes are not mentioned in doc/routes.md:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    #[actix_web::test]
     async fn the_openapi_document_describes_every_route() {
         let st = state(false);
         let app = app!(st);

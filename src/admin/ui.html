@@ -43,6 +43,11 @@
           border: 1px solid rgba(0,0,0,.25); font-size: .82rem; line-height: 1.5;
           font-family: var(--mono); white-space: nowrap; }
   .chips { display: inline-flex; flex-wrap: wrap; gap: .25rem; vertical-align: middle; }
+  /* A tag is free text and can be long: MISP turns an attribute's comment
+     into `description:<text>`, and those run to paragraphs. The cell holds
+     its width and the full text is in the tooltip. */
+  td .tagname { display: inline-block; max-width: 28rem; overflow: hidden;
+                text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
   .swatch { display: inline-block; width: 1rem; height: 1rem; border-radius: 4px;
             border: 1px solid var(--line); vertical-align: -3px; }
   /* The suggestion list floats over the page, so its container is the
@@ -312,8 +317,11 @@
        same way rather than left uncoloured.
        A name ending in <code>:</code> is a family and colours everything under it,
        which is how an open set like <code>stix-type:ipv4-addr</code> can be coloured
-       at all. Tags found on values but not defined here are listed too, greyed, so
-       adopting one is a click rather than a discovery. <b>Used by</b> counts the
+       at all. Tags found on values but not accounted for are listed too, greyed, so
+       adopting one is a click rather than a discovery — grouped by their key, since
+       a feed can produce thousands of distinct <code>description:</code> or
+       <code>misp-galaxy:</code> values and what you want to colour is the family, not
+       one of them. A bare label with no <code>:</code> keeps its own row. <b>Used by</b> counts the
        values loaded in memory; namespaces paged out to disk are not read back to
        count them, which would make opening this page the most expensive thing the
        server does.</p>
@@ -1470,11 +1478,21 @@ function renderTags() {
     const name = document.createElement("td");
     const code = document.createElement("code");
     code.textContent = tag.name;
+    code.className = "tagname";
+    code.title = tag.name;
     name.append(code);
     if (tag.family) {
       const note = document.createElement("span");
       note.className = "muted";
-      note.textContent = " family";
+      // A family inferred from tags found on values says how many it stands
+      // for: "7 seen" is the reason to give it a colour.
+      note.textContent = tag.variants
+        ? ` family, ${tag.variants} seen`
+        : " family";
+      note.title = tag.variants
+        ? `${tag.variants} different tags under this key were found on values. `
+          + "Defining the family colours all of them."
+        : "Colours every tag beneath it.";
       name.append(note);
     }
     if (!tag.defined) {

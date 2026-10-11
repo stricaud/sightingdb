@@ -1658,6 +1658,11 @@ pub struct TagRow {
     pub used: Option<u64>,
     /// Whether the vocabulary defines it, or it was only found on values.
     pub defined: bool,
+    /// How many distinct tags this row stands for, when it stands for more
+    /// than itself: a family inferred from undefined `key:value` tags found on
+    /// values. `None` for a row that is one tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variants: Option<usize>,
 }
 
 /// `GET /_management/api/tags` — the vocabulary, and what is actually in use.
@@ -1740,27 +1745,77 @@ pub async fn list_tags(state: State, req: HttpRequest) -> HttpResponse {
             family,
             used: (used > 0).then_some(used),
             defined: true,
+            variants: None,
         });
     }
 
-    // Tags found on values that the vocabulary does not define.
+    // Tags found on values that the vocabulary does not account for.
+    //
+    // Not blindly one row per distinct tag. A real feed makes that useless:
+    // MISP turns an attribute's comment into `description:<text>`, and CIRCL's
+    // comments are paragraphs of analysis, so one imported event produced
+    // seven rows of prose here — plus a row per `misp-galaxy:` value on top.
+    // Nobody wants to colour one particular description; they want to colour
+    // `description:`.
+    //
+    // But collapsing every `key:value` tag into its family is wrong the other
+    // way: undefining `tlp:green` would offer only `tlp:`, and giving every
+    // TLP label one colour defeats the point of marking at all. So the two
+    // cases are told apart by how many distinct values a key has: a handful
+    // is a vocabulary, where each is worth adopting on its own; more than
+    // that and the key is being used as a free-text field, where the family
+    // is the only thing worth colouring.
+    const FREE_TEXT_ABOVE: usize = 3;
+
+    let mut by_key: std::collections::BTreeMap<Option<String>, Vec<(&String, u64)>> =
+        std::collections::BTreeMap::new();
+
     for (name, count) in &usage {
+        // Already in the table above.
         if vocabulary.get(name).is_some() {
             continue;
         }
-        rows.push(TagRow {
-            name: name.clone(),
-            // What it is shown in today, so adopting it can start from that
-            // rather than from an empty field.
-            colour: vocabulary
-                .colour_of(name)
-                .unwrap_or(crate::tags::UNKNOWN_COLOUR)
-                .to_string(),
-            description: String::new(),
-            family: false,
-            used: Some(*count),
-            defined: false,
-        });
+        // Already coloured by a family that *is* defined, and already counted
+        // in that family's row, so saying it again adds nothing.
+        if vocabulary.colour_of(name).is_some() {
+            continue;
+        }
+        // A bare label has nothing to group it by, and is the kind somebody
+        // would adopt exactly as it is.
+        let key = match name.split_once(':') {
+            Some((key, _)) if !key.is_empty() => Some(format!("{key}:")),
+            _ => None,
+        };
+        by_key.entry(key).or_default().push((name, *count));
+    }
+
+    for (key, found) in by_key {
+        match key {
+            Some(family) if found.len() > FREE_TEXT_ABOVE => {
+                rows.push(TagRow {
+                    name: family,
+                    colour: crate::tags::UNKNOWN_COLOUR.to_string(),
+                    description: String::new(),
+                    family: true,
+                    used: Some(found.iter().map(|(_, count)| count).sum()),
+                    defined: false,
+                    variants: Some(found.len()),
+                });
+            }
+            _ => {
+                for (name, count) in found {
+                    rows.push(TagRow {
+                        name: name.clone(),
+                        colour: crate::tags::UNKNOWN_COLOUR.to_string(),
+                        description: String::new(),
+                        family: false,
+                        used: Some(count),
+                        defined: false,
+                        variants: None,
+                    });
+                }
+            }
+        }
     }
 
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3382,6 +3437,123 @@ mod tests {
         // Defined and unused: still listed, with no count.
         assert_eq!(row(&body, "tlp:amber")["used"], Json::Null);
         assert_eq!(body["editable"], true);
+    }
+
+    /// A key used as a free-text field is reported as its family, not one row
+    /// per value.
+    ///
+    /// This is what a real feed does: MISP turns an attribute's comment into
+    /// `description:<text>`, and one imported CIRCL event produced seven rows
+    /// of paragraph-long prose in this table. Nobody wants to colour one
+    /// particular description.
+    #[actix_web::test]
+    async fn many_values_under_one_key_collapse_into_a_family() {
+        let dir = TempDir::new("tags-collapse");
+        let st = tagged_state(&dir.0);
+        for n in 1..=6 {
+            st.db.write_tagged(
+                "feeds/ips",
+                &format!("10.0.0.{n}"),
+                chrono::Utc::now(),
+                crate::db::WriteOpts::default(),
+                &format!("description:a paragraph about number {n}"),
+            );
+        }
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        let names: Vec<&str> = body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with("description:a paragraph")),
+            "the individual descriptions are still listed: {names:?}"
+        );
+        let family = row(&body, "description:");
+        assert_eq!(family["family"], true);
+        assert_eq!(family["defined"], false);
+        assert_eq!(
+            family["variants"], 6,
+            "it should say how many it stands for"
+        );
+        assert_eq!(family["used"], 6, "and sum what they are used by");
+    }
+
+    /// A key with only a few distinct values is a vocabulary, not a free-text
+    /// field: each stays adoptable on its own.
+    ///
+    /// Collapsing these would be worse than the noise it avoids — undefining
+    /// `tlp:green` would leave only `tlp:` on offer, and giving every TLP
+    /// label one colour defeats the point of a marking.
+    #[actix_web::test]
+    async fn a_few_values_under_one_key_stay_separate() {
+        let dir = TempDir::new("tags-few");
+        let st = tagged_state(&dir.0);
+        st.db.write_tagged(
+            "feeds/ips",
+            "10.0.0.1",
+            chrono::Utc::now(),
+            crate::db::WriteOpts::default(),
+            "reviewed-by:alice,reviewed-by:bob",
+        );
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        assert_eq!(row(&body, "reviewed-by:alice")["used"], 1);
+        assert_eq!(row(&body, "reviewed-by:bob")["used"], 1);
+        assert!(
+            body["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["name"] != "reviewed-by:"),
+            "two values should not have been collapsed: {body}"
+        );
+    }
+
+    /// A tag a defined family already colours is not listed again. It is
+    /// already accounted for, and already counted in that family's row.
+    #[actix_web::test]
+    async fn a_tag_a_family_already_colours_is_not_listed_again() {
+        let dir = TempDir::new("tags-covered");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        // `stix-type:` is a seeded family, so the value under it needs no row.
+        assert!(
+            body["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["name"] != "stix-type:ipv4-addr"),
+            "a value already coloured by its family was listed anyway: {body}"
+        );
+        // And the family's own row counts it.
+        assert_eq!(row(&body, "stix-type:")["used"], 1);
+    }
+
+    /// A bare label has nothing to group it by and keeps its own row: those
+    /// are the ones somebody would adopt exactly as they are.
+    #[actix_web::test]
+    async fn a_bare_label_keeps_its_own_row() {
+        let dir = TempDir::new("tags-bare");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        assert_eq!(row(&body, "home-grown")["used"], 1);
+        assert_eq!(row(&body, "home-grown")["family"], false);
     }
 
     /// A family's count is everything under it, which is the only number that

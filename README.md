@@ -733,6 +733,14 @@ refusing them to keep a table tidy would lose data. Undefined tags are listed
 beside the defined ones, greyed, so adopting one is a click rather than a
 discovery.
 
+They are grouped where a key is being used as a free-text field. MISP turns an
+attribute's comment into `description:<text>`, and those run to paragraphs — a
+single imported CIRCL event produced seven rows of prose. So a key with more
+than three distinct values appears once, as its family, saying how many it
+stands for; defining it colours all of them. Three or fewer keep their own
+rows, because that is a vocabulary rather than a free-text field and giving
+every `tlp:` label one colour would defeat the point of a marking.
+
 A name ending in `:` is a **family** and colours everything beneath it, so
 `stix-type:` covers `stix-type:ipv4-addr` and every other value of that key.
 Half the vocabulary above is `key:value` with an open set of values, which

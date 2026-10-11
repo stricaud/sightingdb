@@ -399,6 +399,23 @@ A merge that brings a value into a namespace which did not hold it raises
 consensus once, exactly as a first write would — and replaying the merge does
 not raise it again.
 
+### `GET /_api/namespaces` — what this server stores
+
+	$ curl -H 'Authorization: changeme' http://127.0.0.1:9999/_api/namespaces
+	{"namespaces":["misp/domains","misp/files","misp/hashes","misp/ips",
+	               "misp/urls","watchlist/ips"]}
+
+What this server **actually holds**, which is not the same as what it can
+answer for: a server with peers forwards what it does not hold, so a read can
+succeed for a namespace that is not in this list. That is what makes this
+useful — it is the one way to see where data really is, and it is what a peer
+asks when it catches up.
+
+Internal namespaces are left out, and the list is filtered by what the key may
+read, so a scoped key does not learn the names of subtrees it cannot reach.
+
+Not forwarded, by design: the question is about this server.
+
 ### `POST /rb` — read many values
 
 	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
@@ -725,7 +742,12 @@ Out-of-reach namespaces answer **`404`, not `403`**, throughout this interface,
 so that browsing cannot be used to enumerate what a key may not see.
 
 `GET /_management` serves the browser interface itself (HTML, no key — the
-interface asks for one and calls the API below).
+interface asks for one and calls the API below). It is sent with
+`Cache-Control: no-cache`: the page *is* the application, markup and script in
+one file, so a cached copy means a browser running the previous version's
+JavaScript against this version's API. `GET /_management/logo.png` and
+`GET /_management/echarts.min.js` are the two assets it loads, and they do keep
+a long expiry, being the same in every build.
 
 ### `GET /_management/api/session` — is this an admin key?
 
@@ -901,18 +923,35 @@ on values. A feed brings whatever tags it brings, so the second set is not a
 subset of the first, and an undefined tag is listed with `defined: false` —
 which is what makes adopting one a click rather than a discovery.
 
+**Undefined tags are grouped where a key is being used as a free-text field.**
+MISP turns an attribute's comment into `description:<text>`, and those run to
+paragraphs: one imported CIRCL event produced seven rows of prose here, plus a
+row per `misp-galaxy:` value. So a key with **more than three** distinct values
+is reported once, as its family, with `variants` saying how many it stands for
+and `used` summing them — defining that family colours all of them at once,
+which is the thing worth offering. Three or fewer and each keeps its own row:
+that is a vocabulary rather than a free-text field, and collapsing it would be
+worse than the noise it avoids, since giving every `tlp:` label one colour
+defeats the point of a marking. A bare label with no `:` always keeps its own
+row.
+
+A tag a **defined** family already colours is not listed separately at all. It
+is accounted for, and already counted in that family's row.
+
 	$ curl -H 'Authorization: changeme' http://127.0.0.1:9999/_management/api/tags
 	{"tags":[
-	  {"name":"home-grown","colour":"#6b7280","description":"","family":false,
+	  {"name":"description:","colour":"#6b7280","description":"","family":true,
+	   "used":17,"defined":false,"variants":7},
+	  {"name":"needs-review","colour":"#6b7280","description":"","family":false,
 	   "used":1,"defined":false},
 	  {"name":"stix-type:","colour":"#7c3aed",
 	   "description":"The STIX observable type this value exports as, overriding
-	                  what it looks like.","family":true,"used":1,"defined":true},
-	  {"name":"tlp:green","colour":"#33FF00",
-	   "description":"Limited disclosure, restricted to the community.",
-	   "family":false,"used":2,"defined":true}],
+	                  what it looks like.","family":true,"used":31,"defined":true},
+	  {"name":"tlp:clear","colour":"#FFFFFF",
+	   "description":"Recipients can spread this to the world; there is no limit
+	                  on disclosure.","family":false,"used":31,"defined":true}],
 	 "unknown_colour":"#6b7280","editable":true,
-	 "counted_namespaces":2,"total_namespaces":2}
+	 "counted_namespaces":6,"total_namespaces":6}
 
 A name ending in `:` is a **family** and colours everything beneath it, so
 `stix-type:` covers `stix-type:ipv4-addr` and every other value of that key.
@@ -980,19 +1019,22 @@ the editor stays usable while a peer is down.
 	$ curl -H 'Authorization: changeme' http://127.0.0.1:9999/_management/api/galaxy/peers
 	{"peers":[
 	  {"url":"http://127.0.0.1:19841","namespaces":null,"fixed":true,
+	   "enabled":true,
 	   "health":{"url":"http://127.0.0.1:19841","online":true,"probed":true,
-	             "last_seen":1791670776,"latency_ms":0,"version":"0.6.1",
+	             "last_seen":1791678296,"latency_ms":1,"version":"0.7.1",
 	             "error":null,"failures":0,"catching_up":false}},
 	  {"url":"http://127.0.0.1:19842","namespaces":["feeds"],"fixed":false,
-	   "enabled":true,
+	   "enabled":false,
 	   "health":{"url":"http://127.0.0.1:19842","online":false,"probed":false,
 	             "last_seen":0,"latency_ms":null,"version":null,"error":null,
 	             "failures":0,"catching_up":false}}],
 	 "editable":true}
 
-`namespaces` is `null` for a full mirror. **Keys are never returned**: a peer
-key is a credential this server holds, and a topology view is not a reason to
-hand it back out.
+`namespaces` is `null` for a full mirror. `enabled` is false for a peer taken
+out of service: it is kept and reached for nothing, and `probed: false` with
+`last_seen: 0` is what that looks like, since nothing probes a disabled peer
+either. **Keys are never returned**: a peer key is a credential this server
+holds, and a topology view is not a reason to hand it back out.
 
 `fixed: true` means the peer was declared in `[galaxy] peers` in the
 configuration file and cannot be changed here. That file is hand-maintained and
@@ -1021,6 +1063,38 @@ in the order. An upsert would mean that typing an address that already exists
 silently replaces its key, and that key is the one thing bounding what this
 server may do there. Its own address is refused; a loop between two routers is
 not, because cascading is legitimate and the hop count is what makes it safe.
+
+### `PUT /_management/api/galaxy/peers` — change a peer
+
+	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X PUT http://127.0.0.1:9999/_management/api/galaxy/peers \
+	    -d '{"url":"https://node-b.example:9999","key":"a-rotated-key",
+	         "namespaces":["feeds","myorg/ips"]}'
+	{"peers":[
+	  {"url":"https://node-b.example:9999","namespaces":["feeds","myorg/ips"],
+	   "fixed":false,"enabled":true,
+	   "health":{"url":"https://node-b.example:9999","online":true,"probed":true,
+	             "last_seen":1791678296,"latency_ms":1,"version":"0.7.1",
+	             "error":null,"failures":0,"catching_up":false}}],
+	 "editable":true}
+
+For rotating the key a peer is reached with, or changing which namespaces it
+holds. It keeps its place in the order, so the list does not reshuffle under
+someone editing it.
+
+**The key is required even when only `namespaces` changes**, because it is
+never read back: a peer key is a credential this server holds, and a topology
+view is not a reason to hand it out. There is nothing to send but a new one.
+
+Separate from `POST` on purpose. An upsert would mean that typing an address
+that already exists silently replaces its key, and that key is the one thing
+bounding what this server may do there. `POST` on an address already present
+answers `409`; this answers `404` on one that is absent. Leave `namespaces` out
+to make it a full mirror again.
+
+Changing a peer leaves it **disabled if it was**: rotating a key and putting a
+node back into service are two different decisions. A peer declared in
+`[galaxy] peers` answers `409`.
 
 ### `POST /_management/api/galaxy/peers/enabled` — take a peer out of service
 
@@ -1121,6 +1195,53 @@ rewriting the daemon configuration in place is not something this does.
 
 	{"message":"No acl_file is configured, so keys cannot be edited here.
 	  Set acl_file in [daemon] and restart."}                             # 409
+
+### `PUT /_management/api/keys` — replace the whole key list
+
+	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X PUT http://127.0.0.1:9999/_management/api/keys \
+	    -d '{"keys":[{"key":"analyst","admin":false,"read":[""],"write":[]},
+	                 {"key":"changeme","admin":true,"read":[""],"write":[""]}]}'
+
+Hold exactly this list. Unlike saving keys one at a time, it can **remove** —
+which is what makes a revocation reach a server that was offline when the key
+was revoked.
+
+Refused with `403` unless this server has `acl_replaceable` set in `[galaxy]`:
+having its keys rewritten from outside is not something to arrive at by
+accident, so both ends have to agree. It is also refused if the list would not
+include the key making the request, which would lock the caller out of the
+server it is replacing, and if it would leave no admin key at all.
+
+This is the route the periodic key gossip uses when a server is the galaxy's
+`acl_authority`. See the README's galaxy section.
+
+### `GET /_management/api/keys/drift` — where this server's keys and its peers' disagree
+
+	$ curl -H 'Authorization: changeme' http://127.0.0.1:9999/_management/api/keys/drift
+	{"peers":[
+	  {"url":"https://node-a.example:9999","agrees":false,"readable":true,
+	   "missing":["analyst"],"only_on_peer":["old-importer"],
+	   "revoked_but_present":["rotated-out"]}]}
+
+For finding keys that did not propagate. `missing` is what this server has and
+the peer does not; `only_on_peer` is the reverse; `revoked_but_present` is the
+subset of those this server actually revoked, which is the list worth acting
+on — a key the peer has always had of its own is not drift.
+
+That distinction exists because without it the key this server authenticates
+with there appears as stale drift on every single check. Revocations are
+remembered in memory, so they stop being flagged after a restart; the peer's
+own key list is then the only way to see them.
+
+Reading a peer's keys means administering it, so this needs `admin` on the peer
+key — which a narrowly-scoped peer key deliberately does not have:
+
+	{"url":"https://node-a.example:9999","agrees":false,"readable":false,
+	 "error":"this server does not administer that peer", ...}
+
+That is a correct answer rather than a failure. A load balancer that cannot
+read its nodes' keys also cannot rewrite them, which is usually the point.
 
 ### `DELETE /_management/api/keys/<key>` — remove a key
 

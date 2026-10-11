@@ -1159,6 +1159,17 @@ paths:
                           description: >-
                             Whether the vocabulary defines it, or it was only
                             found on values.
+                        variants:
+                          type: integer
+                          description: >-
+                            How many distinct tags this row stands for, when it
+                            stands for more than itself. Present on a family
+                            inferred from undefined `key:value` tags: a key
+                            with more than three distinct values is reported
+                            once rather than one row per value, since that key
+                            is being used as a free-text field and the family
+                            is what is worth colouring. Absent on a row that is
+                            one tag.
                   unknown_colour:
                     type: string
                     description: What an undefined tag is shown in.
