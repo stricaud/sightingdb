@@ -27,9 +27,13 @@ ENGINE    ?= xelatex
 export MERMAID_CACHE  := $(BUILD)/diagrams
 export MERMAID_CONFIG := style/mermaid.json
 export MERMAID_CSS    := style/mermaid.css
-# Only set where the browser mermaid-cli drives needs --no-sandbox, which in
-# practice means a CI container running as root. The workflow sets it.
+# Only exported when it has a value. `export MERMAID_PUPPETEER` on its own
+# exports it as empty, which is not the same as unset to anything reading it.
+# Set it where the browser mermaid-cli drives needs --no-sandbox, which in
+# practice means a CI container running as root.
+ifneq ($(MERMAID_PUPPETEER),)
 export MERMAID_PUPPETEER
+endif
 
 PANDOC_FLAGS := \
   --from=markdown+smart+pipe_tables+fenced_code_attributes \

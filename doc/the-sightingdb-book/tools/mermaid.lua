@@ -18,6 +18,14 @@ local css = os.getenv("MERMAID_CSS") or "style/mermaid.css"
 -- leave it unset everywhere else: passing --no-sandbox on a workstation would
 -- be turning off a protection for no reason.
 local puppeteer = os.getenv("MERMAID_PUPPETEER")
+-- An exported-but-empty variable is what `export VAR` in a Makefile produces,
+-- and the empty string is *truthy* in Lua — so without this, every diagram
+-- was rendered with a bare `-p`, mermaid-cli read the missing value as the
+-- flag `true`, looked for a configuration file called "true", and fell back
+-- to showing the diagram's source. Caught because the fallback says so.
+if puppeteer == "" then
+  puppeteer = nil
+end
 
 -- PDF for LaTeX, SVG for everything else. Both are vector, so a diagram is
 -- sharp in print and sharp at any zoom in a browser; what differs is only
