@@ -1,0 +1,4 @@
+# Built output. The book is the markdown; these are what it compiles to.
+the-sightingdb-book.pdf
+the-sightingdb-book.html
+build/
