@@ -52,7 +52,7 @@ Anything you like is kept, and these are the keys the STIX export understands:
 | Tag | What it does |
 | --- | --- |
 | `stix-type:<type>` | The observable type, and so the pattern: `ipv4-addr`, `domain-name`, `url`, `email-addr`, `mutex`, `windows-registry-key`, or `file.<ALGORITHM>` for a hash. |
-| `stix-id:indicator--<uuid>` | Reuse this indicator id rather than minting one. |
+| `stix-id:indicator--<uuid>` | Use this indicator id rather than deriving one. Written by the STIX importer, so a value that arrived as STIX goes back out under the id its publisher gave it. See chapter 11. |
 | `indicator-type:<value>` | Adds to `indicator_types`. Repeatable. |
 | `tlp:<label>` | Marks the indicator and the sighting with the TLP marking. |
 | `confidence:<0-100>` | STIX `confidence` on both objects. |

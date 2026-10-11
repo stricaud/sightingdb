@@ -33,15 +33,88 @@ and so carries the `x_` prefix the specification requires.
 
 ### Ids are derived, not minted
 
-Every id is a UUIDv5 over a fixed namespace UUID and what the object describes.
+**Minting** an id is creating a fresh one. A STIX identifier is the object's
+type, two dashes, and a UUID:
+
+```text
+indicator--9299f726-ce06-492e-8472-2b52ccb53191
+```
+
+Normally that UUID is a **version 4** — random. Minting one takes nothing but
+a source of randomness, which is why it is the default: no agreement is
+needed, and two parties will never collide. The cost is that it is new every
+time. Export the same value twice and you get two unrelated ids, and nothing
+downstream can tell they describe the same thing.
+
+A **version 5** UUID is the other kind. It is a hash of two inputs:
+
+- a **namespace UUID**, chosen once and kept forever, and
+- a **name** — any string, as long as you can produce the same one again.
+
+Same two inputs, same UUID, on any machine, in any language, for ever. So
+"what it takes to mint" is really the question of which of those two you are
+doing: with v4, a random number; with v5, a namespace you have fixed and a
+name you can reconstruct.
+
+SightingDB uses v5 everywhere, with a namespace of its own:
+
+```text
+3ef11775-6174-4718-92bf-16705b732650
+```
+
+and these names:
+
+| Object | The name that is hashed |
+| --- | --- |
+| indicator | `indicator:<observable type>:<value>` |
+| sighting | `sighting:<namespace>:<observable type>:<value>` |
+| identity | `identity:<name>` |
+| bundle | `bundle:<namespaces, comma separated>` |
+
+Which means you can mint the same ids yourself, without this server:
+
+```python
+import uuid
+
+SIGHTINGDB = uuid.UUID("3ef11775-6174-4718-92bf-16705b732650")
+
+value, observable, namespace = "evil.example", "domain-name", "feeds/misp/domains"
+
+print("indicator--" + str(uuid.uuid5(SIGHTINGDB, f"indicator:{observable}:{value}")))
+print("sighting--"  + str(uuid.uuid5(SIGHTINGDB, f"sighting:{namespace}:{observable}:{value}")))
+```
+
+Those are exactly the ids the export produces for that value in that
+namespace — not an illustration of the idea, the same two strings hashed the
+same way. And they will not change between releases: the namespace above is a
+constant precisely so that they cannot.
+
+Note which name carries what. The indicator's has only the observable type and
+the value in it, so the same domain seen in four namespaces is one indicator.
+The sighting's has the namespace as well, so each of those four is its own
+sighting of it.
+
+> The specification asks for v4 on objects like indicators and sightings, and
+> *requires* v5 for cyber-observable objects, with a namespace it fixes
+> itself. Using v5 everywhere is therefore a deliberate departure: it trades
+> the guarantee that two publishers never collide for the guarantee that the
+> same data always produces the same bundle. For a database whose job is to be
+> re-exported on a schedule, that is the better trade — and the namespace
+> being ours is what keeps the collision risk where v4 would have put it.
+
 Two consequences, both useful:
 
 - Exporting the same data twice produces a **byte-identical** bundle, so an
   export can be diffed, cached, or published on a schedule without looking like
   it changed.
 - One value in two namespaces yields **one indicator with two sightings**,
-  because the indicator's id depends on the value and the sightings' on the
-  namespace.
+  because the indicator's name has only the value in it and the sighting's has
+  the namespace too.
+
+A value that arrived *as* STIX is the exception: the importer records the id
+its publisher gave it as a `stix-id:` tag, and the export uses that rather than
+deriving one. A bundle that goes out of here and comes back refers to the same
+objects it did before.
 
 ### What decides the pattern
 

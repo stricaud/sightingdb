@@ -719,7 +719,7 @@ ignored, so your own conventions cost nothing.
 | Tag | What it does |
 | --- | --- |
 | `stix-type:<type>` | The observable type, and so the pattern: `ipv4-addr`, `domain-name`, `url`, `email-addr`, `mutex`, `windows-registry-key`, or `file.<ALGORITHM>` for a hash. Without it the type is taken from the `[stix.types]` mapping for the namespace, and failing that from the shape of the value. |
-| `stix-id:indicator--<uuid>` | Reuse this indicator id instead of minting one. Written by the STIX importer, so a value that arrived as STIX goes back out under the id its publisher gave it. |
+| `stix-id:indicator--<uuid>` | Use this indicator id instead of calculating one. Written by the STIX importer, so a value that arrived as STIX goes back out under the id its publisher gave it. |
 | `indicator-type:<value>` | Adds to `indicator_types`. Repeatable. The STIX vocabulary is `malicious-activity`, `anomalous-activity`, `benign`, `compromised`, `attribution`, `unknown`, ... |
 | `tlp:<white\|green\|amber\|red>` | Marks the indicator and the sighting with the matching TLP marking definition, which is included in the bundle. |
 | `confidence:<0-100>` | STIX `confidence` on both objects. Out-of-range values are ignored. |
@@ -875,7 +875,8 @@ namespace UUID and the thing it names, which has two consequences worth
 relying on: exporting the same data twice produces the same bundle byte for
 byte, and the same value in two namespaces produces *one* indicator with a
 sighting each — so a consumer merging both bundles sees one indicator sighted
-twice rather than two indicators. A `stix-id:` tag overrides the minted id.
+twice rather than two indicators. A `stix-id:` tag is used in place of the
+calculated one.
 
 Who the bundle is published as comes from the configuration:
 
@@ -1547,8 +1548,9 @@ at a router or at a node.
 A STIX export is gathered the same way: each namespace is exported by the
 mirror that holds it, and the bundles are folded into one. The result is
 **byte-identical** to what the mirror would have answered on its own, including
-for a subtree spanning several mirrors — ids are derived from what they
-describe rather than minted per request, so duplicate objects collapse and the
+for a subtree spanning several mirrors — every id is calculated from what it
+describes rather than generated afresh each request, so duplicate objects
+collapse and the
 bundle id is rebuilt from the namespace list. That is what makes an export
 through a load balancer comparable with one from a node rather than merely
 similar.

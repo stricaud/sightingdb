@@ -495,8 +495,9 @@ namespace travels as `x_sightingdb_namespace`. A `tlp:` tag becomes a
 
 **Through a router**, each namespace is exported by the mirror that holds it
 and the bundles are folded together. The result is byte-identical to what the
-mirror would have answered on its own — ids here are derived from what they
-describe rather than minted per request, so duplicate objects collapse and the
+mirror would have answered on its own — every id is calculated from what it
+describes rather than generated afresh each request, so duplicate objects
+collapse and the
 bundle id is rebuilt from the namespace list. That holds for a subtree spanning
 several mirrors too, which is what makes an export through a load balancer
 comparable with one from a node rather than merely similar.

@@ -1541,7 +1541,9 @@ understands:</p>
 </tr>
 <tr>
 <td><code>stix-id:indicator--&lt;uuid&gt;</code></td>
-<td>Reuse this indicator id rather than minting one.</td>
+<td>Use this indicator id rather than deriving one. Written by the STIX
+importer, so a value that arrived as STIX goes back out under the id its
+publisher gave it. See chapter 11.</td>
 </tr>
 <tr>
 <td><code>indicator-type:&lt;value&gt;</code></td>
@@ -2471,16 +2473,97 @@ specification requires.</p>
 <section id="ids-are-derived-not-minted" class="level3" data-number="11.1.1">
 <h3 data-number="11.1.1"><span class="header-section-number">11.1.1</span> Ids are derived, not
 minted</h3>
-<p>Every id is a UUIDv5 over a fixed namespace UUID and what the object
-describes. Two consequences, both useful:</p>
+<p><strong>Minting</strong> an id is creating a fresh one. A STIX
+identifier is the object’s type, two dashes, and a UUID:</p>
+<pre class="text"><code>indicator--9299f726-ce06-492e-8472-2b52ccb53191</code></pre>
+<p>Normally that UUID is a <strong>version 4</strong> — random. Minting
+one takes nothing but a source of randomness, which is why it is the
+default: no agreement is needed, and two parties will never collide. The
+cost is that it is new every time. Export the same value twice and you
+get two unrelated ids, and nothing downstream can tell they describe the
+same thing.</p>
+<p>A <strong>version 5</strong> UUID is the other kind. It is a hash of
+two inputs:</p>
+<ul>
+<li>a <strong>namespace UUID</strong>, chosen once and kept forever,
+and</li>
+<li>a <strong>name</strong> — any string, as long as you can produce the
+same one again.</li>
+</ul>
+<p>Same two inputs, same UUID, on any machine, in any language, for
+ever. So “what it takes to mint” is really the question of which of
+those two you are doing: with v4, a random number; with v5, a namespace
+you have fixed and a name you can reconstruct.</p>
+<p>SightingDB uses v5 everywhere, with a namespace of its own:</p>
+<pre class="text"><code>3ef11775-6174-4718-92bf-16705b732650</code></pre>
+<p>and these names:</p>
+<table>
+<thead>
+<tr>
+<th>Object</th>
+<th>The name that is hashed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>indicator</td>
+<td><code>indicator:&lt;observable type&gt;:&lt;value&gt;</code></td>
+</tr>
+<tr>
+<td>sighting</td>
+<td><code>sighting:&lt;namespace&gt;:&lt;observable type&gt;:&lt;value&gt;</code></td>
+</tr>
+<tr>
+<td>identity</td>
+<td><code>identity:&lt;name&gt;</code></td>
+</tr>
+<tr>
+<td>bundle</td>
+<td><code>bundle:&lt;namespaces, comma separated&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p>Which means you can mint the same ids yourself, without this
+server:</p>
+<div class="sourceCode" id="cb88"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb88-1"><a href="#cb88-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> uuid</span>
+<span id="cb88-2"><a href="#cb88-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb88-3"><a href="#cb88-3" aria-hidden="true" tabindex="-1"></a>SIGHTINGDB <span class="op">=</span> uuid.UUID(<span class="st">&quot;3ef11775-6174-4718-92bf-16705b732650&quot;</span>)</span>
+<span id="cb88-4"><a href="#cb88-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb88-5"><a href="#cb88-5" aria-hidden="true" tabindex="-1"></a>value, observable, namespace <span class="op">=</span> <span class="st">&quot;evil.example&quot;</span>, <span class="st">&quot;domain-name&quot;</span>, <span class="st">&quot;feeds/misp/domains&quot;</span></span>
+<span id="cb88-6"><a href="#cb88-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb88-7"><a href="#cb88-7" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;indicator--&quot;</span> <span class="op">+</span> <span class="bu">str</span>(uuid.uuid5(SIGHTINGDB, <span class="ss">f&quot;indicator:</span><span class="sc">{</span>observable<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>value<span class="sc">}</span><span class="ss">&quot;</span>)))</span>
+<span id="cb88-8"><a href="#cb88-8" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;sighting--&quot;</span>  <span class="op">+</span> <span class="bu">str</span>(uuid.uuid5(SIGHTINGDB, <span class="ss">f&quot;sighting:</span><span class="sc">{</span>namespace<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>observable<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>value<span class="sc">}</span><span class="ss">&quot;</span>)))</span></code></pre></div>
+<p>Those are exactly the ids the export produces for that value in that
+namespace — not an illustration of the idea, the same two strings hashed
+the same way. And they will not change between releases: the namespace
+above is a constant precisely so that they cannot.</p>
+<p>Note which name carries what. The indicator’s has only the observable
+type and the value in it, so the same domain seen in four namespaces is
+one indicator. The sighting’s has the namespace as well, so each of
+those four is its own sighting of it.</p>
+<blockquote>
+<p>The specification asks for v4 on objects like indicators and
+sightings, and <em>requires</em> v5 for cyber-observable objects, with a
+namespace it fixes itself. Using v5 everywhere is therefore a deliberate
+departure: it trades the guarantee that two publishers never collide for
+the guarantee that the same data always produces the same bundle. For a
+database whose job is to be re-exported on a schedule, that is the
+better trade — and the namespace being ours is what keeps the collision
+risk where v4 would have put it.</p>
+</blockquote>
+<p>Two consequences, both useful:</p>
 <ul>
 <li>Exporting the same data twice produces a
 <strong>byte-identical</strong> bundle, so an export can be diffed,
 cached, or published on a schedule without looking like it changed.</li>
 <li>One value in two namespaces yields <strong>one indicator with two
-sightings</strong>, because the indicator’s id depends on the value and
-the sightings’ on the namespace.</li>
+sightings</strong>, because the indicator’s name has only the value in
+it and the sighting’s has the namespace too.</li>
 </ul>
+<p>A value that arrived <em>as</em> STIX is the exception: the importer
+records the id its publisher gave it as a <code>stix-id:</code> tag, and
+the export uses that rather than deriving one. A bundle that goes out of
+here and comes back refers to the same objects it did before.</p>
 </section>
 <section id="what-decides-the-pattern" class="level3" data-number="11.1.2">
 <h3 data-number="11.1.2"><span class="header-section-number">11.1.2</span> What decides the
@@ -2496,8 +2579,8 @@ backwards.</li>
 <p>A value that none of those identify is <strong>skipped</strong> and
 counted in <code>X-SightingDB-Skipped</code>, never guessed at. If you
 would rather have it, ask:</p>
-<div class="sourceCode" id="cb86"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb86-1"><a href="#cb86-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb86-2"><a href="#cb86-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds/misp/ips?untyped=include&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb89"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb89-1"><a href="#cb89-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb89-2"><a href="#cb89-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds/misp/ips?untyped=include&#39;</span></span></code></pre></div>
 <p>Those go out as a custom observable type, flagged, so a consumer can
 tell them from a value whose type is actually known.</p>
 </section>
@@ -2548,11 +2631,11 @@ than one that refused, so it says.</p>
 <section id="a-subtree-or-several-namespaces" class="level3" data-number="11.1.4">
 <h3 data-number="11.1.4"><span class="header-section-number">11.1.4</span> A subtree, or several
 namespaces</h3>
-<div class="sourceCode" id="cb87"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb87-1"><a href="#cb87-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb87-2"><a href="#cb87-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds?recursive&#39;</span></span></code></pre></div>
-<div class="sourceCode" id="cb88"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb88-1"><a href="#cb88-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
-<span id="cb88-2"><a href="#cb88-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST http://localhost:9999/_api/stix <span class="dt">\</span></span>
-<span id="cb88-3"><a href="#cb88-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;namespaces&quot;:[&quot;feeds/misp/ips&quot;,&quot;watchlist/ips&quot;],&quot;q&quot;:&quot;198.51&quot;,&quot;limit&quot;:500}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb90"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb90-1"><a href="#cb90-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb90-2"><a href="#cb90-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds?recursive&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb91"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb91-1"><a href="#cb91-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb91-2"><a href="#cb91-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST http://localhost:9999/_api/stix <span class="dt">\</span></span>
+<span id="cb91-3"><a href="#cb91-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;namespaces&quot;:[&quot;feeds/misp/ips&quot;,&quot;watchlist/ips&quot;],&quot;q&quot;:&quot;198.51&quot;,&quot;limit&quot;:500}&#39;</span></span></code></pre></div>
 <p>Through a load balancer, each namespace is exported by the mirror
 that holds it and the bundles are folded into one. The result is
 byte-identical to what a single server holding all of them would produce
@@ -2561,14 +2644,14 @@ reconciliation.</p>
 </section>
 <section id="configuring-who-you-are" class="level3" data-number="11.1.5">
 <h3 data-number="11.1.5"><span class="header-section-number">11.1.5</span> Configuring who you are</h3>
-<div class="sourceCode" id="cb89"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb89-1"><a href="#cb89-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[stix]</span></span>
-<span id="cb89-2"><a href="#cb89-2" aria-hidden="true" tabindex="-1"></a><span class="dt">identity</span> <span class="op">=</span> <span class="st">&quot;Beta Cyber Intelligence Company&quot;</span></span>
-<span id="cb89-3"><a href="#cb89-3" aria-hidden="true" tabindex="-1"></a><span class="dt">identity_class</span> <span class="op">=</span> <span class="st">&quot;organization&quot;</span></span>
-<span id="cb89-4"><a href="#cb89-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb89-5"><a href="#cb89-5" aria-hidden="true" tabindex="-1"></a><span class="kw">[stix.types]</span></span>
-<span id="cb89-6"><a href="#cb89-6" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/ips&quot;</span> <span class="op">=</span> <span class="st">&quot;ipv4-addr&quot;</span></span>
-<span id="cb89-7"><a href="#cb89-7" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/domains&quot;</span> <span class="op">=</span> <span class="st">&quot;domain-name&quot;</span></span>
-<span id="cb89-8"><a href="#cb89-8" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/hashes&quot;</span> <span class="op">=</span> <span class="st">&quot;file.SHA-256&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb92"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb92-1"><a href="#cb92-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[stix]</span></span>
+<span id="cb92-2"><a href="#cb92-2" aria-hidden="true" tabindex="-1"></a><span class="dt">identity</span> <span class="op">=</span> <span class="st">&quot;Beta Cyber Intelligence Company&quot;</span></span>
+<span id="cb92-3"><a href="#cb92-3" aria-hidden="true" tabindex="-1"></a><span class="dt">identity_class</span> <span class="op">=</span> <span class="st">&quot;organization&quot;</span></span>
+<span id="cb92-4"><a href="#cb92-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb92-5"><a href="#cb92-5" aria-hidden="true" tabindex="-1"></a><span class="kw">[stix.types]</span></span>
+<span id="cb92-6"><a href="#cb92-6" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/ips&quot;</span> <span class="op">=</span> <span class="st">&quot;ipv4-addr&quot;</span></span>
+<span id="cb92-7"><a href="#cb92-7" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/domains&quot;</span> <span class="op">=</span> <span class="st">&quot;domain-name&quot;</span></span>
+<span id="cb92-8"><a href="#cb92-8" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/hashes&quot;</span> <span class="op">=</span> <span class="st">&quot;file.SHA-256&quot;</span></span></code></pre></div>
 <p><code>identity</code> is who the bundle is published by and who the
 sightings are attributed to when no <code>identity:</code> tag says
 otherwise. <code>[stix.types]</code> saves tagging every value in a
@@ -2585,7 +2668,7 @@ namespace that only ever holds one kind of thing.</p>
 <section id="importing-stix" class="level2" data-number="11.2">
 <h2 data-number="11.2"><span class="header-section-number">11.2</span>
 Importing STIX</h2>
-<div class="sourceCode" id="cb90"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb90-1"><a href="#cb90-1" aria-hidden="true" tabindex="-1"></a><span class="ex">sightingdb</span> <span class="at">--import-stix</span> ./bundles/</span></code></pre></div>
+<div class="sourceCode" id="cb93"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb93-1"><a href="#cb93-1" aria-hidden="true" tabindex="-1"></a><span class="ex">sightingdb</span> <span class="at">--import-stix</span> ./bundles/</span></code></pre></div>
 <p>A file or a directory. It loads, writes, saves and exits — no
 listeners start, so it is safe to run against a server’s data directory
 while that server is stopped.</p>
@@ -2600,20 +2683,20 @@ which is what makes an import and then an export round-trip.</p>
 <h2 data-number="11.3"><span class="header-section-number">11.3</span>
 Importing from MISP</h2>
 <p>MISP publishes over ZMQ, and SightingDB subscribes:</p>
-<div class="sourceCode" id="cb91"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb91-1"><a href="#cb91-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq]</span></span>
-<span id="cb91-2"><a href="#cb91-2" aria-hidden="true" tabindex="-1"></a><span class="dt">url</span> <span class="op">=</span> <span class="st">&quot;tcp://misp.example:50000&quot;</span></span>
-<span id="cb91-3"><a href="#cb91-3" aria-hidden="true" tabindex="-1"></a><span class="dt">format</span> <span class="op">=</span> <span class="st">&quot;misp&quot;</span></span>
-<span id="cb91-4"><a href="#cb91-4" aria-hidden="true" tabindex="-1"></a><span class="dt">default_namespace</span> <span class="op">=</span> <span class="st">&quot;misp/other&quot;</span></span>
-<span id="cb91-5"><a href="#cb91-5" aria-hidden="true" tabindex="-1"></a><span class="dt">require_to_ids</span> <span class="op">=</span> <span class="cn">false</span></span>
-<span id="cb91-6"><a href="#cb91-6" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb91-7"><a href="#cb91-7" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq.types]</span></span>
-<span id="cb91-8"><a href="#cb91-8" aria-hidden="true" tabindex="-1"></a><span class="dt">ip-src</span> <span class="op">=</span> <span class="st">&quot;misp/ips&quot;</span></span>
-<span id="cb91-9"><a href="#cb91-9" aria-hidden="true" tabindex="-1"></a><span class="dt">ip-dst</span> <span class="op">=</span> <span class="st">&quot;misp/ips&quot;</span></span>
-<span id="cb91-10"><a href="#cb91-10" aria-hidden="true" tabindex="-1"></a><span class="dt">domain</span> <span class="op">=</span> <span class="st">&quot;misp/domains&quot;</span></span>
-<span id="cb91-11"><a href="#cb91-11" aria-hidden="true" tabindex="-1"></a><span class="dt">hostname</span> <span class="op">=</span> <span class="st">&quot;misp/domains&quot;</span></span>
-<span id="cb91-12"><a href="#cb91-12" aria-hidden="true" tabindex="-1"></a><span class="dt">url</span> <span class="op">=</span> <span class="st">&quot;misp/urls&quot;</span></span>
-<span id="cb91-13"><a href="#cb91-13" aria-hidden="true" tabindex="-1"></a><span class="dt">md5</span> <span class="op">=</span> <span class="st">&quot;misp/hashes&quot;</span></span>
-<span id="cb91-14"><a href="#cb91-14" aria-hidden="true" tabindex="-1"></a><span class="dt">sha256</span> <span class="op">=</span> <span class="st">&quot;misp/hashes&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb94"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb94-1"><a href="#cb94-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq]</span></span>
+<span id="cb94-2"><a href="#cb94-2" aria-hidden="true" tabindex="-1"></a><span class="dt">url</span> <span class="op">=</span> <span class="st">&quot;tcp://misp.example:50000&quot;</span></span>
+<span id="cb94-3"><a href="#cb94-3" aria-hidden="true" tabindex="-1"></a><span class="dt">format</span> <span class="op">=</span> <span class="st">&quot;misp&quot;</span></span>
+<span id="cb94-4"><a href="#cb94-4" aria-hidden="true" tabindex="-1"></a><span class="dt">default_namespace</span> <span class="op">=</span> <span class="st">&quot;misp/other&quot;</span></span>
+<span id="cb94-5"><a href="#cb94-5" aria-hidden="true" tabindex="-1"></a><span class="dt">require_to_ids</span> <span class="op">=</span> <span class="cn">false</span></span>
+<span id="cb94-6"><a href="#cb94-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb94-7"><a href="#cb94-7" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq.types]</span></span>
+<span id="cb94-8"><a href="#cb94-8" aria-hidden="true" tabindex="-1"></a><span class="dt">ip-src</span> <span class="op">=</span> <span class="st">&quot;misp/ips&quot;</span></span>
+<span id="cb94-9"><a href="#cb94-9" aria-hidden="true" tabindex="-1"></a><span class="dt">ip-dst</span> <span class="op">=</span> <span class="st">&quot;misp/ips&quot;</span></span>
+<span id="cb94-10"><a href="#cb94-10" aria-hidden="true" tabindex="-1"></a><span class="dt">domain</span> <span class="op">=</span> <span class="st">&quot;misp/domains&quot;</span></span>
+<span id="cb94-11"><a href="#cb94-11" aria-hidden="true" tabindex="-1"></a><span class="dt">hostname</span> <span class="op">=</span> <span class="st">&quot;misp/domains&quot;</span></span>
+<span id="cb94-12"><a href="#cb94-12" aria-hidden="true" tabindex="-1"></a><span class="dt">url</span> <span class="op">=</span> <span class="st">&quot;misp/urls&quot;</span></span>
+<span id="cb94-13"><a href="#cb94-13" aria-hidden="true" tabindex="-1"></a><span class="dt">md5</span> <span class="op">=</span> <span class="st">&quot;misp/hashes&quot;</span></span>
+<span id="cb94-14"><a href="#cb94-14" aria-hidden="true" tabindex="-1"></a><span class="dt">sha256</span> <span class="op">=</span> <span class="st">&quot;misp/hashes&quot;</span></span></code></pre></div>
 <p>Attributes are read from single-attribute publications and from whole
 events, including attributes nested inside objects — which is where most
 of a modern MISP event’s attributes live. Only mapped types are ingested
@@ -2704,9 +2787,9 @@ Operations</h1>
 <section id="is-it-alive" class="level2" data-number="12.1">
 <h2 data-number="12.1"><span class="header-section-number">12.1</span>
 Is it alive</h2>
-<div class="sourceCode" id="cb92"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb92-1"><a href="#cb92-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-fsS</span> http://localhost:9999/health</span></code></pre></div>
-<div class="sourceCode" id="cb93"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb93-1"><a href="#cb93-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span><span class="st">&quot;ok&quot;</span><span class="fu">,</span><span class="dt">&quot;version&quot;</span><span class="fu">:</span><span class="st">&quot;0.7.1&quot;</span><span class="fu">,</span><span class="dt">&quot;uptime_seconds&quot;</span><span class="fu">:</span><span class="dv">864</span><span class="fu">,</span></span>
-<span id="cb93-2"><a href="#cb93-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;resident_shards&quot;</span><span class="fu">:</span><span class="dv">4</span><span class="fu">,</span><span class="dt">&quot;shards&quot;</span><span class="fu">:</span><span class="dv">7</span><span class="fu">,</span><span class="dt">&quot;catching_up&quot;</span><span class="fu">:</span><span class="kw">false</span><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb95"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb95-1"><a href="#cb95-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-fsS</span> http://localhost:9999/health</span></code></pre></div>
+<div class="sourceCode" id="cb96"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb96-1"><a href="#cb96-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span><span class="st">&quot;ok&quot;</span><span class="fu">,</span><span class="dt">&quot;version&quot;</span><span class="fu">:</span><span class="st">&quot;0.7.1&quot;</span><span class="fu">,</span><span class="dt">&quot;uptime_seconds&quot;</span><span class="fu">:</span><span class="dv">864</span><span class="fu">,</span></span>
+<span id="cb96-2"><a href="#cb96-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;resident_shards&quot;</span><span class="fu">:</span><span class="dv">4</span><span class="fu">,</span><span class="dt">&quot;shards&quot;</span><span class="fu">:</span><span class="dv">7</span><span class="fu">,</span><span class="dt">&quot;catching_up&quot;</span><span class="fu">:</span><span class="kw">false</span><span class="fu">}</span></span></code></pre></div>
 <p>No key, which is what makes it usable as a container healthcheck and
 a load balancer probe. <code>resident_shards</code> against
 <code>shards</code> is how much of the database is in memory;
@@ -2740,12 +2823,12 @@ memory, <code>warm</code> writes it out and drops it after
 the next sweep. Evicted data is <strong>read back when it is next
 used</strong>, so <code>cold</code> costs one load per burst of activity
 rather than one per operation.</p>
-<div class="sourceCode" id="cb94"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb94-1"><a href="#cb94-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="at">-X</span> POST http://localhost:9999/_api/tier <span class="dt">\</span></span>
-<span id="cb94-2"><a href="#cb94-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
-<span id="cb94-3"><a href="#cb94-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;namespace&quot;:&quot;archive&quot;,&quot;tier&quot;:&quot;warm&quot;,&quot;warm_idle&quot;:86400}&#39;</span></span></code></pre></div>
-<div class="sourceCode" id="cb95"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb95-1"><a href="#cb95-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;shard&quot;</span><span class="fu">:</span><span class="st">&quot;archive&quot;</span><span class="fu">,</span><span class="dt">&quot;tier&quot;</span><span class="fu">:</span><span class="st">&quot;warm&quot;</span><span class="fu">,</span><span class="dt">&quot;warm_idle&quot;</span><span class="fu">:</span><span class="dv">86400</span><span class="fu">,</span></span>
-<span id="cb95-2"><a href="#cb95-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;own_tier&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span><span class="dt">&quot;own_warm_idle&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span></span>
-<span id="cb95-3"><a href="#cb95-3" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;effect&quot;</span><span class="fu">:</span><span class="st">&quot;&#39;archive&#39; and everything under it is dropped after 86400s untouched&quot;</span><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb97"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb97-1"><a href="#cb97-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="at">-X</span> POST http://localhost:9999/_api/tier <span class="dt">\</span></span>
+<span id="cb97-2"><a href="#cb97-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb97-3"><a href="#cb97-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;namespace&quot;:&quot;archive&quot;,&quot;tier&quot;:&quot;warm&quot;,&quot;warm_idle&quot;:86400}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb98"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb98-1"><a href="#cb98-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;shard&quot;</span><span class="fu">:</span><span class="st">&quot;archive&quot;</span><span class="fu">,</span><span class="dt">&quot;tier&quot;</span><span class="fu">:</span><span class="st">&quot;warm&quot;</span><span class="fu">,</span><span class="dt">&quot;warm_idle&quot;</span><span class="fu">:</span><span class="dv">86400</span><span class="fu">,</span></span>
+<span id="cb98-2"><a href="#cb98-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;own_tier&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span><span class="dt">&quot;own_warm_idle&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb98-3"><a href="#cb98-3" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;effect&quot;</span><span class="fu">:</span><span class="st">&quot;&#39;archive&#39; and everything under it is dropped after 86400s untouched&quot;</span><span class="fu">}</span></span></code></pre></div>
 <p>The reply says the effect out loud, because a change made from a row
 deep in a tree is a change to everything beside it. Either field takes
 <code>&quot;default&quot;</code> to stop overriding.</p>
@@ -2766,8 +2849,8 @@ people look up” is interesting for a while and not forever.</p>
 <section id="what-was-refused" class="level2" data-number="12.5">
 <h2 data-number="12.5"><span class="header-section-number">12.5</span>
 What was refused</h2>
-<div class="sourceCode" id="cb96"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb96-1"><a href="#cb96-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb96-2"><a href="#cb96-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/_management/api/rejections&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb99"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb99-1"><a href="#cb99-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb99-2"><a href="#cb99-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/_management/api/rejections&#39;</span></span></code></pre></div>
 <p>Newest first, from every write path including the ZMQ ingest, which
 has no caller of its own to tell. This is the answer to “the feed says
 it sent fifty thousand and I have forty-nine thousand”.</p>
@@ -2777,10 +2860,10 @@ fact about the data.</p>
 <section id="certificates" class="level2" data-number="12.6">
 <h2 data-number="12.6"><span class="header-section-number">12.6</span>
 Certificates</h2>
-<div class="sourceCode" id="cb97"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb97-1"><a href="#cb97-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[daemon]</span></span>
-<span id="cb97-2"><a href="#cb97-2" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl</span> <span class="op">=</span> <span class="cn">true</span></span>
-<span id="cb97-3"><a href="#cb97-3" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_cert</span> <span class="op">=</span> <span class="st">&quot;/etc/sightingdb/tls/cert.pem&quot;</span></span>
-<span id="cb97-4"><a href="#cb97-4" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_key</span> <span class="op">=</span> <span class="st">&quot;/etc/sightingdb/tls/key.pem&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb100"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb100-1"><a href="#cb100-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[daemon]</span></span>
+<span id="cb100-2"><a href="#cb100-2" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl</span> <span class="op">=</span> <span class="cn">true</span></span>
+<span id="cb100-3"><a href="#cb100-3" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_cert</span> <span class="op">=</span> <span class="st">&quot;/etc/sightingdb/tls/cert.pem&quot;</span></span>
+<span id="cb100-4"><a href="#cb100-4" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_key</span> <span class="op">=</span> <span class="st">&quot;/etc/sightingdb/tls/key.pem&quot;</span></span></code></pre></div>
 <p><code>sightingdb --install-selfsigned-keys</code> writes a pair at
 those paths for getting started. The Configuration page shows the expiry
 and warns at 30 days.</p>
