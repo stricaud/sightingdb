@@ -21,11 +21,32 @@ toc-depth: 2
 numbersections: true
 secnumdepth: 2
 links-as-notes: false
-# A monospace face that is narrow enough for an 80-column curl command and
-# still legible at 9pt, which most of this book depends on.
-monofont: "Menlo"
+# Loaded by file rather than by name, and from fonts TeX Live itself ships:
+# Pagella is a Palatino clone, Heros a Helvetica clone, and Latin Modern Mono
+# is narrow enough for an 80-column curl command while staying legible at 9pt.
+#
+# By file because a name has to be registered with the system's font service
+# to be found, and these are not — the book would then build on the machine it
+# was written on and nowhere else, which is exactly what a CI runner finds out
+# for you. `texlive-fonts-recommended` and `lmodern` are where they live on
+# Debian and Ubuntu; MacTeX has them already.
+mainfont: "texgyrepagella"
+mainfontoptions:
+  - Extension=.otf
+  - UprightFont=*-regular
+  - BoldFont=*-bold
+  - ItalicFont=*-italic
+  - BoldItalicFont=*-bolditalic
+sansfont: "texgyreheros"
+sansfontoptions:
+  - Extension=.otf
+  - UprightFont=*-regular
+  - BoldFont=*-bold
+  - ItalicFont=*-italic
+  - BoldItalicFont=*-bolditalic
+monofont: "lmmono10-regular"
 monofontoptions:
-  - Scale=0.86
-mainfont: "Palatino"
-sansfont: "Helvetica Neue"
+  - Extension=.otf
+  - BoldFont=lmmonolt10-bold
+  - Scale=0.88
 ...

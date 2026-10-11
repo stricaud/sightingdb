@@ -11,6 +11,9 @@
 
 BOOK      := the-sightingdb-book
 CHAPTERS  := $(sort $(wildcard chapters/*.md))
+# Images are prerequisites too: re-taking a screenshot should rebuild the book,
+# which it did not until this line existed.
+IMAGES    := $(wildcard images/*)
 STYLE     := style/book.tex
 META      := metadata.yaml
 FILTER    := tools/mermaid.lua
@@ -24,6 +27,9 @@ ENGINE    ?= xelatex
 export MERMAID_CACHE  := $(BUILD)/diagrams
 export MERMAID_CONFIG := style/mermaid.json
 export MERMAID_CSS    := style/mermaid.css
+# Only set where the browser mermaid-cli drives needs --no-sandbox, which in
+# practice means a CI container running as root. The workflow sets it.
+export MERMAID_PUPPETEER
 
 PANDOC_FLAGS := \
   --from=markdown+smart+pipe_tables+fenced_code_attributes \
@@ -40,7 +46,7 @@ all: pdf
 
 pdf: $(BOOK).pdf
 
-$(BOOK).pdf: $(CHAPTERS) $(STYLE) $(META) $(FILTER) | $(MERMAID_CACHE)
+$(BOOK).pdf: $(CHAPTERS) $(IMAGES) $(STYLE) $(META) $(FILTER) | $(MERMAID_CACHE)
 	@command -v $(PANDOC) >/dev/null || { \
 	  echo "pandoc is not installed. brew install pandoc"; exit 1; }
 	@command -v $(ENGINE) >/dev/null || { \
@@ -59,7 +65,7 @@ $(BOOK).pdf: $(CHAPTERS) $(STYLE) $(META) $(FILTER) | $(MERMAID_CACHE)
 # on a web server with nothing beside it.
 html: $(BOOK).html
 
-$(BOOK).html: $(CHAPTERS) $(META) $(FILTER) style/book.css style/cover.html | $(MERMAID_CACHE)
+$(BOOK).html: $(CHAPTERS) $(IMAGES) $(META) $(FILTER) style/book.css style/cover.html | $(MERMAID_CACHE)
 	@command -v $(PANDOC) >/dev/null || { \
 	  echo "pandoc is not installed. brew install pandoc"; exit 1; }
 	@command -v mmdc >/dev/null || \

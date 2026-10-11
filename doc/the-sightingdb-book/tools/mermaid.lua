@@ -12,6 +12,12 @@
 local cache = os.getenv("MERMAID_CACHE") or "build/diagrams"
 local config = os.getenv("MERMAID_CONFIG") or "style/mermaid.json"
 local css = os.getenv("MERMAID_CSS") or "style/mermaid.css"
+-- mermaid-cli drives a headless browser, which refuses to start as root
+-- without `--no-sandbox` — which is exactly what a CI container is. Set
+-- MERMAID_PUPPETEER to a file holding {"args": ["--no-sandbox"]} there, and
+-- leave it unset everywhere else: passing --no-sandbox on a workstation would
+-- be turning off a protection for no reason.
+local puppeteer = os.getenv("MERMAID_PUPPETEER")
 
 -- PDF for LaTeX, SVG for everything else. Both are vector, so a diagram is
 -- sharp in print and sharp at any zoom in a browser; what differs is only
@@ -65,8 +71,9 @@ function CodeBlock(block)
     -- box of its own; the theme comes from the config so every diagram in the
     -- book is drawn in the logo's colours.
     local command = string.format(
-      "mmdc --quiet -i %s -o %s -b transparent -c %s -C %s 2>&1",
-      source, image, config, css
+      "mmdc --quiet -i %s -o %s -b transparent -c %s -C %s%s 2>&1",
+      source, image, config, css,
+      puppeteer and (" -p " .. puppeteer) or ""
     )
     local pipe = io.popen(command)
     local output = pipe and pipe:read("*a") or ""

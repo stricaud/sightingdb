@@ -136,7 +136,11 @@ for (const shot of shots) {
     const box = await page.evaluate(() => {
       const main = document.querySelector("main");
       const height = main ? main.getBoundingClientRect().bottom : 0;
-      return Math.min(Math.max(Math.ceil(height) + 24, 320), 900);
+      // Capped at a shape that fits a page. A screenshot taller than it is
+      // wide gets scaled down by its height when placed in a column, which
+      // makes it narrow and unreadable; showing the top of a long page is
+      // what a figure in a book does anyway.
+      return Math.min(Math.max(Math.ceil(height) + 24, 320), 690);
     });
 
     await page.screenshot({
