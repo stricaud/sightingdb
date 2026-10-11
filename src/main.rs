@@ -499,6 +499,8 @@ fn server_info(
             format: format!("{:?}", zmq.format).to_lowercase(),
             require_to_ids: zmq.mapping.require_to_ids,
             mapped_types: zmq.mapping.types.len(),
+            hashed_namespace: zmq.mapping.hashed_namespace.clone(),
+            store_values: zmq.mapping.store_values,
         }),
         namespaces: db.namespace_count(),
         apikeys: acl.len(),

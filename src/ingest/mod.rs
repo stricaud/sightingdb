@@ -269,6 +269,8 @@ mod tests {
                 types: HashMap::from([("ip-src".to_string(), "misp/ips".to_string())]),
                 default_namespace: None,
                 require_to_ids: false,
+                hashed_namespace: None,
+                store_values: true,
             },
             ttl: 0,
             reconnect: 5,

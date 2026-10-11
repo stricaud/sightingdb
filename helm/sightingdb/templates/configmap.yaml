@@ -150,6 +150,12 @@ data:
     {{- if not (kindIs "invalid" .reconnect) }}
     reconnect = {{ int64 .reconnect }}
     {{- end }}
+    {{- if not (kindIs "invalid" .hashed_namespace) }}
+    hashed_namespace = {{ .hashed_namespace | quote }}
+    {{- end }}
+    {{- if not (kindIs "invalid" .store_values) }}
+    store_values = {{ .store_values }}
+    {{- end }}
     {{- with .types }}
 
     # A key containing a dot has to be quoted, or TOML reads it as a table.

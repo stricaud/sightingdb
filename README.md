@@ -642,6 +642,33 @@ ingested unless `default_namespace` is set, MISP's own timestamps are preserved,
 and `require_to_ids=true` limits ingest to attributes MISP flagged as
 actionable. A publisher that goes away is retried rather than being fatal.
 
+### Digests for MISP
+
+MISP publishes values in cleartext but looks them up by SHA-256 —
+`hash('sha256', $value)`, lowercase hex — so something has to hash them, and
+this ingest is the only place that sees the cleartext. `hashed_namespace`
+records the digest of every ingested attribute there, hashed exactly as MISP
+does: the whole value, so `1.2.3.4|80` is one string.
+
+	[zmq]
+	endpoint = "tcp://misp.example.com:50000"
+	hashed_namespace = "misp/published"
+	# Never write the cleartext, only the digest.
+	store_values = false
+
+Keep it apart from the namespaces a MISP connection reads as sightings: an
+attribute being published is not a sighting.
+
+Every attribute that passes `require_to_ids` is hashed, whether or not
+`[zmq.types]` maps its type, since MISP may look up any attribute it shows; the
+mapping still decides where the cleartext goes. The digest carries the same
+timestamp and tags as the value, except those that would give the value away:
+`description:` (the attribute's comment), `misp-event:` (a pointer to the event
+that holds the cleartext) and `stix-type:` (the digest is not an `ipv4-addr`).
+`store_values = false` skips the plain write entirely, needs
+`hashed_namespace`, and makes an empty `[zmq.types]` a complete configuration.
+Both apply to `format = "misp"` only.
+
 `format=native` instead reads `{"items":[{"namespace":..,"value":..}]}`, for
 publishers that speak SightingDB directly. Note that in this mode the publisher
 chooses its own namespaces, so only subscribe to a source you trust — the

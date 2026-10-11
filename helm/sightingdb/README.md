@@ -89,7 +89,7 @@ hatches for something the chart does not model yet.
 | `config.daemon.*` | | `enabled`, `listen_ip`, `listen_port`, `authenticate`, `post_limit`, `dbdir`, `snapshot_interval`, `compression_level`, `sweep_interval`, `stats_retention`, `shadow_ttl`. |
 | `config.storage.*` | | `default_tier`, `warm_idle`, `tiers`. |
 | `config.dns.*` | disabled | `zone`, `listen_ip`, `listen_port`, `ttl`, `rate_limit`, `threads`, `shadow`, `namespaces`. |
-| `config.zmq.*` | disabled | `endpoint`, `topics`, `format`, `require_to_ids`, `default_namespace`, `ttl`, `reconnect`, `types`. |
+| `config.zmq.*` | disabled | `endpoint`, `topics`, `format`, `require_to_ids`, `default_namespace`, `ttl`, `reconnect`, `hashed_namespace`, `store_values`, `types`. |
 | `config.stix.*` | | `identity`, `identity_class`, `default_namespace`, `ttl`, `types`. |
 | `configOverride` | `""` | Raw TOML, replacing everything under `config`. |
 | `existingConfigMap` | `""` | A ConfigMap of your own. |

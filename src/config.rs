@@ -403,6 +403,12 @@ struct RawZmq {
     reconnect: u64,
     #[serde(default)]
     types: Option<toml::Value>,
+    /// Also record the SHA-256 of every ingested value here, which is what
+    /// MISP's SightingDB connection looks up.
+    hashed_namespace: Option<String>,
+    /// `false` records only the digest. Requires `hashed_namespace`.
+    #[serde(default = "yes")]
+    store_values: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -953,9 +959,41 @@ impl RawZmq {
         let format = Format::parse(&self.format)
             .with_context(|| format!("in [zmq] of {}", path.display()))?;
         let types = type_map(self.types.as_ref(), "zmq.types", path)?;
-        let default_namespace = namespace_option(self.default_namespace, "zmq")?;
+        let default_namespace =
+            namespace_option(self.default_namespace, "zmq", "default_namespace")?;
+        let hashed_namespace = namespace_option(self.hashed_namespace, "zmq", "hashed_namespace")?;
 
-        if types.is_empty() && default_namespace.is_none() && format == Format::Misp {
+        if !self.store_values && hashed_namespace.is_none() {
+            bail!(
+                "[zmq] in {} sets store_values = false without a hashed_namespace, so \
+                 nothing would ever be recorded. Set hashed_namespace, or remove \
+                 store_values",
+                path.display()
+            );
+        }
+        if !self.store_values && format != Format::Misp {
+            bail!(
+                "[zmq] in {} sets store_values = false, which only applies to format = \
+                 \"misp\"",
+                path.display()
+            );
+        }
+        if hashed_namespace.is_some() && format != Format::Misp {
+            log::warn!(
+                "[zmq] in {} sets hashed_namespace, which only applies to format = \"misp\"; \
+                 a native publisher chooses its own namespaces and nothing is hashed",
+                path.display()
+            );
+        }
+
+        // With a hashed namespace every attribute is still recorded as its
+        // digest, so an empty mapping is a reasonable configuration rather
+        // than a mistake.
+        if types.is_empty()
+            && default_namespace.is_none()
+            && hashed_namespace.is_none()
+            && format == Format::Misp
+        {
             log::warn!(
                 "[zmq] is configured in {} but [zmq.types] maps nothing and no \
                  default_namespace is set, so every attribute will be discarded",
@@ -971,6 +1009,8 @@ impl RawZmq {
                 types,
                 default_namespace,
                 require_to_ids: self.require_to_ids,
+                hashed_namespace,
+                store_values: self.store_values,
             },
             ttl: self.ttl,
             reconnect: self.reconnect,
@@ -984,7 +1024,11 @@ impl RawStix {
         Ok(StixSettings {
             mapping: StixMapping {
                 types: type_map(self.types.as_ref(), "stix.types", path)?,
-                default_namespace: namespace_option(self.default_namespace, "stix")?,
+                default_namespace: namespace_option(
+                    self.default_namespace,
+                    "stix",
+                    "default_namespace",
+                )?,
             },
             ttl: self.ttl,
             export: crate::stix::Settings {
@@ -1044,7 +1088,7 @@ fn type_map(
     Ok(map)
 }
 
-fn namespace_option(value: Option<String>, table: &str) -> Result<Option<String>> {
+fn namespace_option(value: Option<String>, table: &str, key: &str) -> Result<Option<String>> {
     let Some(namespace) = value
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())
@@ -1052,7 +1096,7 @@ fn namespace_option(value: Option<String>, table: &str) -> Result<Option<String>
         return Ok(None);
     };
     if namespace.starts_with('_') {
-        bail!("'default_namespace' in [{table}] is the internal namespace '{namespace}'");
+        bail!("'{key}' in [{table}] is the internal namespace '{namespace}'");
     }
     Ok(Some(namespace))
 }
@@ -1573,6 +1617,120 @@ ip-src = "misp/ips"
         assert!(zmq.mapping.require_to_ids);
         assert_eq!(zmq.mapping.types["ip-src"], "misp/ips");
         assert_eq!(zmq.reconnect, 5);
+    }
+
+    #[test]
+    fn zmq_hashing_is_off_unless_configured() {
+        let dir = TempDir::new("zmqhashoff");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[zmq]\nendpoint = \"tcp://misp:50000\"\n\n\
+             [zmq.types]\nip-src = \"misp/ips\"\n",
+        ))
+        .unwrap();
+
+        let mapping = settings.zmq.unwrap().mapping;
+        assert_eq!(mapping.hashed_namespace, None);
+        assert!(mapping.store_values);
+    }
+
+    #[test]
+    fn zmq_can_record_digests_for_misp() {
+        let dir = TempDir::new("zmqhash");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            r#"
+[daemon]
+ssl = false
+
+[zmq]
+endpoint = "tcp://misp:50000"
+hashed_namespace = " misp/sha256 "
+
+[zmq.types]
+ip-src = "misp/ips"
+"#,
+        ))
+        .unwrap();
+
+        let mapping = settings.zmq.unwrap().mapping;
+        assert_eq!(mapping.hashed_namespace.as_deref(), Some("misp/sha256"));
+        assert!(mapping.store_values);
+    }
+
+    /// Only digests, and so nothing to map: an empty [zmq.types] and no
+    /// default_namespace is a complete configuration here.
+    #[test]
+    fn zmq_can_record_only_digests_with_no_types() {
+        let dir = TempDir::new("zmqhashonly");
+        let settings = Settings::load(&dir.write(
+            "c.toml",
+            r#"
+[daemon]
+ssl = false
+
+[zmq]
+endpoint = "tcp://misp:50000"
+hashed_namespace = "misp/sha256"
+store_values = false
+"#,
+        ))
+        .unwrap();
+
+        let mapping = settings.zmq.unwrap().mapping;
+        assert!(mapping.types.is_empty());
+        assert_eq!(mapping.default_namespace, None);
+        assert!(!mapping.store_values);
+    }
+
+    #[test]
+    fn zmq_store_values_false_needs_a_hashed_namespace() {
+        let dir = TempDir::new("zmqnohash");
+        let err = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[zmq]\nendpoint = \"tcp://misp:50000\"\n\
+             store_values = false\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("hashed_namespace"), "{err}");
+
+        // An empty one is no hashed namespace either.
+        let err = Settings::load(&dir.write(
+            "d.toml",
+            "[daemon]\nssl = false\n\n[zmq]\nendpoint = \"tcp://misp:50000\"\n\
+             hashed_namespace = \" \"\nstore_values = false\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("hashed_namespace"), "{err}");
+    }
+
+    #[test]
+    fn zmq_hashed_namespace_cannot_be_internal() {
+        let dir = TempDir::new("zmqhashinternal");
+        let err = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[zmq]\nendpoint = \"tcp://misp:50000\"\n\
+             hashed_namespace = \"_config/acl\"\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("hashed_namespace"), "{err}");
+        assert!(err.contains("_config/acl"), "{err}");
+    }
+
+    #[test]
+    fn zmq_store_values_false_is_refused_for_native() {
+        let dir = TempDir::new("zmqhashnative");
+        let err = Settings::load(&dir.write(
+            "c.toml",
+            "[daemon]\nssl = false\n\n[zmq]\nendpoint = \"tcp://misp:50000\"\n\
+             format = \"native\"\nhashed_namespace = \"misp/sha256\"\nstore_values = false\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("store_values"), "{err}");
     }
 
     #[test]

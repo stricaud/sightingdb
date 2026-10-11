@@ -232,6 +232,15 @@ tiers_file = "tiers.toml"
 # TTL on ingested sightings, and seconds between reconnection attempts.
 # ttl = 0
 # reconnect = 5
+# MISP publishes values in cleartext but looks them up by SHA-256, so
+# something has to hash them, and this ingest is the only place that sees
+# the cleartext. hashed_namespace records sha256(value) of every ingested
+# attribute there, hashed exactly as MISP does: the whole value, so
+# "1.2.3.4|80" is one string.
+# hashed_namespace = "misp/published"
+# false never writes the cleartext, only the digest. Requires
+# hashed_namespace; [zmq.types] may then be empty.
+# store_values = true
 #
 # [zmq.types]
 # ip-src = "misp/ips"

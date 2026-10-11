@@ -427,6 +427,10 @@ pub struct ZmqInfo {
     pub format: String,
     pub require_to_ids: bool,
     pub mapped_types: usize,
+    /// Where digests of ingested values go, for MISP to look up.
+    pub hashed_namespace: Option<String>,
+    /// `false` when only digests are recorded.
+    pub store_values: bool,
 }
 
 /// Check the caller holds an admin grant, handing back the key so the caller

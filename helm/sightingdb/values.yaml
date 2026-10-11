@@ -340,6 +340,11 @@ config:
     # TTL applied to ingested sightings; 0 leaves them permanent.
     ttl: 0
     reconnect: 5
+    # Also record sha256(value) of every ingested attribute here, which is
+    # what MISP's SightingDB connection looks up. Null turns it off.
+    hashed_namespace: null
+    # false records only the digest, never the value. Needs hashed_namespace.
+    store_values: true
     # MISP attribute type to namespace.
     types: {}
       # ip-src: misp/ips

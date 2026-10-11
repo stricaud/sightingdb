@@ -66,7 +66,7 @@ pub fn sanitize_tag(tag: &str) -> String {
 }
 
 /// Which MISP attribute types are ingested, and where they land.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mapping {
     /// MISP attribute type (`ip-src`, `md5`, ...) to namespace.
     pub types: HashMap<String, String>,
@@ -74,6 +74,26 @@ pub struct Mapping {
     pub default_namespace: Option<String>,
     /// Ingest only attributes MISP has flagged as actionable.
     pub require_to_ids: bool,
+    /// Where the SHA-256 of every ingested value is also recorded. This is
+    /// what MISP's own SightingDB connection queries: it never sends a value,
+    /// only `hash('sha256', $attribute['value'])`, against one namespace.
+    pub hashed_namespace: Option<String>,
+    /// Whether the value itself is written to its mapped namespace. `false`
+    /// keeps only the digest, so the database never holds the cleartext; the
+    /// configuration refuses it without a `hashed_namespace`.
+    pub store_values: bool,
+}
+
+impl Default for Mapping {
+    fn default() -> Self {
+        Self {
+            types: HashMap::new(),
+            default_namespace: None,
+            require_to_ids: false,
+            hashed_namespace: None,
+            store_values: true,
+        }
+    }
 }
 
 impl Mapping {
@@ -231,41 +251,116 @@ fn collect(node: &Value, mapping: &Mapping, context: &EventContext, out: &mut Ve
                 collect(item, mapping, context, out);
             }
         }
-        Value::Object(_) => {
-            if let Some(sighting) = attribute_to_sighting(node, mapping, context) {
-                out.push(sighting);
-            }
-        }
+        Value::Object(_) => attribute_to_sightings(node, mapping, context, out),
         _ => {}
     }
 }
 
-fn attribute_to_sighting(
+/// The plain sighting of an attribute and, when configured, its digest.
+fn attribute_to_sightings(
     attribute: &Value,
     mapping: &Mapping,
     context: &EventContext,
-) -> Option<Sighting> {
+    out: &mut Vec<Sighting>,
+) {
     if mapping.require_to_ids && !truthy(attribute.get("to_ids")) {
-        return None;
+        return;
     }
 
-    let misp_type = attribute.get("type")?.as_str()?;
-    let namespace = mapping.namespace_for(misp_type)?.to_string();
+    let Some(misp_type) = attribute.get("type").and_then(Value::as_str) else {
+        return;
+    };
 
     // Composite types (`filename|md5`) live in `value`; some publishers only
     // fill in `value1`.
-    let value = attribute
+    let Some(value) = attribute
         .get("value")
         .and_then(Value::as_str)
-        .or_else(|| attribute.get("value1").and_then(Value::as_str))?;
-    if value.is_empty() {
-        return None;
+        .or_else(|| attribute.get("value1").and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    let namespace = mapping.namespace_for(misp_type);
+    let hashed_namespace = mapping.hashed_namespace.as_deref();
+    // Neither write would happen, so do not bother building the tags. An
+    // unmapped type with `store_values = false` and no hashed namespace cannot
+    // happen — the configuration refuses it — but costs nothing to handle.
+    let plain = namespace.filter(|_| mapping.store_values);
+    if plain.is_none() && hashed_namespace.is_none() {
+        return;
     }
 
-    Some(
-        Sighting::once(namespace, value, timestamp_of(attribute))
-            .with_tags(tags_of(attribute, misp_type, context)),
-    )
+    let timestamp = timestamp_of(attribute);
+    let tags = tags_of(attribute, misp_type, context);
+
+    // The digest is written for *every* attribute that passes the filters
+    // above, mapped or not. MISP looks up whatever attribute it is showing,
+    // of any type, in the one namespace its connection names — so hashing only
+    // the mapped types would leave MISP blind to the rest for no gain. A
+    // digest gives nothing away about the value, and `[zmq.types]` still
+    // decides where (and whether) the cleartext goes. `require_to_ids` is a
+    // statement about which attributes are worth recording at all, so it
+    // applies to both.
+    //
+    // It is the digest of the whole `value` field as MISP holds it: for
+    // `ip-dst|port` that is `1.2.3.4|80`, never one half, because that is
+    // exactly the string MISP hashes when it asks. (A publisher that sends
+    // only `value1` gets that hashed instead; for a non-composite type it is
+    // the same string, and for a composite it is the best there is.)
+    let hashed = hashed_namespace.map(|hashed_namespace| {
+        Sighting::once(hashed_namespace, sha256_hex(value), timestamp).with_tags(hashed_tags(&tags))
+    });
+
+    if let Some(namespace) = plain {
+        out.push(Sighting::once(namespace, value, timestamp).with_tags(tags));
+    }
+    out.extend(hashed);
+}
+
+/// The lowercase hex SHA-256 of a value's UTF-8 bytes, which is what PHP's
+/// `hash('sha256', $value)` returns and therefore what MISP asks for.
+pub fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let digest = Sha256::digest(value.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        // Writing to a String cannot fail.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Tag families that are kept off a digest.
+///
+/// The point of storing only a digest is that the database cannot say what
+/// the value was, so anything that would say it for the digest goes:
+///
+/// - `description:` is the attribute's free-text comment, which routinely
+///   restates the value or enough of it ("C2 at 1.2.3.4", "dropper.exe").
+/// - `misp-event:` points at the MISP event holding the cleartext: anyone who
+///   can read that event can undo the hashing by following the pointer.
+/// - `stix-type:` would make the STIX export claim the digest *is* an
+///   `ipv4-addr` or a `domain-name` and build a pattern saying something
+///   false. The `misp-type:` tag stays, since a type is not a value.
+///
+/// Markings (`tlp:`), galaxy and taxonomy tags, and `misp-category:` describe
+/// the value rather than spell it, and the marking in particular must travel
+/// with whatever is shared.
+const VALUE_REVEALING_TAGS: &[&str] = &["description:", "misp-event:", "stix-type:"];
+
+fn hashed_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .filter(|tag| {
+            !VALUE_REVEALING_TAGS
+                .iter()
+                .any(|family| tag.starts_with(family))
+        })
+        .cloned()
+        .collect()
 }
 
 /// What MISP knows about an attribute, as tags.
@@ -404,6 +499,8 @@ mod tests {
             .collect(),
             default_namespace: None,
             require_to_ids: false,
+            hashed_namespace: None,
+            store_values: true,
         }
     }
 
@@ -820,6 +917,129 @@ mod tests {
             values,
             ["1.1.1.1", "d41d8cd98f00b204e9800998ecf8427e", "evil.com"]
         );
+    }
+
+    // -- digests for MISP --------------------------------------------------
+
+    fn hashing(store_values: bool) -> Mapping {
+        Mapping {
+            hashed_namespace: Some("misp/sha256".into()),
+            store_values,
+            ..mapping()
+        }
+    }
+
+    /// What PHP's `hash('sha256', '8.8.8.8')` returns, which is what MISP sends.
+    #[test]
+    fn the_digest_is_the_one_misp_asks_for() {
+        assert_eq!(
+            sha256_hex("8.8.8.8"),
+            "838c4c2573848f58e74332341a7ca6bc5cd86a8aec7d644137d53b4d597f10f5"
+        );
+    }
+
+    #[test]
+    fn a_hashed_namespace_records_the_digest_beside_the_value() {
+        let body = r#"{"Attribute": {"type": "ip-dst", "value": "8.8.8.8",
+                       "timestamp": "1600000000"}}"#;
+
+        let sightings = parse(body, &hashing(true)).unwrap();
+        assert_eq!(sightings.len(), 2, "{sightings:?}");
+        assert_eq!(sightings[0].namespace, "misp/ips");
+        assert_eq!(sightings[0].value, "8.8.8.8");
+        assert_eq!(sightings[1].namespace, "misp/sha256");
+        assert_eq!(
+            sightings[1].value,
+            "838c4c2573848f58e74332341a7ca6bc5cd86a8aec7d644137d53b4d597f10f5"
+        );
+        // Same timestamp handling as the plain write.
+        assert_eq!(sightings[1].timestamp, Some(1_600_000_000));
+    }
+
+    /// MISP hashes the whole `value` field, so a composite has to be hashed
+    /// whole too, not split.
+    #[test]
+    fn a_composite_value_is_hashed_whole() {
+        let mut mapping = hashing(true);
+        mapping
+            .types
+            .insert("ip-dst|port".into(), "misp/ips".into());
+        let body = r#"{"Attribute": {"type": "ip-dst|port", "value": "1.2.3.4|80",
+                       "value1": "1.2.3.4", "value2": "80"}}"#;
+
+        let sightings = parse(body, &mapping).unwrap();
+        let hashed: Vec<&Sighting> = sightings
+            .iter()
+            .filter(|s| s.namespace == "misp/sha256")
+            .collect();
+        assert_eq!(hashed.len(), 1);
+        assert_eq!(hashed[0].value, sha256_hex("1.2.3.4|80"));
+        assert_ne!(hashed[0].value, sha256_hex("1.2.3.4"));
+    }
+
+    #[test]
+    fn without_store_values_only_the_digest_is_written() {
+        let body = r#"{"Event": {"Attribute": [
+            {"type": "ip-dst", "value": "8.8.8.8"},
+            {"type": "domain", "value": "evil.com"}
+        ]}}"#;
+
+        let sightings = parse(body, &hashing(false)).unwrap();
+        assert_eq!(sightings.len(), 2, "{sightings:?}");
+        assert!(sightings.iter().all(|s| s.namespace == "misp/sha256"));
+        let values: Vec<&str> = sightings.iter().map(|s| s.value.as_str()).collect();
+        assert_eq!(values, [sha256_hex("8.8.8.8"), sha256_hex("evil.com")]);
+    }
+
+    /// MISP may look up any attribute it shows, so the digest is recorded for
+    /// types [zmq.types] does not map — while the cleartext still is not.
+    #[test]
+    fn unmapped_types_are_still_hashed() {
+        let body = r#"{"Attribute": {"type": "btc", "value": "1BvBMSEY"}}"#;
+
+        let sightings = parse(body, &hashing(true)).unwrap();
+        assert_eq!(
+            sightings,
+            vec![
+                Sighting::once("misp/sha256", sha256_hex("1BvBMSEY"), None)
+                    .with_tags(vec!["misp-type:btc".to_string()])
+            ]
+        );
+        // And without a hashed namespace, nothing changes.
+        assert!(parse(body, &mapping()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn to_ids_still_filters_the_digest() {
+        let mut mapping = hashing(true);
+        mapping.require_to_ids = true;
+        let body = r#"{"Attribute": {"type": "ip-dst", "value": "8.8.8.8", "to_ids": false}}"#;
+        assert!(parse(body, &mapping).unwrap().is_empty());
+    }
+
+    /// The digest is there so the value cannot be read back; a tag that spells
+    /// it out, or points at where it is spelled out, would defeat that.
+    #[test]
+    fn tags_that_reveal_the_value_are_not_carried_to_the_digest() {
+        let body = r#"{"Attribute": {"type": "ip-dst", "value": "8.8.8.8",
+                       "category": "Network activity", "event_id": 42,
+                       "comment": "C2 at 8.8.8.8",
+                       "Tag": [{"name": "tlp:amber"}]}}"#;
+
+        let sightings = parse(body, &hashing(true)).unwrap();
+        let plain = &sightings[0].tags;
+        let hashed = &sightings[1].tags;
+        assert!(plain.contains(&"description:C2 at 8.8.8.8".to_string()));
+
+        assert_eq!(
+            hashed,
+            &[
+                "misp-type:ip-dst",
+                "misp-category:Network activity",
+                "tlp:amber"
+            ]
+        );
+        assert!(!hashed.iter().any(|t| t.contains("8.8.8.8")), "{hashed:?}");
     }
 
     // -- native format -----------------------------------------------------
