@@ -1079,6 +1079,10 @@ fn load_tags(file: Option<&Path>) -> crate::tags::Vocabulary {
         return crate::tags::Vocabulary::seeded();
     }
     match std::fs::read_to_string(path).map(|text| crate::tags::Vocabulary::from_toml(&text)) {
+        // Taken as it is. The TLP labels are what a new installation is
+        // seeded with, not something re-imposed on every load: once this file
+        // exists it is whoever maintains it, and a label removed on purpose
+        // stays removed.
         Ok(Ok(vocabulary)) => vocabulary,
         Ok(Err(e)) => {
             log::error!(

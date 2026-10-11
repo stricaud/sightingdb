@@ -927,8 +927,20 @@ the most expensive thing the server does and would evict the working set to do
 it. A key that cannot read every namespace gets no counts at all, since a count
 would otherwise say what is in namespaces it has no access to.
 
-The TLP colours are MISP's own, from its `tlp` taxonomy, so a tag exported to
-MISP and back looks the same in both.
+A new installation is seeded with the five **TLP 2.0** labels — `tlp:clear`,
+`tlp:green`, `tlp:amber`, `tlp:amber+strict`, `tlp:red` — plus `tlp:white`,
+which 2.0 renamed to CLEAR, because sources still send it. CIRCL's public
+OSINT feed tags its events `tlp:white` *and* `tlp:clear`, so a real import
+carries both; WHITE is given CLEAR's colour, because that is what it means. A
+colour per family of SightingDB's own vocabulary comes with them.
+
+Seeded, not insisted upon. Once there is a `tags_file` the vocabulary is
+whoever maintains it: any of those can be recoloured or removed, and nothing
+puts them back — an install that only ever sees 2.0 can drop WHITE and it
+stays dropped.
+
+The colours are MISP's own, from its `tlp` taxonomy, which follows FIRST's — so
+a tag exported to MISP and back looks the same in both.
 
 ### `POST /_management/api/tags/vocabulary` — define a tag's colour
 
@@ -940,6 +952,14 @@ MISP and back looks the same in both.
 Answers with the whole table, so the interface need not ask again. Takes effect
 at once; needs a `tags_file`, which is machine-owned and rewritten whole. A
 name may not contain a comma, since a comma is what separates tags on a value.
+
+**Who may change it:** an `admin` key, or a key with read *and* write across
+all namespaces. The second because the vocabulary is about data rather than
+about the server — a key that can already write any tag onto any value is not
+meaningfully restrained by being unable to say what colour that tag is shown
+in. A key scoped to a subtree cannot: the vocabulary is server-wide, so
+changing it would reach past whatever that key was scoped to. Reading the table
+needs `admin` or read across all namespaces.
 
 ### `DELETE /_management/api/tags/vocabulary?tag=<tag>` — forget a colour
 

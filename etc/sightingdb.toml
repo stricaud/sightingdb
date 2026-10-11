@@ -131,8 +131,17 @@ acl_file = "acl.toml"
 #
 # A name ending in ":" is a family and colours everything beneath it, so
 # "stix-type:" covers stix-type:ipv4-addr and every other value of that key.
-# Without this setting, MISP's own TLP colours plus a colour per family of
-# SightingDB's vocabulary are used, and colours are read-only in the interface.
+#
+# A new installation is seeded with the five TLP 2.0 labels — clear, green,
+# amber, amber+strict, red — plus tlp:white, which 2.0 renamed to CLEAR,
+# because sources still send it: CIRCL's OSINT feed tags events with both.
+# WHITE is given CLEAR's colour, because that is what it means. A colour per
+# family of SightingDB's own vocabulary comes with them. After that this file
+# is yours: any of them can be recoloured or removed, and nothing puts them
+# back.
+#
+# Without this setting those colours are still used, but are read-only in the
+# interface.
 tags_file = "tags.toml"
 
 # Eviction needs somewhere to write, so it only happens when dbdir is set.

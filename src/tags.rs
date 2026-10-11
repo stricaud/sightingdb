@@ -57,39 +57,72 @@ pub struct Vocabulary {
     tags: BTreeMap<String, Tag>,
 }
 
-/// MISP's own TLP colours, and a colour per family of SightingDB's vocabulary.
+/// The TLP labels a new installation starts with.
 ///
-/// The TLP hex values are the ones in MISP's `tlp` taxonomy rather than
-/// anything chosen here, so a tag exported to MISP and back looks the same in
-/// both. The rest are families — see the module note — covering the tags the
-/// STIX export reads, which are the ones a user meets most.
-const SEED: &[(&str, &str, &str)] = &[
+/// Worth having out of the box: TLP is the one piece of tag vocabulary almost
+/// every source uses, and a marking shown in its own colour is the difference
+/// between seeing at a glance that a value is restricted and reading it as
+/// grey text among twenty others.
+///
+/// The five **TLP 2.0** labels, and then `tlp:white` — which 2.0 renamed to
+/// CLEAR — because feeds still send it. That is not hypothetical: CIRCL's
+/// public OSINT feed tags its events `tlp:white` *and* `tlp:clear`, so a real
+/// import carries both. Leaving WHITE out would mean a third of a feed's
+/// values arriving with an uncoloured marking, which is worse than carrying a
+/// label the standard has moved on from. It is given CLEAR's colour, because
+/// that is what it means.
+///
+/// Seeded, not enforced: once there is a `tags_file` the vocabulary is
+/// whoever maintains it, and any of these can be recoloured or removed — an
+/// install that only ever sees 2.0 can drop WHITE and it stays dropped.
+///
+/// The hex values are the ones in MISP's own `tlp` taxonomy, which follows
+/// FIRST's, so a tag exported to MISP and back looks the same in both. The
+/// descriptions are FIRST's definitions, shortened.
+pub const TLP: &[(&str, &str, &str)] = &[
     (
-        "tlp:red",
-        "#FF2B2B",
-        "Not for disclosure, restricted to participants only.",
-    ),
-    (
-        "tlp:amber",
-        "#FFC000",
-        "Limited disclosure, restricted to participants' organizations.",
-    ),
-    (
-        "tlp:amber+strict",
-        "#FFC000",
-        "Limited disclosure, restricted to participants' organization only.",
+        "tlp:clear",
+        "#FFFFFF",
+        "Recipients can spread this to the world; there is no limit on disclosure.",
     ),
     (
         "tlp:green",
         "#33FF00",
-        "Limited disclosure, restricted to the community.",
+        "Limited disclosure; recipients can spread this within their community.",
     ),
-    ("tlp:clear", "#FFFFFF", "Disclosure is not limited."),
+    (
+        "tlp:amber",
+        "#FFC000",
+        "Limited disclosure; recipients may share only on a need-to-know basis \
+         within their organization and its clients.",
+    ),
+    (
+        "tlp:amber+strict",
+        "#FFC000",
+        "Limited disclosure; recipients may share only on a need-to-know basis \
+         within their organization, and not with clients.",
+    ),
+    (
+        "tlp:red",
+        "#FF2B2B",
+        "For the eyes and ears of the named recipients only; no further disclosure.",
+    ),
+    // TLP 1.0. Kept because feeds still send it, and given CLEAR's colour
+    // because that is what it means.
     (
         "tlp:white",
         "#FFFFFF",
-        "Superseded by tlp:clear; kept because feeds still send it.",
+        "TLP 1.0's name for CLEAR, which replaced it in 2.0. Shown the same way; \
+         kept because sources still publish it.",
     ),
+];
+
+/// A colour per family of SightingDB's own vocabulary.
+///
+/// Seeded into a new installation alongside [`TLP`], and the file's to keep
+/// thereafter. Families — see the module note — because the tags they cover
+/// have an open set of values.
+const FAMILIES: &[(&str, &str, &str)] = &[
     (
         "stix-type:",
         "#7c3aed",
@@ -116,10 +149,12 @@ const SEED: &[(&str, &str, &str)] = &[
 ];
 
 impl Vocabulary {
-    /// The vocabulary a server starts with when no file has been written yet.
+    /// The vocabulary a new installation starts with: the TLP labels and this
+    /// program's own families.
     pub fn seeded() -> Self {
-        let tags = SEED
+        let tags = TLP
             .iter()
+            .chain(FAMILIES)
             .map(|(name, colour, description)| {
                 (
                     (*name).to_string(),
@@ -220,8 +255,16 @@ impl Vocabulary {
     }
 
     /// Forget a tag's presentation. Values keep the tag itself.
-    pub fn remove(&mut self, name: &str) -> bool {
-        self.tags.remove(name.trim()).is_some()
+    ///
+    /// Anything can go, the seeded TLP labels included: they are what a new
+    /// installation starts with, not something this program insists on. An
+    /// install that marks its data some other way should not have to look at
+    /// five rows it will never use.
+    pub fn remove(&mut self, name: &str) -> Result<(), String> {
+        if self.tags.remove(name.trim()).is_none() {
+            return Err("No such tag in the vocabulary.".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -390,14 +433,80 @@ colour = "not a colour"
     #[test]
     fn removing_a_tag_leaves_the_others() {
         let mut vocabulary = Vocabulary::seeded();
+        vocabulary.set("mine", "#123456", "").unwrap();
         let before = vocabulary.len();
-        assert!(vocabulary.remove("tlp:red"));
+
+        assert!(vocabulary.remove("mine").is_ok());
         assert!(
-            !vocabulary.remove("tlp:red"),
+            vocabulary.remove("mine").is_err(),
             "removing twice is not a change"
         );
         assert_eq!(vocabulary.len(), before - 1);
         assert!(vocabulary.get("tlp:green").is_some());
+    }
+
+    /// The five TLP 2.0 labels, and `tlp:white` for the feeds still sending
+    /// it.
+    #[test]
+    fn a_new_installation_is_seeded_with_every_tlp_label() {
+        let vocabulary = Vocabulary::seeded();
+        let labels: Vec<&str> = TLP.iter().map(|(name, _, _)| *name).collect();
+        assert_eq!(
+            labels,
+            [
+                "tlp:clear",
+                "tlp:green",
+                "tlp:amber",
+                "tlp:amber+strict",
+                "tlp:red",
+                "tlp:white",
+            ],
+            "the seeded set should be TLP 2.0 plus 1.0's WHITE"
+        );
+        for label in labels {
+            assert!(vocabulary.get(label).is_some(), "{label} is not shipped");
+        }
+    }
+
+    /// WHITE and CLEAR mean the same thing, so they are shown the same way.
+    /// A feed sending both — CIRCL's does — must not make one value look
+    /// differently marked from the next.
+    #[test]
+    fn white_is_shown_the_same_as_clear() {
+        let vocabulary = Vocabulary::seeded();
+        assert_eq!(
+            vocabulary.colour_of("tlp:white"),
+            vocabulary.colour_of("tlp:clear"),
+        );
+    }
+
+    /// Seeded, not insisted upon: anything can be removed, and nothing puts
+    /// it back.
+    #[test]
+    fn a_seeded_label_can_be_removed_for_good() {
+        let mut vocabulary = Vocabulary::seeded();
+        assert!(vocabulary.remove("tlp:red").is_ok());
+        assert!(vocabulary.get("tlp:red").is_none());
+
+        // Through a write and a read, which is the path a restart takes.
+        let reloaded = Vocabulary::from_toml(&vocabulary.to_toml()).expect("parses");
+        assert!(reloaded.get("tlp:red").is_none(), "it came back");
+        assert!(
+            reloaded.get("tlp:amber").is_some(),
+            "the others went with it"
+        );
+    }
+
+    /// Everything shipped survives a write and a read, which is what makes
+    /// the file the interface writes a usable starting point.
+    #[test]
+    fn the_shipped_vocabulary_round_trips_through_the_file() {
+        let shipped = Vocabulary::seeded();
+        let reloaded = Vocabulary::from_toml(&shipped.to_toml()).expect("valid TOML");
+        assert_eq!(reloaded, shipped);
+        for (name, colour, _) in TLP {
+            assert_eq!(reloaded.colour_of(name), Some(*colour), "{name}");
+        }
     }
 
     #[test]

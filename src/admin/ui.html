@@ -305,6 +305,11 @@
     <p class="muted" id="t-readonly"></p>
     <p class="muted">A tag is free text on a value, so this table decides only how one
        is <i>shown</i> — nothing here stops a feed writing a tag nobody has defined.
+       A new installation starts with the TLP labels and a colour per family of
+       SightingDB's own vocabulary; after that this table is yours, and any of them can
+       be recoloured or removed. <code>tlp:white</code> is there too: TLP 2.0 renamed
+       it to <code>tlp:clear</code>, but sources still send both, so it is shown the
+       same way rather than left uncoloured.
        A name ending in <code>:</code> is a family and colours everything under it,
        which is how an open set like <code>stix-type:ipv4-addr</code> can be coloured
        at all. Tags found on values but not defined here are listed too, greyed, so
@@ -1479,6 +1484,7 @@ function renderTags() {
       note.title = "Found on values but given no colour here.";
       name.append(note);
     }
+
 
     // How it actually renders, which is the whole reason for the table.
     const preview = document.createElement("td");

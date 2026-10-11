@@ -741,8 +741,25 @@ the longest family wins. It is also the shape of a MISP machine tag,
 `namespace:predicate`, so a whole MISP taxonomy can be given one colour by its
 namespace.
 
-The TLP colours are MISP's own, taken from its `tlp` taxonomy rather than
-chosen here, so a tag exported to MISP and back looks the same in both.
+A new installation is seeded with the five **TLP 2.0** labels —
+`tlp:clear`, `tlp:green`, `tlp:amber`, `tlp:amber+strict`, `tlp:red` — plus
+`tlp:white`, which 2.0 renamed to CLEAR, because sources still send it.
+CIRCL's public OSINT feed tags its events `tlp:white` *and* `tlp:clear`, so a
+real import carries both, and leaving WHITE out would mean a third of a feed's
+values arriving with an uncoloured marking. It is given CLEAR's colour,
+because that is what it means. A colour per family of SightingDB's own
+vocabulary comes with them. The colours are MISP's own, from its `tlp`
+taxonomy, which follows FIRST's, so a tag exported to MISP and back looks the
+same in both.
+
+Seeded, not insisted upon: once there is a `tags_file` the vocabulary is
+whoever maintains it. Any of those can be recoloured or removed, and nothing
+puts them back — an install that only ever sees TLP 2.0 can drop WHITE, and
+one that marks its data some other way need not keep any of them.
+
+Changing the table needs an `admin` key or one with read and write across all
+namespaces; a key scoped to a subtree cannot, since the vocabulary is
+server-wide and changing it would reach past that scope.
 
 Typing a tag offers the ones already in use, completing the entry after the
 last comma — the point being to type a tag the same way twice. A family is

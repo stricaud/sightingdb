@@ -1241,6 +1241,12 @@ paths:
         that rewrote it would destroy those comments. Takes effect at once,
         without a restart.
 
+        Needs an `admin` key, or a key with read *and* write across all
+        namespaces: a key that can already write any tag onto any value is not
+        meaningfully restrained by being unable to say what colour it is shown
+        in. A key scoped to a subtree cannot, since the vocabulary is
+        server-wide.
+
         A name ending in `:` defines a family. Answers with the whole table, so
         the interface need not ask again.
       requestBody:

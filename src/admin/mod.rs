@@ -464,6 +464,76 @@ fn require_admin<'a>(state: &SharedState, req: &'a HttpRequest) -> Result<&'a st
     }
 }
 
+/// A key allowed to see the tag vocabulary.
+///
+/// `admin`, or a key that can read every namespace. Wider than the editor
+/// check because the table is presentation — colours and descriptions — and
+/// because every edit answers with it: an `rw` key that could change a tag
+/// but not read the result back would be an odd thing to build.
+fn require_vocabulary_reader<'a>(
+    state: &SharedState,
+    req: &'a HttpRequest,
+) -> Result<&'a str, HttpResponse> {
+    let Some(header) = req.headers().get("Authorization") else {
+        return Err(HttpResponse::Unauthorized().json(Message::new("An API key is required.")));
+    };
+    let Ok(key) = header.to_str() else {
+        return Err(HttpResponse::BadRequest()
+            .json(Message::new("Authorization header is not valid UTF-8.")));
+    };
+
+    let acl = state.acl();
+    if acl.is_admin(key) || acl.can_read(key, "/") {
+        return Ok(key);
+    }
+    Err(HttpResponse::Forbidden().json(Message::new(
+        "Seeing how tags are shown needs an admin key, or read across all namespaces.",
+    )))
+}
+
+/// A key allowed to change the tag vocabulary.
+///
+/// `admin`, or read **and** write over the whole namespace tree. The second is
+/// there because the vocabulary is about data rather than about the server: a
+/// key that can already write any tag onto any value is not meaningfully
+/// restrained by being unable to say what colour that tag is shown in. A key
+/// scoped to a subtree is a different matter — the vocabulary is server-wide,
+/// so changing it reaches past whatever that key was scoped to.
+fn require_vocabulary_editor<'a>(
+    state: &SharedState,
+    req: &'a HttpRequest,
+) -> Result<&'a str, HttpResponse> {
+    let Some(header) = req.headers().get("Authorization") else {
+        return Err(HttpResponse::Unauthorized().json(Message::new("An API key is required.")));
+    };
+    let Ok(key) = header.to_str() else {
+        return Err(HttpResponse::BadRequest()
+            .json(Message::new("Authorization header is not valid UTF-8.")));
+    };
+
+    let acl = state.acl();
+    // "/" is the whole tree, which is what an unscoped `rw` grant covers.
+    if acl.is_admin(key) || (acl.can_read(key, "/") && acl.can_write(key, "/")) {
+        return Ok(key);
+    }
+
+    log::warn!(
+        "{}",
+        crate::handlers::refusal(
+            &crate::handlers::peer_of(req),
+            key,
+            acl.contains(key),
+            "change",
+            "the tag vocabulary",
+        )
+    );
+    Err(HttpResponse::Forbidden().json(Message::new(concat!(
+        "Changing how tags are shown needs an admin key, or read and write ",
+        "across all namespaces: the vocabulary is server-wide, so a key scoped ",
+        "to one subtree would be reaching past it."
+    ))))
+}
+
 /// Reaching the interface is not the same as being allowed to read the data in
 /// it: an `admin, r:feeds` key browses `feeds/*` and nothing else.
 fn require_read(state: &SharedState, key: &str, namespace: &str) -> Result<(), HttpResponse> {
@@ -1622,7 +1692,7 @@ pub struct TagsView {
 }
 
 pub async fn list_tags(state: State, req: HttpRequest) -> HttpResponse {
-    let caller = match require_admin(&state, &req) {
+    let caller = match require_vocabulary_reader(&state, &req) {
         Ok(key) => key.to_string(),
         Err(resp) => return resp,
     };
@@ -1791,7 +1861,7 @@ pub async fn define_tag(
     body: web::Json<TagDefinition>,
     req: HttpRequest,
 ) -> HttpResponse {
-    let caller = match require_admin(&state, &req) {
+    let caller = match require_vocabulary_editor(&state, &req) {
         Ok(key) => key.to_string(),
         Err(resp) => return resp,
     };
@@ -1832,7 +1902,7 @@ pub async fn undefine_tag(
     query: web::Query<TagQuery>,
     req: HttpRequest,
 ) -> HttpResponse {
-    let caller = match require_admin(&state, &req) {
+    let caller = match require_vocabulary_editor(&state, &req) {
         Ok(key) => key.to_string(),
         Err(resp) => return resp,
     };
@@ -1845,8 +1915,8 @@ pub async fn undefine_tag(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    if !vocabulary.remove(&query.tag) {
-        return HttpResponse::NotFound().json(Message::new("No such tag in the vocabulary."));
+    if let Err(e) = vocabulary.remove(&query.tag) {
+        return HttpResponse::NotFound().json(Message::new(e));
     }
     if let Err(resp) = save_tags(&state, vocabulary) {
         return resp;
@@ -3625,6 +3695,9 @@ mod tests {
         let st = tagged_state(&dir.0);
         let app = app!(st);
 
+        // A tag the vocabulary defines, which is what there is to undefine:
+        // one that is only *seen* on values has no definition to remove and
+        // answers 404.
         let resp = test::call_service(
             &app,
             test::TestRequest::delete()
@@ -3645,6 +3718,110 @@ mod tests {
             view.tags.contains("tlp:green"),
             "the tag was taken off the value: {}",
             view.tags
+        );
+    }
+
+    /// Removing a definition that was never there is a miss, not a success:
+    /// a tag only seen on values has no colour to forget.
+    #[actix_web::test]
+    async fn undefining_a_tag_that_was_only_seen_is_not_found() {
+        let dir = TempDir::new("tags-undefine-seen");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/_management/api/tags/vocabulary?tag=home-grown")
+                .insert_header(("Authorization", ADMIN))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A new installation ships every TLP label, 1.0's WHITE included: feeds
+    /// still send it, and an uncoloured marking is worse than an old one.
+    #[actix_web::test]
+    async fn a_new_installation_ships_the_tlp_labels() {
+        let dir = TempDir::new("tags-standard");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let body: Json =
+            test::read_body_json(get!(app, "/_management/api/tags", Some(ADMIN))).await;
+        for label in [
+            "tlp:clear",
+            "tlp:green",
+            "tlp:amber",
+            "tlp:amber+strict",
+            "tlp:red",
+            "tlp:white",
+        ] {
+            assert_eq!(row(&body, label)["defined"], true, "{label} is not shipped");
+        }
+        // WHITE and CLEAR mean the same thing and are shown the same way.
+        assert_eq!(
+            row(&body, "tlp:white")["colour"],
+            row(&body, "tlp:clear")["colour"]
+        );
+    }
+
+    /// And any of them can be removed, because they are a starting point
+    /// rather than something this program insists on. The tag stays on the
+    /// values; only its colour is forgotten.
+    #[actix_web::test]
+    async fn a_shipped_label_can_be_removed() {
+        let dir = TempDir::new("tags-remove-shipped");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/_management/api/tags/vocabulary?tag=tlp:red")
+                .insert_header(("Authorization", ADMIN))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(st.tags.read().unwrap().get("tlp:red").is_none());
+
+        // And it stays removed: nothing puts it back on the next load.
+        let written = std::fs::read_to_string(dir.0.join("tags.toml")).expect("the file");
+        assert!(!written.contains("tlp:red"), "{written}");
+        let reloaded = crate::tags::Vocabulary::from_toml(&written).expect("parses");
+        assert!(
+            reloaded.get("tlp:red").is_none(),
+            "a removed label came back when the file was read"
+        );
+        // The ones left alone are still there.
+        assert!(reloaded.get("tlp:amber").is_some());
+    }
+
+    /// A shipped label can be recoloured, and the change sticks.
+    #[actix_web::test]
+    async fn a_shipped_label_can_be_recoloured() {
+        let dir = TempDir::new("tags-standard-colour");
+        let st = tagged_state(&dir.0);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/tags/vocabulary")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({
+                    "name": "tlp:amber", "colour": "#abcdef",
+                    "description": "ours"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            st.tags.read().unwrap().colour_of("tlp:amber"),
+            Some("#abcdef")
         );
     }
 
@@ -3848,6 +4025,102 @@ mod tests {
              one-line pieces instead:\n{}",
             found.join("\n")
         );
+    }
+
+    /// Anyone with read and write across every namespace can change the
+    /// vocabulary, not only an admin.
+    ///
+    /// A key that can already write any tag onto any value is not
+    /// meaningfully restrained by being unable to say what colour that tag is
+    /// shown in.
+    #[actix_web::test]
+    async fn a_full_read_write_key_can_edit_the_vocabulary() {
+        let dir = TempDir::new("tags-rw");
+        let st = tagged_state(&dir.0);
+        st.acl
+            .write()
+            .unwrap()
+            .set("writer", parse_grants("rw").unwrap());
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/tags/vocabulary")
+                .insert_header(("Authorization", "writer"))
+                .set_json(serde_json::json!({"name": "ours", "colour": "#112233"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "an rw key was refused");
+        assert_eq!(st.tags.read().unwrap().colour_of("ours"), Some("#112233"));
+
+        // And it can remove one.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/_management/api/tags/vocabulary?tag=tlp:red")
+                .insert_header(("Authorization", "writer"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(st.tags.read().unwrap().get("tlp:red").is_none());
+    }
+
+    /// A key scoped to one subtree cannot: the vocabulary is server-wide, so
+    /// changing it reaches past whatever that key was scoped to.
+    #[actix_web::test]
+    async fn a_scoped_key_cannot_edit_the_vocabulary() {
+        let dir = TempDir::new("tags-scoped-write");
+        let st = tagged_state(&dir.0);
+        st.acl
+            .write()
+            .unwrap()
+            .set("narrow", parse_grants("rw:feeds").unwrap());
+        let app = app!(st);
+
+        for req in [
+            test::TestRequest::post()
+                .uri("/_management/api/tags/vocabulary")
+                .insert_header(("Authorization", "narrow"))
+                .set_json(serde_json::json!({"name": "ours", "colour": "#112233"}))
+                .to_request(),
+            test::TestRequest::delete()
+                .uri("/_management/api/tags/vocabulary?tag=tlp:red")
+                .insert_header(("Authorization", "narrow"))
+                .to_request(),
+        ] {
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+        // Nothing changed.
+        assert!(st.tags.read().unwrap().get("tlp:red").is_some());
+        assert!(st.tags.read().unwrap().get("ours").is_none());
+    }
+
+    /// A read-only key cannot either: changing how tags are shown is a
+    /// change.
+    #[actix_web::test]
+    async fn a_read_only_key_cannot_edit_the_vocabulary() {
+        let dir = TempDir::new("tags-readonly");
+        let st = tagged_state(&dir.0);
+        st.acl
+            .write()
+            .unwrap()
+            .set("reader", parse_grants("r").unwrap());
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/tags/vocabulary")
+                .insert_header(("Authorization", "reader"))
+                .set_json(serde_json::json!({"name": "ours", "colour": "#112233"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[actix_web::test]
