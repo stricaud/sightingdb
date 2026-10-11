@@ -128,8 +128,8 @@ flowchart LR
   M["<b>MISP sighting</b><br/>a person confirms<br/>an attribute<br/><br/>true / false positive<br/>expiration"]
   S["<b>SightingDB</b><br/>a machine counts<br/>an observation<br/><br/>count, first_seen<br/>last_seen, consensus"]
   X["<b>STIX sighting</b><br/>an organisation<br/>publishes having<br/>seen an indicator<br/><br/>count, first_seen<br/>last_seen"]
-  M -. "import<br/>(chapter 11)" .-> S
-  S -. "export<br/>(chapter 11)" .-> X
+  M -. "import" .-> S
+  S -. "export" .-> X
 ```
 
 The difference from MISP is the one worth holding on to. A MISP sighting is a
