@@ -2,23 +2,37 @@
   "theme": "base",
   "themeVariables": {
     "fontFamily": "\"trebuchet ms\", verdana, arial, sans-serif",
-    "fontSize": "15px",
-    "primaryColor": "#EEF0FA",
-    "primaryTextColor": "#01024C",
+    "primaryColor": "#E9ECF8",
     "primaryBorderColor": "#01024C",
-    "lineColor": "#5C6570",
-    "textColor": "#1B1F24",
-    "secondaryColor": "#FFF6D6",
+    "primaryTextColor": "#01024C",
+    "secondaryColor": "#FFF4CF",
     "secondaryBorderColor": "#8F7832",
     "secondaryTextColor": "#1B1F24",
     "tertiaryColor": "#F6F8FA",
     "tertiaryBorderColor": "#D9DEE4",
-    "noteBkgColor": "#FFF6D6",
-    "noteBorderColor": "#FDD32A",
-    "noteTextColor": "#1B1F24",
+    "tertiaryTextColor": "#1B1F24",
+    "lineColor": "#01024C",
+    "textColor": "#1B1F24",
+    "mainBkg": "#E9ECF8",
+    "nodeBorder": "#01024C",
+    "nodeTextColor": "#01024C",
+    "edgeLabelBackground": "#FFFFFF",
+    "labelTextColor": "#1B1F24",
     "clusterBkg": "#F6F8FA",
     "clusterBorder": "#D9DEE4",
-    "edgeLabelBackground": "#FFFFFF"
+    "noteBkgColor": "#FFF4CF",
+    "noteBorderColor": "#FDD32A",
+    "noteTextColor": "#1B1F24",
+    "actorBkg": "#E9ECF8",
+    "actorBorder": "#01024C",
+    "actorTextColor": "#01024C",
+    "actorLineColor": "#01024C",
+    "signalColor": "#01024C",
+    "signalTextColor": "#1B1F24",
+    "labelBoxBkgColor": "#FFF4CF",
+    "labelBoxBorderColor": "#8F7832",
+    "sequenceNumberColor": "#FFFFFF",
+    "fontSize": "24px"
   },
   "flowchart": {
     "curve": "basis",
@@ -26,10 +40,16 @@
     "nodeSpacing": 55,
     "rankSpacing": 60,
     "useMaxWidth": true,
-    "htmlLabels": true
+    "htmlLabels": true,
+    "wrappingWidth": 280
   },
   "sequence": {
-    "actorMargin": 60,
-    "noteMargin": 12
-  }
+    "actorMargin": 70,
+    "noteMargin": 14,
+    "messageFontSize": 18,
+    "actorFontSize": 18,
+    "noteFontSize": 17,
+    "useMaxWidth": true
+  },
+  "themeCSS": ".edgeLabel rect, .edgeLabel .label-container { rx: 3px; ry: 3px; } .cluster rect { rx: 6px; ry: 6px; }"
 }

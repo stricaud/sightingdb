@@ -204,6 +204,24 @@ img[src^="data:image/svg"], img[src$=".svg"] {
   max-height: 72vh;
   width: auto;
   max-width: 100%;
+  /* A diagram is drawn on a transparent background in one set of colours,
+     and reused for both themes. Its labels sit on the page rather than inside
+     a filled shape, so in dark mode they were dark text on a dark page —
+     invisible. Giving the picture its own light surface fixes that without
+     rendering every diagram twice, and reads as a figure on a card rather
+     than a hole in the page. */
+  background: #FFFFFF;
+  padding: 0.9rem 0.6rem;
+  border-radius: 6px;
+}
+
+@media (prefers-color-scheme: dark) {
+  img[src^="data:image/svg"], img[src$=".svg"] {
+    /* Not pure white against a near-black page: a little warmth so it sits
+       on the page instead of glaring off it. */
+    background: #F4F5F7;
+    box-shadow: 0 1px 12px rgb(0 0 0 / 45%);
+  }
 }
 
 /* A screenshot is a picture of a window, so it gets an edge; a diagram sits

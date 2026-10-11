@@ -11,7 +11,6 @@
 
 local cache = os.getenv("MERMAID_CACHE") or "build/diagrams"
 local config = os.getenv("MERMAID_CONFIG") or "style/mermaid.json"
-local css = os.getenv("MERMAID_CSS") or "style/mermaid.css"
 -- mermaid-cli drives a headless browser, which refuses to start as root
 -- without `--no-sandbox` — which is exactly what a CI container is. Set
 -- MERMAID_PUPPETEER to a file holding {"args": ["--no-sandbox"]} there, and
@@ -46,6 +45,22 @@ local function digest(text)
   return string.format("%08x", hash)
 end
 
+-- The theme is part of what a rendered diagram *is*, so it has to be part of
+-- the key. It was not, and a change to the colours or the label size left
+-- every cached picture in place: the build looked like it had worked and the
+-- book was unchanged.
+local function slurp(path)
+  local handle = io.open(path, "r")
+  if not handle then
+    return ""
+  end
+  local text = handle:read("*a")
+  handle:close()
+  return text
+end
+
+local theme = slurp(config)
+
 local function exists(path)
   local handle = io.open(path, "r")
   if handle then handle:close() return true end
@@ -62,7 +77,8 @@ function CodeBlock(block)
   -- The format is part of the key: the same diagram is cached once per
   -- output, so building the PDF does not throw away the SVG and back again.
   local extension = wanted_format()
-  local key = digest(block.text .. (block.attributes["caption"] or "")) .. "-" .. extension
+  local key = digest(block.text .. (block.attributes["caption"] or "") .. theme)
+    .. "-" .. extension
   local source = cache .. "/" .. key .. ".mmd"
   local image = cache .. "/" .. key .. "." .. extension
 
@@ -79,8 +95,11 @@ function CodeBlock(block)
     -- box of its own; the theme comes from the config so every diagram in the
     -- book is drawn in the logo's colours.
     local command = string.format(
-      "mmdc --quiet -i %s -o %s -b transparent -c %s -C %s%s 2>&1",
-      source, image, config, css,
+      -- No --cssFile: that styles the *page* mermaid-cli renders in, and
+      -- none of it reaches the extracted SVG. Anything that has to arrive in
+      -- the picture goes in `themeCSS` in the config instead, which does.
+      "mmdc --quiet -i %s -o %s -b transparent -c %s%s 2>&1",
+      source, image, config,
       puppeteer and (" -p " .. puppeteer) or ""
     )
     local pipe = io.popen(command)
@@ -121,7 +140,12 @@ function CodeBlock(block)
   end
 
   local caption = block.attributes["caption"]
-  local width = block.attributes["width"] or "88%"
+  -- Full width on screen, where the only limit is the text column; a little
+  -- inset in print, where a figure running to the margin looks like a mistake.
+  -- A diagram is drawn wider than the column either way and scaled down, so
+  -- every point of width here is type the reader gets back.
+  local width = block.attributes["width"]
+    or (FORMAT:match("latex") and "92%" or "100%")
   local height = block.attributes["height"] or "58%"
 
   if FORMAT:match("latex") then

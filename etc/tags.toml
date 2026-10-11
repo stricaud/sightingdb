@@ -1,0 +1,108 @@
+# The tag vocabulary a new installation starts with.
+#
+# This file is compiled into the binary, so editing it and rebuilding changes
+# what a fresh server ships with. Adding a default tag is editing this list,
+# not editing code.
+#
+# It is compiled in rather than read at startup because SightingDB has to be
+# able to run with no files at all — no configuration, no database directory,
+# nothing — and a default that lives at a path the binary has to guess is a
+# default that disappears the first time someone runs it from somewhere else.
+#
+# ---------------------------------------------------------------------------
+# This is a *starting point*, not a policy.
+#
+# It is used only when there is no tags_file yet. Once there is one, that file
+# is the vocabulary and this one is never consulted again: anything here can be
+# recoloured or removed, and nothing puts it back.
+#
+# So **to change the tags on a server you already run, edit its tags_file or
+# use the Tags page** — not this. Editing this changes what the *next* new
+# installation starts with.
+# ---------------------------------------------------------------------------
+#
+# A name ending in ':' is a family and colours everything beneath it, so
+# "stix-type:" covers stix-type:ipv4-addr and every other value of that key.
+# An exact entry beats its family, and the longest family wins.
+#
+# A colour is #rgb or #rrggbb. A name may contain anything except a comma,
+# which is what separates tags on a value.
+
+# ---------------------------------------------------------------------------
+# TLP
+#
+# The five TLP 2.0 labels, and then tlp:white — which 2.0 renamed to CLEAR —
+# because sources still send it. That is not hypothetical: CIRCL's public OSINT
+# feed tags its events tlp:white *and* tlp:clear, so a real import carries
+# both. Leaving WHITE out would mean a share of a feed's values arriving with
+# an uncoloured marking, which is worse than carrying a label the standard has
+# moved on from. It is given CLEAR's colour, because that is what it means.
+#
+# The hex values are the ones in MISP's own tlp taxonomy, which follows
+# FIRST's, so a tag exported to MISP and back looks the same in both. The
+# descriptions are FIRST's definitions, shortened.
+# ---------------------------------------------------------------------------
+
+[tags."tlp:clear"]
+colour = "#FFFFFF"
+description = "Recipients can spread this to the world; there is no limit on disclosure."
+
+[tags."tlp:green"]
+colour = "#33FF00"
+description = "Limited disclosure; recipients can spread this within their community."
+
+[tags."tlp:amber"]
+colour = "#FFC000"
+description = "Limited disclosure; recipients may share only on a need-to-know basis within their organization and its clients."
+
+[tags."tlp:amber+strict"]
+colour = "#FFC000"
+description = "Limited disclosure; recipients may share only on a need-to-know basis within their organization, and not with clients."
+
+[tags."tlp:red"]
+colour = "#FF2B2B"
+description = "For the eyes and ears of the named recipients only; no further disclosure."
+
+[tags."tlp:white"]
+colour = "#FFFFFF"
+description = "TLP 1.0's name for CLEAR, which replaced it in 2.0. Shown the same way; kept because sources still publish it."
+
+# ---------------------------------------------------------------------------
+# SightingDB's own vocabulary
+#
+# Families, because the tags they cover have an open set of values that could
+# not be enumerated here even in principle. These are the keys the STIX export
+# reads, which are the ones a user meets most.
+# ---------------------------------------------------------------------------
+
+[tags."stix-type:"]
+colour = "#7c3aed"
+description = "The STIX observable type this value exports as, overriding what it looks like."
+
+[tags."indicator-type:"]
+colour = "#2563eb"
+description = "The STIX indicator type, such as malicious-activity."
+
+[tags."confidence:"]
+colour = "#0891b2"
+description = "Confidence in the sighting, 0 to 100."
+
+[tags."identity:"]
+colour = "#059669"
+description = "Who reported the sighting."
+
+# ---------------------------------------------------------------------------
+# What the MISP importer writes
+# ---------------------------------------------------------------------------
+
+[tags."misp-type:"]
+colour = "#d97706"
+description = "The MISP attribute type imported."
+
+[tags."misp-category:"]
+colour = "#d97706"
+description = "The MISP attribute category imported."
+
+[tags."misp-event:"]
+colour = "#d97706"
+description = "The MISP event this came from."

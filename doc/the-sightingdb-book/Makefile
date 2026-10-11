@@ -15,6 +15,10 @@ CHAPTERS  := $(sort $(wildcard chapters/*.md))
 # which it did not until this line existed.
 IMAGES    := $(wildcard images/*)
 STYLE     := style/book.tex
+# The diagram theme is a prerequisite too: it decides what every rendered
+# diagram looks like, and changing it used to leave the book untouched because
+# make had nothing to notice.
+THEME     := style/mermaid.json
 META      := metadata.yaml
 FILTER    := tools/mermaid.lua
 BUILD     := build
@@ -26,7 +30,6 @@ ENGINE    ?= xelatex
 # rebuild only redraws what changed.
 export MERMAID_CACHE  := $(BUILD)/diagrams
 export MERMAID_CONFIG := style/mermaid.json
-export MERMAID_CSS    := style/mermaid.css
 # Only exported when it has a value. `export MERMAID_PUPPETEER` on its own
 # exports it as empty, which is not the same as unset to anything reading it.
 # Set it where the browser mermaid-cli drives needs --no-sandbox, which in
@@ -50,7 +53,7 @@ all: pdf
 
 pdf: $(BOOK).pdf
 
-$(BOOK).pdf: $(CHAPTERS) $(IMAGES) $(STYLE) $(META) $(FILTER) | $(MERMAID_CACHE)
+$(BOOK).pdf: $(CHAPTERS) $(IMAGES) $(STYLE) $(THEME) $(META) $(FILTER) | $(MERMAID_CACHE)
 	@command -v $(PANDOC) >/dev/null || { \
 	  echo "pandoc is not installed. brew install pandoc"; exit 1; }
 	@command -v $(ENGINE) >/dev/null || { \
@@ -69,7 +72,7 @@ $(BOOK).pdf: $(CHAPTERS) $(IMAGES) $(STYLE) $(META) $(FILTER) | $(MERMAID_CACHE)
 # on a web server with nothing beside it.
 html: $(BOOK).html
 
-$(BOOK).html: $(CHAPTERS) $(IMAGES) $(META) $(FILTER) style/book.css style/cover.html | $(MERMAID_CACHE)
+$(BOOK).html: $(CHAPTERS) $(IMAGES) $(THEME) $(META) $(FILTER) style/book.css style/cover.html | $(MERMAID_CACHE)
 	@command -v $(PANDOC) >/dev/null || { \
 	  echo "pandoc is not installed. brew install pandoc"; exit 1; }
 	@command -v mmdc >/dev/null || \

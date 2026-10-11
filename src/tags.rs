@@ -57,115 +57,43 @@ pub struct Vocabulary {
     tags: BTreeMap<String, Tag>,
 }
 
-/// The TLP labels a new installation starts with.
+/// The vocabulary a new installation starts with.
 ///
-/// Worth having out of the box: TLP is the one piece of tag vocabulary almost
-/// every source uses, and a marking shown in its own colour is the difference
-/// between seeing at a glance that a value is restricted and reading it as
-/// grey text among twenty others.
+/// Kept as TOML in `etc/tags.toml` rather than written out here, because
+/// adding a default tag should be editing a list rather than editing code —
+/// and because a list of colours and descriptions reads far better as the
+/// thing it is than as a table of Rust tuples.
 ///
-/// The five **TLP 2.0** labels, and then `tlp:white` — which 2.0 renamed to
-/// CLEAR — because feeds still send it. That is not hypothetical: CIRCL's
-/// public OSINT feed tags its events `tlp:white` *and* `tlp:clear`, so a real
-/// import carries both. Leaving WHITE out would mean a third of a feed's
-/// values arriving with an uncoloured marking, which is worse than carrying a
-/// label the standard has moved on from. It is given CLEAR's colour, because
-/// that is what it means.
+/// **Compiled in rather than read at startup.** SightingDB has to be able to
+/// run with no files at all — no configuration, no database directory,
+/// nothing — so a default that lives at a path the binary has to guess is a
+/// default that disappears the first time someone runs it from somewhere
+/// else. This way the file is the single source of truth and the binary still
+/// stands alone.
 ///
-/// Seeded, not enforced: once there is a `tags_file` the vocabulary is
-/// whoever maintains it, and any of these can be recoloured or removed — an
-/// install that only ever sees 2.0 can drop WHITE and it stays dropped.
-///
-/// The hex values are the ones in MISP's own `tlp` taxonomy, which follows
-/// FIRST's, so a tag exported to MISP and back looks the same in both. The
-/// descriptions are FIRST's definitions, shortened.
-pub const TLP: &[(&str, &str, &str)] = &[
-    (
-        "tlp:clear",
-        "#FFFFFF",
-        "Recipients can spread this to the world; there is no limit on disclosure.",
-    ),
-    (
-        "tlp:green",
-        "#33FF00",
-        "Limited disclosure; recipients can spread this within their community.",
-    ),
-    (
-        "tlp:amber",
-        "#FFC000",
-        "Limited disclosure; recipients may share only on a need-to-know basis \
-         within their organization and its clients.",
-    ),
-    (
-        "tlp:amber+strict",
-        "#FFC000",
-        "Limited disclosure; recipients may share only on a need-to-know basis \
-         within their organization, and not with clients.",
-    ),
-    (
-        "tlp:red",
-        "#FF2B2B",
-        "For the eyes and ears of the named recipients only; no further disclosure.",
-    ),
-    // TLP 1.0. Kept because feeds still send it, and given CLEAR's colour
-    // because that is what it means.
-    (
-        "tlp:white",
-        "#FFFFFF",
-        "TLP 1.0's name for CLEAR, which replaced it in 2.0. Shown the same way; \
-         kept because sources still publish it.",
-    ),
-];
-
-/// A colour per family of SightingDB's own vocabulary.
-///
-/// Seeded into a new installation alongside [`TLP`], and the file's to keep
-/// thereafter. Families — see the module note — because the tags they cover
-/// have an open set of values.
-const FAMILIES: &[(&str, &str, &str)] = &[
-    (
-        "stix-type:",
-        "#7c3aed",
-        "The STIX observable type this value exports as, overriding what it looks like.",
-    ),
-    (
-        "indicator-type:",
-        "#2563eb",
-        "The STIX indicator type, such as malicious-activity.",
-    ),
-    (
-        "confidence:",
-        "#0891b2",
-        "Confidence in the sighting, 0 to 100.",
-    ),
-    ("identity:", "#059669", "Who reported the sighting."),
-    ("misp-type:", "#d97706", "The MISP attribute type imported."),
-    (
-        "misp-category:",
-        "#d97706",
-        "The MISP attribute category imported.",
-    ),
-    ("misp-event:", "#d97706", "The MISP event this came from."),
-];
+/// It is used only when there is no `tags_file` yet. After that the file on
+/// disk is the vocabulary, and this is never consulted again.
+const SEED: &str = include_str!("../etc/tags.toml");
 
 impl Vocabulary {
-    /// The vocabulary a new installation starts with: the TLP labels and this
-    /// program's own families.
+    /// The vocabulary a new installation starts with, from [`SEED`].
+    ///
+    /// A malformed seed is a bug in the shipped file rather than anything a
+    /// deployment did, so it is reported and the server starts with an empty
+    /// vocabulary — tags still work, they are simply all shown in one colour.
+    /// Panicking here would mean a typo in a table of colours stopped a
+    /// database from starting. A test parses it so this cannot ship.
     pub fn seeded() -> Self {
-        let tags = TLP
-            .iter()
-            .chain(FAMILIES)
-            .map(|(name, colour, description)| {
-                (
-                    (*name).to_string(),
-                    Tag {
-                        colour: (*colour).to_string(),
-                        description: (*description).to_string(),
-                    },
-                )
-            })
-            .collect();
-        Self { tags }
+        match Self::from_toml(SEED) {
+            Ok(vocabulary) => vocabulary,
+            Err(e) => {
+                log::error!(
+                    "The built-in tag vocabulary (etc/tags.toml) will not parse: {e}. \
+                     Tags will all be shown in one colour."
+                );
+                Self::default()
+            }
+        }
     }
 
     /// Read a vocabulary file.
@@ -445,26 +373,42 @@ colour = "not a colour"
         assert!(vocabulary.get("tlp:green").is_some());
     }
 
+    /// The shipped file parses, and the server never starts with nothing
+    /// because of a typo in it.
+    ///
+    /// `seeded()` deliberately does not panic on a malformed seed — a bad
+    /// colour should not stop a database starting — which means a broken
+    /// `etc/tags.toml` would otherwise ship silently as "no colours at all".
+    /// This is what stops that.
+    #[test]
+    fn the_shipped_seed_file_parses() {
+        Vocabulary::from_toml(SEED).expect("etc/tags.toml does not parse");
+        assert!(
+            !Vocabulary::seeded().tags.is_empty(),
+            "a new installation would start with no vocabulary at all"
+        );
+    }
+
     /// The five TLP 2.0 labels, and `tlp:white` for the feeds still sending
-    /// it.
+    /// it. Asserted against the vocabulary rather than against however it
+    /// happens to be stored, so moving the list between a file and the code
+    /// cannot weaken the check.
     #[test]
     fn a_new_installation_is_seeded_with_every_tlp_label() {
         let vocabulary = Vocabulary::seeded();
-        let labels: Vec<&str> = TLP.iter().map(|(name, _, _)| *name).collect();
-        assert_eq!(
-            labels,
-            [
-                "tlp:clear",
-                "tlp:green",
-                "tlp:amber",
-                "tlp:amber+strict",
-                "tlp:red",
-                "tlp:white",
-            ],
-            "the seeded set should be TLP 2.0 plus 1.0's WHITE"
-        );
-        for label in labels {
+        for label in [
+            "tlp:clear",
+            "tlp:green",
+            "tlp:amber",
+            "tlp:amber+strict",
+            "tlp:red",
+            "tlp:white",
+        ] {
             assert!(vocabulary.get(label).is_some(), "{label} is not shipped");
+        }
+        // And the families this program's own vocabulary needs.
+        for family in ["stix-type:", "misp-type:", "indicator-type:"] {
+            assert!(vocabulary.get(family).is_some(), "{family} is not shipped");
         }
     }
 
@@ -504,9 +448,11 @@ colour = "not a colour"
         let shipped = Vocabulary::seeded();
         let reloaded = Vocabulary::from_toml(&shipped.to_toml()).expect("valid TOML");
         assert_eq!(reloaded, shipped);
-        for (name, colour, _) in TLP {
-            assert_eq!(reloaded.colour_of(name), Some(*colour), "{name}");
-        }
+        // The marking colours in particular, since a tag exported to MISP and
+        // back should look the same in both.
+        assert_eq!(reloaded.colour_of("tlp:red"), Some("#FF2B2B"));
+        assert_eq!(reloaded.colour_of("tlp:amber"), Some("#FFC000"));
+        assert_eq!(reloaded.colour_of("tlp:green"), Some("#33FF00"));
     }
 
     #[test]
