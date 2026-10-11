@@ -1,0 +1,154 @@
+% ---------------------------------------------------------------------------
+% The SightingDB book: typography and colour.
+%
+% The palette is taken from the logo — a gold star on a deep night sky — so
+% the book looks like the thing it documents. Sampled from
+% doc/sightingdb-logo3_256.png rather than chosen by eye.
+% ---------------------------------------------------------------------------
+\usepackage{xcolor}
+
+\definecolor{night}{HTML}{01024C}      % the sky: headings, rules, the cover
+\definecolor{deepnight}{HTML}{00042C}  % its darkest corner
+\definecolor{star}{HTML}{FDD32A}       % the star: accents, bullets
+\definecolor{dimstar}{HTML}{8F7832}    % gold dark enough to read on paper
+\definecolor{ink}{HTML}{1B1F24}        % body text, same as the interface
+\definecolor{quiet}{HTML}{5C6570}      % captions and asides
+\definecolor{rule}{HTML}{D9DEE4}
+\definecolor{shell}{HTML}{F6F8FA}      % the background of a command block
+
+% --- headings --------------------------------------------------------------
+\usepackage{titlesec}
+
+% A chapter opens with its number in the gold of the star, large and quiet,
+% above the title. Nothing else on the line.
+\titleformat{\chapter}[display]
+  {\normalfont\sffamily\bfseries\color{night}}
+  {\hfill\fontsize{64}{64}\selectfont\color{star}\thechapter}
+  {-10pt}
+  {\fontsize{26}{30}\selectfont\raggedright}
+  [\vspace{4pt}{\color{star}\titlerule[2pt]}]
+\titlespacing*{\chapter}{0pt}{0pt}{28pt}
+
+\titleformat{\section}
+  {\normalfont\sffamily\bfseries\Large\color{night}}{\thesection}{0.6em}{}
+\titleformat{\subsection}
+  {\normalfont\sffamily\bfseries\large\color{night}}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}
+  {\normalfont\sffamily\bfseries\color{dimstar}}{}{0em}{}
+
+% --- code ------------------------------------------------------------------
+% Commands and responses are the substance of this book, so they are set in a
+% tinted panel with a gold edge rather than left as loose monospace.
+\usepackage{fancyvrb}
+\usepackage{tcolorbox}
+\tcbuselibrary{breakable,skins}
+
+\renewenvironment{Shaded}{
+  \begin{tcolorbox}[
+    breakable, enhanced, boxrule=0pt, arc=2pt,
+    left=8pt, right=8pt, top=6pt, bottom=6pt,
+    colback=shell, colframe=shell,
+    borderline west={2pt}{0pt}{star},
+    before skip=10pt, after skip=10pt,
+  ]
+}{\end{tcolorbox}}
+
+% --- links, tables, lists --------------------------------------------------
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=night, urlcolor=dimstar, citecolor=night,
+  pdfborder={0 0 0},
+}
+
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+
+% Gold bullets, so a list belongs to the same book as the headings.
+\usepackage{enumitem}
+\setlist[itemize,1]{label=\textcolor{star}{\rule[1.5pt]{4pt}{4pt}}, leftmargin=1.4em}
+\setlist[itemize,2]{label=\textcolor{dimstar}{\textbullet}}
+\setlist[enumerate,1]{label=\textcolor{dimstar}{\bfseries\arabic*.}, leftmargin=1.6em}
+
+% --- running heads ---------------------------------------------------------
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE]{\small\sffamily\color{quiet}\leftmark}
+\fancyhead[RO]{\small\sffamily\color{quiet}\rightmark}
+\fancyfoot[C]{\small\sffamily\color{quiet}\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{rule}\leaders\hrule height \headrulewidth\hfill}}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\sffamily\color{quiet}\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+% --- block quotes become notes ---------------------------------------------
+% A quote in this book is always an aside, so it is drawn as one.
+\renewenvironment{quote}{
+  \begin{tcolorbox}[
+    breakable, enhanced, boxrule=0pt, arc=2pt,
+    left=10pt, right=10pt, top=8pt, bottom=8pt,
+    colback=night!4, colframe=night!4,
+    borderline west={3pt}{0pt}{night},
+    before skip=10pt, after skip=10pt,
+  ]
+}{\end{tcolorbox}}
+
+% Tighten the gap tables leave behind, and let long ones break.
+\setlength{\LTpre}{8pt}
+\setlength{\LTpost}{8pt}
+
+% ---------------------------------------------------------------------------
+% The title page.
+%
+% Built here rather than left to pandoc's default, so the logo, the quote and
+% the palette appear together. The star on its night sky above the title is
+% the whole identity of the thing in one image.
+% ---------------------------------------------------------------------------
+\usepackage{graphicx}
+
+% The epigraph lives here rather than in metadata.yaml: pandoc passes `title`
+% and `author` through to LaTeX but not fields of our own invention, and a
+% half-working indirection is worse than a string in the file that uses it.
+\newcommand{\bookepigraph}{%
+  Once is happenstance. Twice is coincidence.\\
+  The third time it's enemy action.}
+\newcommand{\bookepigraphsource}{%
+  Auric Goldfinger, in Ian Fleming's \textit{Goldfinger}, 1959}
+\newcommand{\bookepigraphnote}{SightingDB does the counting.}
+
+\makeatletter
+\renewcommand{\maketitle}{%
+  \begin{titlepage}
+  \thispagestyle{empty}
+  \centering
+  \vspace*{\fill}
+
+  \IfFileExists{images/logo.png}{%
+    \includegraphics[width=42mm]{images/logo.png}\\[9mm]
+  }{}
+
+  {\sffamily\bfseries\fontsize{46}{50}\selectfont\color{night}\@title\par}
+
+  \vspace{3mm}
+  {\color{star}\rule{46mm}{2.5pt}}
+  \vspace{13mm}
+
+  % The quote is the subtitle, set as the epigraph it is: it explains the
+  % thing better than a line of explanatory text would.
+  \begin{minipage}{0.78\textwidth}
+    \centering
+    {\itshape\fontsize{14.5}{21}\selectfont\color{ink}\bookepigraph\par}
+    \vspace{5mm}
+    {\sffamily\footnotesize\color{quiet}--- \bookepigraphsource\par}
+    \vspace{10mm}
+    {\sffamily\small\color{dimstar}\bookepigraphnote\par}
+  \end{minipage}
+
+  \vspace*{\fill}
+  {\sffamily\color{quiet}\@author\par}
+  \vspace{2mm}
+  {\sffamily\footnotesize\color{quiet}\@date\par}
+  \end{titlepage}
+}
+\makeatother

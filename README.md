@@ -18,6 +18,22 @@ SightingDB is designed to scale writing and reading. There is no global lock: na
 
 The database is held in memory and snapshotted to disk (see `dbdir` below). Set no `dbdir` to run purely in memory.
 
+The book
+=======
+
+There is a book: [doc/the-sightingdb-book](doc/the-sightingdb-book), one
+markdown file per chapter, which builds into a PDF or a single self-contained
+HTML page.
+
+	$ cd doc/the-sightingdb-book
+	$ make          # the PDF
+	$ make html     # one HTML file, diagrams and screenshots included
+
+It is the long-form version of this README: what a sighting is and how the
+word is used in MISP and STIX, a quick start, the configuration files, the API
+with curl, the Python client, galaxies and how to run one, the management
+interface with screenshots, STIX and MISP, and a reference chapter.
+
 Getting started
 ===============
 

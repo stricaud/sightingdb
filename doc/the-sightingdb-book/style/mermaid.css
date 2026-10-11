@@ -1,0 +1,6 @@
+/* Deliberately light on overrides.
+   mermaid measures a label's width with one font and the renderer draws it
+   with another, so anything that makes the text wider than measured — bold
+   above all — clips it inside its box. Weight is set in the theme's own
+   font settings instead, where the measurement sees it. */
+.edgeLabel { font-size: 13px; }

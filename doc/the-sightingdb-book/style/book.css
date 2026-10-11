@@ -1,0 +1,235 @@
+/* The SightingDB book, on screen.
+ *
+ * The same palette as the PDF — a gold star on a deep night sky, sampled from
+ * the logo — and the same idea of what a page should look like: wide margins,
+ * one column, code in a tinted panel with a gold edge.
+ */
+
+:root {
+  --night: #01024C;
+  --deepnight: #00042C;
+  --star: #FDD32A;
+  --dimstar: #8F7832;
+  --ink: #1B1F24;
+  --quiet: #5C6570;
+  --rule: #D9DEE4;
+  --shell: #F6F8FA;
+  --page: #FFFFFF;
+  --measure: 46rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #E6E9EC;
+    --quiet: #9AA4AF;
+    --rule: #2B3138;
+    --shell: #161A20;
+    --page: #0F1216;
+    --night: #AFC0FF;
+    --dimstar: #E3C25F;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0 auto;
+  padding: 3rem 1.25rem 6rem;
+  max-width: var(--measure);
+  background: var(--page);
+  color: var(--ink);
+  font: 17px/1.65 Palatino, "Palatino Linotype", Georgia, serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* --- the cover ---------------------------------------------------------- */
+
+/* pandoc writes its own title block from the metadata. The metadata is still
+   wanted — it is where the PDF's title page and this page's <title> come from
+   — but the cover below replaces what it draws, so it is hidden rather than
+   removed. */
+#title-block-header { display: none; }
+
+
+.cover {
+  text-align: center;
+  padding: 2rem 0 3.5rem;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: 3rem;
+}
+.cover img { width: 150px; height: auto; border-radius: 10px; }
+.cover h1 {
+  font: 700 3.6rem/1 "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: var(--night);
+  margin: 1.6rem 0 0.6rem;
+  border: 0;
+}
+.cover .bar {
+  width: 10rem; height: 3px; background: var(--star);
+  margin: 0 auto 2.2rem; border-radius: 2px;
+}
+.cover blockquote {
+  border: 0; background: none; padding: 0; margin: 0 auto;
+  max-width: 32rem; font-style: italic; font-size: 1.15rem; color: var(--ink);
+}
+.cover .attribution { font: 0.85rem/1.5 "Helvetica Neue", sans-serif; color: var(--quiet); margin-top: 0.9rem; }
+.cover .note { font: 0.95rem/1.5 "Helvetica Neue", sans-serif; color: var(--dimstar); margin-top: 1.8rem; }
+
+/* --- headings ----------------------------------------------------------- */
+
+h1, h2, h3, h4 {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: var(--night);
+  line-height: 1.25;
+  margin: 2.6rem 0 0.9rem;
+}
+h1 {
+  font-size: 2.1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 2px solid var(--star);
+  margin-top: 4rem;
+}
+h1:first-of-type { margin-top: 0; }
+h2 { font-size: 1.45rem; }
+h3 { font-size: 1.15rem; }
+h4 { font-size: 1rem; color: var(--dimstar); }
+
+/* The chapter number pandoc writes into the heading. */
+h1 .header-section-number { color: var(--star); margin-right: 0.5rem; }
+h2 .header-section-number,
+h3 .header-section-number { color: var(--dimstar); margin-right: 0.4rem; }
+
+/* --- the table of contents ---------------------------------------------- */
+
+#TOC {
+  background: var(--shell);
+  border-left: 3px solid var(--star);
+  border-radius: 4px;
+  padding: 1.2rem 1.4rem;
+  margin: 0 0 3.5rem;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 0.95rem;
+}
+#TOC > ul { margin: 0; padding-left: 1.1rem; }
+#TOC ul ul { font-size: 0.92em; color: var(--quiet); }
+#TOC li { margin: 0.18rem 0; }
+#TOC a { color: var(--night); text-decoration: none; }
+#TOC a:hover { text-decoration: underline; }
+
+/* --- text --------------------------------------------------------------- */
+
+p { margin: 0 0 1.1rem; }
+a { color: var(--night); text-decoration-color: var(--star); text-underline-offset: 2px; }
+a:hover { color: var(--dimstar); }
+strong { color: var(--night); }
+
+ul, ol { margin: 0 0 1.2rem; padding-left: 1.4rem; }
+li { margin: 0.3rem 0; }
+ul { list-style: none; }
+ul > li::before {
+  content: "";
+  display: inline-block;
+  width: 5px; height: 5px;
+  background: var(--star);
+  margin: 0 0.7rem 0.18rem -1.2rem;
+  vertical-align: middle;
+}
+ul ul > li::before { background: var(--dimstar); }
+ol > li::marker { color: var(--dimstar); font-weight: 700; }
+
+/* --- code --------------------------------------------------------------- */
+
+code {
+  font-family: Menlo, "SF Mono", Consolas, monospace;
+  font-size: 0.86em;
+  background: var(--shell);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--shell);
+  border-left: 3px solid var(--star);
+  border-radius: 0 4px 4px 0;
+  padding: 0.9rem 1.1rem;
+  margin: 1.2rem 0;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+pre code { background: none; padding: 0; font-size: 0.82rem; }
+
+/* --- notes -------------------------------------------------------------- */
+
+blockquote {
+  margin: 1.4rem 0;
+  padding: 0.9rem 1.2rem;
+  background: color-mix(in srgb, var(--night) 5%, var(--page));
+  border-left: 4px solid var(--night);
+  border-radius: 0 4px 4px 0;
+}
+blockquote p:last-child { margin-bottom: 0; }
+
+/* --- tables ------------------------------------------------------------- */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.4rem 0;
+  font-size: 0.95rem;
+}
+th, td {
+  text-align: left;
+  padding: 0.5rem 0.7rem;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+thead th {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: var(--night);
+  border-bottom: 2px solid var(--night);
+}
+tbody tr:last-child td { border-bottom: 1px solid var(--night); }
+td code { white-space: nowrap; }
+
+/* --- figures ------------------------------------------------------------ */
+
+img { max-width: 100%; height: auto; display: block; margin: 1.6rem auto; }
+
+/* A diagram is scaled to the width of the text, which is right for a wide
+   one and absurd for a tall one: a top-to-bottom flowchart three times
+   taller than it is wide would fill three screens. Capping the height and
+   letting the width follow keeps both readable. */
+img[src^="data:image/svg"], img[src$=".svg"] {
+  max-height: 72vh;
+  width: auto;
+  max-width: 100%;
+}
+
+/* A screenshot is a picture of a window, so it gets an edge; a diagram sits
+   on the page like type does, and gets none. */
+img[src$=".png"], img[src^="data:image/png"] {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  box-shadow: 0 2px 10px rgb(1 2 76 / 8%);
+}
+
+figure { margin: 1.8rem 0; }
+figcaption {
+  font: 0.88rem/1.5 "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: var(--quiet);
+  text-align: center;
+  margin-top: 0.6rem;
+}
+
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+
+/* --- printing from the browser ------------------------------------------ */
+
+@media print {
+  body { max-width: none; padding: 0; font-size: 11pt; }
+  h1 { page-break-before: always; }
+  h1:first-of-type { page-break-before: avoid; }
+  pre, blockquote, table, figure { page-break-inside: avoid; }
+  #TOC { page-break-after: always; }
+}

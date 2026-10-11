@@ -1,0 +1,31 @@
+---
+title: "SightingDB"
+author: "Sebastien Tricaud"
+date: "SightingDB 0.7"
+rights: "MIT"
+lang: en-GB
+documentclass: book
+classoption:
+  - oneside
+papersize: a4
+geometry:
+  - top=25mm
+  - bottom=25mm
+  - inner=28mm
+  - outer=24mm
+fontsize: 11pt
+linestretch: 1.08
+colorlinks: true
+toc: true
+toc-depth: 2
+numbersections: true
+secnumdepth: 2
+links-as-notes: false
+# A monospace face that is narrow enough for an 80-column curl command and
+# still legible at 9pt, which most of this book depends on.
+monofont: "Menlo"
+monofontoptions:
+  - Scale=0.86
+mainfont: "Palatino"
+sansfont: "Helvetica Neue"
+...
