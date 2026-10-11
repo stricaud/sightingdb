@@ -202,21 +202,48 @@ impl Galaxy {
         self.max_hops
     }
 
-    /// Every peer, as a snapshot.
+    /// The peers this server will use, as a snapshot.
+    ///
+    /// **Disabled peers are not in it.** That is deliberately the default
+    /// reading of "the peers": every path that sends something somewhere goes
+    /// through here or through [`holders`](Self::holders), so disabling a peer
+    /// takes it out of routing, catch-up, gossip, consensus rebuilds and
+    /// health probes at once, without each of those having to remember to
+    /// check. The two places that must see a disabled peer — the view that
+    /// shows it, and the file it is written to — ask for
+    /// [`all_peers`](Self::all_peers) and say why.
     pub fn peers(&self) -> Vec<Peer> {
+        self.peers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|peer| peer.enabled)
+            .cloned()
+            .collect()
+    }
+
+    /// Every peer, disabled ones included.
+    ///
+    /// For showing the galaxy and for writing the peers file. Not for
+    /// deciding where anything goes — see [`peers`](Self::peers).
+    pub fn all_peers(&self) -> Vec<Peer> {
         self.peers
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
-    /// Peers that store `namespace`, in configured order.
+    /// Enabled peers that store `namespace`, in configured order.
+    ///
+    /// A disabled peer is not a holder: nothing is sent to it, and a namespace
+    /// only it held is out of reach — which is what taking a node out of
+    /// service means.
     pub fn holders(&self, namespace: &str) -> Vec<Peer> {
         self.peers
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .filter(|peer| peer.stores.holds(namespace))
+            .filter(|peer| peer.enabled && peer.stores.holds(namespace))
             .cloned()
             .collect()
     }
@@ -284,7 +311,8 @@ impl Galaxy {
     /// does not reshuffle itself between refreshes.
     pub fn health(&self) -> Vec<PeerHealth> {
         let health = self.health.read().unwrap_or_else(PoisonError::into_inner);
-        self.peers()
+        // Every peer, because a disabled one still has a row to show.
+        self.all_peers()
             .iter()
             .map(|peer| {
                 health
@@ -597,7 +625,10 @@ impl Galaxy {
     /// The peers that belong in the peers file: everything the interface
     /// added, and nothing the main configuration declared.
     pub fn editable_peers(&self) -> Vec<Peer> {
-        self.peers()
+        // `all_peers`, emphatically: this is what the peers file is rewritten
+        // from, and leaving disabled peers out would delete them the moment
+        // one was disabled — turning "stop using it" into "forget it".
+        self.all_peers()
             .into_iter()
             .filter(|peer| !self.is_fixed(&peer.url))
             .collect()
@@ -620,6 +651,7 @@ impl Galaxy {
             url: peer.url.trim().trim_end_matches('/').to_string(),
             key: peer.key.trim().to_string(),
             stores: peer.stores,
+            enabled: peer.enabled,
         };
         if !(peer.url.starts_with("http://") || peer.url.starts_with("https://")) {
             return Err(AddPeer::Invalid(
@@ -683,12 +715,37 @@ impl Galaxy {
         removed
     }
 
+    /// Take a peer out of service, or put it back.
+    ///
+    /// Returns the peer as it now stands, or `None` if there is no such peer.
+    /// Setting it to what it already is succeeds and changes nothing, so a
+    /// toggle pressed twice is not an error.
+    ///
+    /// Health is forgotten when a peer is disabled, because nothing will probe
+    /// it any more and a remembered "online" would be a claim this server
+    /// stopped checking. It starts unprobed when re-enabled.
+    pub fn set_enabled(&self, url: &str, enabled: bool) -> Option<Peer> {
+        let url = url.trim().trim_end_matches('/');
+        let mut peers = self.peers.write().unwrap_or_else(PoisonError::into_inner);
+        let peer = peers.iter_mut().find(|known| known.url == url)?;
+        peer.enabled = enabled;
+        let updated = peer.clone();
+        drop(peers);
+
+        self.health
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(url);
+        Some(updated)
+    }
+
     /// Replace a peer's key or namespace list, keeping its place in the order.
     pub fn update_peer(&self, peer: Peer) -> Option<Peer> {
         let peer = Peer {
             url: peer.url.trim().trim_end_matches('/').to_string(),
             key: peer.key.trim().to_string(),
             stores: peer.stores,
+            enabled: peer.enabled,
         };
         if peer.key.is_empty() {
             return None;
@@ -1903,6 +1960,7 @@ mod tests {
                     url: (*url).to_string(),
                     key: "k".to_string(),
                     stores: crate::db::StoragePolicy::everything(),
+                    enabled: true,
                 })
                 .collect(),
             max_hops: 4,
@@ -1939,6 +1997,7 @@ mod tests {
                     url: "https://added:9999".to_string(),
                     key: "k".to_string(),
                     stores: crate::db::StoragePolicy::everything(),
+                    enabled: true,
                 },
                 "127.0.0.1:9999",
             )

@@ -255,7 +255,12 @@
          written into <code>[galaxy] peers</code> in the configuration are shown here
          but not editable: that file is yours to maintain and this interface does not
          rewrite it. <b>Holds</b> must agree with what the peer itself stores; it is
-         declared rather than discovered so a peer key can stay narrow.</p>
+         declared rather than discovered so a peer key can stay narrow.
+         <b>Disable</b> keeps a peer — its address, its key, what it holds — and sends
+         it nothing at all: no forwarded request, no catch-up, no health probe. It is
+         for taking a node out of service without having to find its key again to put
+         it back. A namespace only a disabled peer held is out of reach while it is
+         off, which is what taking it out of service means.</p>
     </div>
   </section>
 
@@ -1965,7 +1970,14 @@ function renderPeers() {
     // "not asked yet" is not "offline", and the two must not look the same.
     const health = peer.health || {};
     const condition = document.createElement("td");
-    if (!health.probed) {
+    if (peer.enabled === false) {
+      // Said first and said plainly. Nothing probes a disabled peer, so
+      // whatever health it last had is not an answer to "is it up?" — and
+      // showing it as offline would read as a fault rather than a choice.
+      condition.textContent = "disabled";
+      condition.className = "muted";
+      condition.title = "Kept, but nothing is sent to it: no requests, no catch-up, no probes.";
+    } else if (!health.probed) {
       condition.textContent = "not probed yet";
       condition.className = "muted";
     } else if (health.online) {
@@ -2011,19 +2023,32 @@ function renderPeers() {
       edit.type = "button";
       edit.textContent = "Edit";
       edit.onclick = () => openPeerForm(peer);
+
+      // Taking a node out of service without forgetting how to reach it.
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.textContent = peer.enabled === false ? "Enable" : "Disable";
+      toggle.title = peer.enabled === false
+        ? "Start using this peer again"
+        : "Keep it, but send it nothing";
+      toggle.onclick = () => setPeerEnabled(peer.url, peer.enabled === false);
+
       const remove = document.createElement("button");
       remove.type = "button";
       remove.textContent = "Remove";
       remove.onclick = () => removePeer(peer.url);
-      actions.append(edit, " ", remove);
+      actions.append(edit, " ", toggle, " ", remove);
     }
 
+    if (peer.enabled === false) tr.style.opacity = ".55";
     tr.append(url, holds, condition, version, seen, actions);
     rows.append(tr);
   }
 
+  const off = view.peers.filter((p) => p.enabled === false).length;
   $("p-count").textContent = view.peers.length
-    ? `${view.peers.length} peer(s)` : "none yet";
+    ? `${view.peers.length} peer(s)` + (off ? `, ${off} disabled` : "")
+    : "none yet";
   $("p-note").textContent = view.note || "";
   $("p-new").disabled = !view.editable;
 }
@@ -2072,6 +2097,22 @@ async function savePeer() {
     setError(e.message);
   } finally {
     $("p-save").disabled = false;
+  }
+}
+
+/** Take a peer out of service, or put it back. */
+async function setPeerEnabled(url, enabled) {
+  // No confirmation for enabling, and none for disabling either: it is
+  // reversible with the same button, and nothing stored is touched.
+  try {
+    state.peers = await api("/_management/api/galaxy/peers/enabled", "POST",
+      { url, enabled });
+    setError("");
+    renderPeers();
+    // A disabled peer leaves the graph's routing picture, so it is redrawn.
+    loadGalaxy();
+  } catch (e) {
+    setError(e.message);
   }
 }
 

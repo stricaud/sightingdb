@@ -3357,6 +3357,7 @@ mod tests {
                 url: "http://127.0.0.1:1".to_string(),
                 key: "k".to_string(),
                 stores: crate::db::StoragePolicy::everything(),
+                enabled: true,
             }],
             max_hops: 4,
             peers_file: None,
@@ -3405,6 +3406,7 @@ mod tests {
                 } else {
                     crate::db::StoragePolicy::from_prefixes(stores)
                 },
+                enabled: true,
             }],
             max_hops: 4,
             peers_file: None,
@@ -3743,6 +3745,7 @@ mod tests {
                 url: "http://127.0.0.1:1".to_string(),
                 key: "k".to_string(),
                 stores: crate::db::StoragePolicy::everything(),
+                enabled: true,
             }],
             max_hops: 4,
             peers_file: None,
@@ -3918,6 +3921,7 @@ mod tests {
                 url: "http://127.0.0.1:1".to_string(),
                 key: "k".to_string(),
                 stores: crate::db::StoragePolicy::everything(),
+                enabled: true,
             }],
             max_hops: 4,
             peers_file: None,
@@ -3969,6 +3973,7 @@ mod tests {
                 key: "k".to_string(),
                 // Holds only `feeds`, so `other` is nobody's.
                 stores: crate::db::StoragePolicy::from_prefixes(["feeds"]),
+                enabled: true,
             }],
             max_hops: 4,
             peers_file: None,
@@ -4925,6 +4930,7 @@ mod tests {
             "/_management/api/tags",
             "/_management/api/tags/vocabulary",
             "/_management/api/galaxy/peers",
+            "/_management/api/galaxy/peers/enabled",
             "/_management/api/tier",
             "/_management/api/keys",
             "/_management/api/keys/drift",

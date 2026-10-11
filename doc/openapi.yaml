@@ -1348,6 +1348,12 @@ paths:
                           description: >-
                             Declared in the configuration file, so read-only
                             here.
+                        enabled:
+                          type: boolean
+                          description: >-
+                            Whether this server will use it. A disabled peer
+                            is kept and reached for nothing: no forwarded
+                            request, no catch-up, no health probe.
                         health: { $ref: "#/components/schemas/PeerHealth" }
                   editable:
                     type: boolean
@@ -1444,6 +1450,56 @@ paths:
           description: >-
             Declared in the configuration file, or no `peers_file` is
             configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+
+  /_management/api/galaxy/peers/enabled:
+    post:
+      tags: [management, galaxy]
+      summary: Take a peer out of service, or put it back
+      description: |
+        The peer is **kept** — its address, its key, what it holds — and this
+        server sends it nothing at all: no forwarded request, no catch-up, no
+        gossip, not even a health probe. For taking a node out of service
+        without having to find its key again to put it back.
+
+        A namespace only that peer held is then out of reach, and reads of it
+        answer `421`. That is what taking it out of service means, rather than
+        a side effect of it.
+
+        Its own route rather than a field on `PUT`, because `PUT` needs the key
+        and the key is never read back: a toggle should not mean retyping a
+        credential to change something unrelated to it. For the same reason,
+        changing a peer's key or namespaces leaves it disabled if it was.
+
+        Idempotent. The state is written to the `peers_file`, so it survives a
+        restart.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, enabled]
+              properties:
+                url:
+                  type: string
+                  example: "https://node-b.example:9999"
+                enabled: { type: boolean }
+      responses:
+        "200":
+          description: The peer list, as the GET above returns it
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No such peer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "409":
+          description: >-
+            Declared in the configuration file — set `enabled = false` on it
+            there instead — or no `peers_file` is configured.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Message" }

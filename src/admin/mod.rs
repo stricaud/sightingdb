@@ -709,6 +709,9 @@ pub struct PeerRow {
     /// Whether this peer came from the configuration file, and so cannot be
     /// changed here.
     pub fixed: bool,
+    /// Whether this server will use it. A disabled peer is kept and reached
+    /// for nothing: no forwarded request, no catch-up, no health probe.
+    pub enabled: bool,
     pub health: crate::galaxy::PeerHealth,
 }
 
@@ -751,12 +754,16 @@ pub async fn list_peers(state: State, req: HttpRequest) -> HttpResponse {
         .map(|known| (known.url.clone(), known))
         .collect();
 
+    // Every peer, disabled ones included: a peer taken out of service still
+    // has a row, and hiding it would make "disabled" indistinguishable from
+    // "removed" in the one place you would go to put it back.
     let peers = galaxy
-        .peers()
+        .all_peers()
         .into_iter()
         .map(|peer| PeerRow {
             namespaces: (!peer.stores.stores_everything()).then(|| peer.stores.prefixes().to_vec()),
             fixed: galaxy.is_fixed(&peer.url),
+            enabled: peer.enabled,
             health: health
                 .get(&peer.url)
                 .cloned()
@@ -885,7 +892,20 @@ async fn save_peer(
         .filter(|list| !list.is_empty())
         .map(|list| list.as_slice());
 
-    let peer = match crate::config::validated_peer(&change.url, &change.key, namespaces) {
+    // Added enabled, and an edit keeps whatever it was: a `PUT` that changed
+    // the key should not quietly put a peer back into service.
+    let enabled = state
+        .galaxy
+        .as_ref()
+        .and_then(|galaxy| {
+            galaxy
+                .all_peers()
+                .into_iter()
+                .find(|known| known.url == change.url.trim().trim_end_matches('/'))
+        })
+        .is_none_or(|known| known.enabled);
+
+    let peer = match crate::config::validated_peer(&change.url, &change.key, namespaces, enabled) {
         Ok(peer) => peer,
         Err(e) => return HttpResponse::BadRequest().json(Message::new(e)),
     };
@@ -964,6 +984,67 @@ pub async fn delete_peer(
     }
     log::info!("Peer '{}' removed by '{caller}'", query.url);
     list_peers(state, req).await
+}
+
+/// `POST /_management/api/galaxy/peers/enabled` — take a peer out of service,
+/// or put it back.
+///
+/// Its own route rather than a field on `PUT`, because that needs the key —
+/// which is never read back, so a toggle would mean retyping a credential to
+/// change something unrelated to it.
+///
+/// Idempotent: setting it to what it already is succeeds and changes nothing,
+/// so a button pressed twice, or a script run twice, is not an error.
+pub async fn set_peer_enabled(
+    state: State,
+    body: web::Json<PeerEnabled>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let caller = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = peers_file(&state) {
+        return resp;
+    }
+    let Some(galaxy) = state.galaxy.as_ref() else {
+        return HttpResponse::Conflict().json(Message::new("This server has no galaxy."));
+    };
+
+    let change = body.into_inner();
+    if galaxy.is_fixed(&change.url) {
+        return HttpResponse::Conflict().json(Message::new(format!(
+            concat!(
+                "{} is declared in the configuration file, so disabling it here would ",
+                "not last: it would come back at the next restart. Set enabled = false ",
+                "on it in [galaxy] peers instead."
+            ),
+            change.url
+        )));
+    }
+    if galaxy.set_enabled(&change.url, change.enabled).is_none() {
+        return HttpResponse::NotFound().json(Message::new("No such peer."));
+    }
+    if let Err(resp) = save_peers(&state) {
+        return resp;
+    }
+
+    log::info!(
+        "Peer '{}' {} by '{caller}'",
+        change.url,
+        if change.enabled {
+            "put back into service"
+        } else {
+            "taken out of service"
+        }
+    );
+    list_peers(state, req).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PeerEnabled {
+    url: String,
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2250,6 +2331,10 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
             "/_management/api/galaxy/peers",
             web::delete().to(delete_peer),
         )
+        .route(
+            "/_management/api/galaxy/peers/enabled",
+            web::post().to(set_peer_enabled),
+        )
         .route("/_management/api/rejections", web::get().to(rejections))
         .route(
             "/_management/api/rejections",
@@ -2906,6 +2991,7 @@ mod tests {
                 url: "http://from-the-file:9999".to_string(),
                 key: "k".to_string(),
                 stores: crate::db::StoragePolicy::everything(),
+                enabled: true,
             }],
             peers_file: Some(dir.join("peers.toml")),
             fixed: vec!["http://from-the-file:9999".to_string()],
@@ -3278,6 +3364,257 @@ mod tests {
             st.tags.read().unwrap().colour_of("home-grown"),
             Some("#aa33cc")
         );
+    }
+
+    /// A disabled peer is kept and is sent nothing.
+    ///
+    /// Both halves matter. Sent nothing, or disabling did not do anything;
+    /// kept, or it is just a slower way of removing it — and the point is to
+    /// be able to put it back without finding its key again.
+    #[actix_web::test]
+    async fn a_disabled_peer_is_kept_and_sent_nothing() {
+        let dir = TempDir::new("peers-disable");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://added:9999", "key": "secret"})
+        );
+        let galaxy = st.galaxy.as_ref().unwrap();
+        assert!(
+            galaxy
+                .holders("feeds/ips")
+                .iter()
+                .any(|p| p.url == "http://added:9999"),
+            "it should be a holder before being disabled"
+        );
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/galaxy/peers/enabled")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"url": "http://added:9999", "enabled": false}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Nothing is routed to it any more.
+        assert!(
+            !galaxy
+                .holders("feeds/ips")
+                .iter()
+                .any(|p| p.url == "http://added:9999"),
+            "a disabled peer is still being forwarded to"
+        );
+        // And nothing else reaches for it either: catch-up, gossip and the
+        // health poller all read `peers()`.
+        assert!(
+            !galaxy.peers().iter().any(|p| p.url == "http://added:9999"),
+            "a disabled peer is still in the list the background tasks use"
+        );
+
+        // But it is still there, with its key, and still listed.
+        assert!(
+            galaxy
+                .all_peers()
+                .iter()
+                .any(|p| p.url == "http://added:9999" && p.key == "secret"),
+            "the peer was forgotten rather than disabled"
+        );
+        let body: Json = test::read_body_json(resp).await;
+        let row = body["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["url"] == "http://added:9999")
+            .expect("still listed");
+        assert_eq!(row["enabled"], false);
+    }
+
+    /// Disabling it must survive a restart, which means it has to be written
+    /// to the peers file — and the peer must still be *in* that file, which is
+    /// the trap: the file is rewritten from the editable peers, and leaving
+    /// disabled ones out would delete them.
+    #[actix_web::test]
+    async fn a_disabled_peer_stays_in_the_peers_file() {
+        let dir = TempDir::new("peers-disable-file");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://added:9999", "key": "secret"})
+        );
+        test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/galaxy/peers/enabled")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"url": "http://added:9999", "enabled": false}))
+                .to_request(),
+        )
+        .await;
+
+        let written = std::fs::read_to_string(dir.0.join("peers.toml")).expect("the file");
+        assert!(
+            written.contains("http://added:9999"),
+            "disabling the peer deleted it from the file: {written}"
+        );
+        assert!(
+            written.contains("secret"),
+            "its key went with it: {written}"
+        );
+        assert!(
+            written.contains("enabled = false"),
+            "it would come back enabled: {written}"
+        );
+
+        // And the file reads back as a disabled peer.
+        let reloaded: crate::config::PeersFile = toml::from_str(&written).expect("parses");
+        let entry = reloaded
+            .peers
+            .iter()
+            .find(|p| p.url == "http://added:9999")
+            .expect("in the file");
+        assert_eq!(entry.enabled, Some(false));
+    }
+
+    /// Enabling it again puts it back, and the toggle is idempotent.
+    #[actix_web::test]
+    async fn enabling_a_peer_puts_it_back() {
+        let dir = TempDir::new("peers-enable");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://added:9999", "key": "secret"})
+        );
+        let toggle =
+            |enabled: bool| serde_json::json!({"url": "http://added:9999", "enabled": enabled});
+        let send = |body: serde_json::Value| {
+            test::TestRequest::post()
+                .uri("/_management/api/galaxy/peers/enabled")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(body)
+                .to_request()
+        };
+
+        test::call_service(&app, send(toggle(false))).await;
+        // Twice: a button pressed again is not an error.
+        let resp = test::call_service(&app, send(toggle(false))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = test::call_service(&app, send(toggle(true))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            st.galaxy
+                .as_ref()
+                .unwrap()
+                .holders("feeds/ips")
+                .iter()
+                .any(|p| p.url == "http://added:9999"),
+            "enabling it did not put it back into routing"
+        );
+
+        let written = std::fs::read_to_string(dir.0.join("peers.toml")).unwrap();
+        assert!(
+            !written.contains("enabled = false"),
+            "it would come back disabled: {written}"
+        );
+    }
+
+    /// Changing a peer's key must not quietly put a disabled one back into
+    /// service: those are two different decisions.
+    #[actix_web::test]
+    async fn editing_a_disabled_peer_leaves_it_disabled() {
+        let dir = TempDir::new("peers-edit-disabled");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        peer!(
+            app,
+            post,
+            serde_json::json!({"url": "http://added:9999", "key": "first"})
+        );
+        test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/galaxy/peers/enabled")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"url": "http://added:9999", "enabled": false}))
+                .to_request(),
+        )
+        .await;
+
+        let resp = peer!(
+            app,
+            put,
+            serde_json::json!({"url": "http://added:9999", "key": "rotated"})
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: Json = test::read_body_json(resp).await;
+        let row = body["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["url"] == "http://added:9999")
+            .expect("listed");
+        assert_eq!(
+            row["enabled"], false,
+            "rotating the key put the peer back into service: {body}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_configured_peer_cannot_be_disabled_here() {
+        let dir = TempDir::new("peers-disable-fixed");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/galaxy/peers/enabled")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"url": "http://from-the-file:9999", "enabled": false}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: Json = test::read_body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("enabled = false"),
+            "the refusal should say how to do it instead: {body}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn disabling_a_peer_that_is_not_there_is_not_found() {
+        let dir = TempDir::new("peers-disable-missing");
+        let st = peered_state(&dir.0);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/_management/api/galaxy/peers/enabled")
+                .insert_header(("Authorization", ADMIN))
+                .set_json(serde_json::json!({"url": "http://nowhere:9999", "enabled": false}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// Removing a colour must not remove the tag from the values, which would

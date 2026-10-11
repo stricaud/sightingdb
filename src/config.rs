@@ -154,6 +154,18 @@ pub struct Peer {
     /// that it can be the narrowest thing that does the job. The cost is that
     /// it must agree with the peer's own `[storage] namespaces`.
     pub stores: crate::db::StoragePolicy,
+    /// Whether this server will use the peer at all.
+    ///
+    /// A disabled peer is kept — its address, its key, what it holds — and
+    /// nothing is sent to it: no forwarded request, no catch-up, no gossip,
+    /// not even a health probe. It is for taking a node out of service
+    /// without forgetting how to reach it, which is otherwise a matter of
+    /// removing it and getting the key back out of wherever it was written
+    /// down.
+    ///
+    /// True unless something says otherwise, so every existing configuration
+    /// and peers file means what it meant before.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +332,8 @@ struct RawPeer {
     /// What the peer stores. Absent means everything — a full mirror, which is
     /// the common case and the one a reader should assume.
     namespaces: Option<Vec<String>>,
+    /// Absent means enabled. See [`Peer::enabled`].
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -638,6 +652,7 @@ pub fn validated_peer(
     url: &str,
     key: &str,
     namespaces: Option<&[String]>,
+    enabled: bool,
 ) -> std::result::Result<Peer, String> {
     let url = url.trim().trim_end_matches('/').to_string();
     let key = key.trim().to_string();
@@ -673,7 +688,12 @@ pub fn validated_peer(
              mirror, or name what it holds."
         ));
     }
-    Ok(Peer { url, key, stores })
+    Ok(Peer {
+        url,
+        key,
+        stores,
+        enabled,
+    })
 }
 
 /// The shape of the peers file the management interface writes.
@@ -689,6 +709,8 @@ pub struct FilePeer {
     pub key: String,
     #[serde(default)]
     pub namespaces: Option<Vec<String>>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 impl PeersFile {
@@ -714,6 +736,11 @@ impl PeersFile {
                     .map(|p| format!("\"{p}\""))
                     .collect();
                 out.push_str(&format!("namespaces = [{}]\n", list.join(", ")));
+            }
+            // Written only when it is off, since absent means on — so the
+            // file stays quiet about the ordinary case.
+            if !peer.enabled {
+                out.push_str("enabled = false\n");
             }
             out.push('\n');
         }
@@ -755,7 +782,12 @@ fn load_file_peers(file: Option<&Path>) -> Vec<Peer> {
     };
     let mut peers = Vec::new();
     for entry in parsed.peers {
-        match validated_peer(&entry.url, &entry.key, entry.namespaces.as_deref()) {
+        match validated_peer(
+            &entry.url,
+            &entry.key,
+            entry.namespaces.as_deref(),
+            entry.enabled.unwrap_or(true),
+        ) {
             Ok(peer) => peers.push(peer),
             Err(e) => log::error!("in {}: {e}", path.display()),
         }
@@ -770,8 +802,13 @@ impl RawGalaxy {
 
         let mut peers: Vec<Peer> = Vec::new();
         for raw in self.peers {
-            let peer = validated_peer(&raw.url, &raw.key, raw.namespaces.as_deref())
-                .map_err(|e| anyhow::anyhow!("[galaxy] {e}, in {}", path.display()))?;
+            let peer = validated_peer(
+                &raw.url,
+                &raw.key,
+                raw.namespaces.as_deref(),
+                raw.enabled.unwrap_or(true),
+            )
+            .map_err(|e| anyhow::anyhow!("[galaxy] {e}, in {}", path.display()))?;
             if peers.iter().any(|known| known.url == peer.url) {
                 bail!(
                     "[galaxy] lists peer '{}' twice, in {}",

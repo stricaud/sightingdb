@@ -964,6 +964,7 @@ the editor stays usable while a peer is down.
 	             "last_seen":1791670776,"latency_ms":0,"version":"0.6.1",
 	             "error":null,"failures":0,"catching_up":false}},
 	  {"url":"http://127.0.0.1:19842","namespaces":["feeds"],"fixed":false,
+	   "enabled":true,
 	   "health":{"url":"http://127.0.0.1:19842","online":false,"probed":false,
 	             "last_seen":0,"latency_ms":null,"version":null,"error":null,
 	             "failures":0,"catching_up":false}}],
@@ -1000,6 +1001,31 @@ in the order. An upsert would mean that typing an address that already exists
 silently replaces its key, and that key is the one thing bounding what this
 server may do there. Its own address is refused; a loop between two routers is
 not, because cascading is legitimate and the hop count is what makes it safe.
+
+### `POST /_management/api/galaxy/peers/enabled` — take a peer out of service
+
+	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
+	    -X POST http://127.0.0.1:9999/_management/api/galaxy/peers/enabled \
+	    -d '{"url":"https://node-b.example:9999","enabled":false}'
+
+The peer is **kept** — its address, its key, what it holds — and this server
+sends it nothing at all: no forwarded request, no catch-up, no gossip, not even
+a health probe. It is for taking a node out of service without having to find
+its key again to put it back, which is otherwise what removing it costs.
+
+A namespace only that peer held is then out of reach, and reads of it answer
+`421`. That is what taking it out of service means rather than a side effect of
+it.
+
+Its own route rather than a field on `PUT`, because `PUT` needs the key and the
+key is never read back — a toggle should not mean retyping a credential to
+change something unrelated to it. For the same reason, changing a peer's key or
+namespaces leaves it disabled if it was: those are two different decisions.
+
+Idempotent, so a button pressed twice or a script run twice is not an error.
+The state is written to the `peers_file`, so it survives a restart. A peer
+declared in `[galaxy] peers` answers `409`: set `enabled = false` on it there
+instead.
 
 ### `DELETE /_management/api/galaxy/peers?url=<url>` — remove a peer
 

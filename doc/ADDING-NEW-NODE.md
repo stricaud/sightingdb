@@ -201,6 +201,29 @@ The key is required even when only `namespaces` changes, because it is never
 read back: a peer key is a credential the load balancer holds, and a topology
 view is not a reason to hand it out.
 
+Taking one out of service without removing it:
+
+	$ curl -H 'Authorization: <lb admin key>' \
+	    -X POST https://lb.example:9999/_management/api/galaxy/peers/enabled \
+	    -H 'Content-Type: application/json' \
+	    -d '{"url": "https://new-node.example:9999", "enabled": false}'
+
+The peer is kept — address, key, namespaces — and this server sends it nothing
+at all: no forwarded request, no catch-up, no gossip, not even a health probe.
+Use it when a node is going down for maintenance, or when you want to stop
+sending it data without having to find its key again to put it back. `Disable`
+and `Enable` in the Galaxy page are the same call.
+
+It is a separate call from `PUT` on purpose: `PUT` needs the key, and the key
+is never read back, so a toggle would mean retyping a credential to change
+something unrelated to it. For the same reason, rotating a peer's key leaves it
+disabled if it was — those are two different decisions.
+
+**A namespace only that peer held is out of reach while it is off**, and reads
+of it answer `421`. That is what taking a node out of service means, so check
+first that something else holds what it holds — the `Holds` column is there for
+this.
+
 Removing:
 
 	$ curl -H 'Authorization: <lb admin key>' -X DELETE \
@@ -261,6 +284,8 @@ When it does not work
 | `400 ... has no key` | The key is what bounds what this server may do there; there is no default. |
 | Added, but `online: false` with `probed: true` | The address is wrong, the node is down, or TLS is being rejected — the `error` field says which. For a galaxy of self-signed instances set `verify_tls = false`. |
 | Added and online, but reads of it `404` | It is empty and has no peers to catch up from. See [Give the new node peers of its own](#give-the-new-node-peers-of-its-own). |
+| Shown as `disabled`, and nothing reaches it | Somebody turned it off. `Enable` puts it back; nothing was lost. |
+| `421` on a namespace that exists | Every peer holding it is disabled or removed. Nowhere in reach stores it. |
 | Writes to it refused in a bulk response | The key you gave the load balancer is narrower than the namespaces being written, or the node's `[storage]` does not hold them. The per-item error says which. |
 
 A galaxy to try all of this against, in four containers:

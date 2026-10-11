@@ -166,6 +166,12 @@ the old.
 reply from that node. It is about the server, not about any value, and has
 nothing to do with a value's own `last_seen`.
 
+`Disable` keeps a node and sends it nothing — no requests, no catch-up, not
+even a probe — which is how you take one out of service without losing the key
+needed to put it back. Try it on node-c and then read `misp/ips`: the other two
+hold it as well, so nothing changes. Try it on node-a *and* node-b and a read
+of `misp/domains` answers `421`, because nowhere in reach stores it any more.
+
 The nodes here are joined through the API by `seed.sh`, so all three are
 editable. Had they been written into `[galaxy] peers` in `lb.toml` they would
 show the same information but read-only, because that file is yours and the

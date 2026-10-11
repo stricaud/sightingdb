@@ -342,4 +342,8 @@ tiers_file = "tiers.toml"
 #peers = [
 #  { url = "https://node-a.example:9999", key = "..." },
 #  { url = "https://node-b.example:9999", key = "...", namespaces = ["feeds"] },
+#  # Kept, and sent nothing: no requests, no catch-up, not even a health
+#  # probe. For a node out of service that you do not want to forget how to
+#  # reach. A namespace only it held is out of reach while it is off.
+#  { url = "https://spare.example:9999", key = "...", enabled = false },
 #]
