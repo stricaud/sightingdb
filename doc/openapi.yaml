@@ -422,8 +422,22 @@ paths:
 
         A value whose observable type cannot be worked out is skipped, and the
         response headers say how many that was.
+
+        With `val`, the bundle holds that one value's indicator and sighting,
+        with the ids the whole namespace's export gives them: how to learn the
+        ids SightingDB uses for a value without exporting everything. Through
+        a router it is answered by the mirror holding the namespace.
       parameters:
         - $ref: "#/components/parameters/Namespace"
+        - name: val
+          in: query
+          description: |
+            Export only this value. `404` when the namespace does not hold it.
+            Cannot be combined with `recursive`. The bundle's own id is derived
+            from the namespace and the value, so it is not mistaken for the
+            namespace's bundle; every object in it is identical.
+          schema: { type: string }
+          example: 1.2.3.4
         - name: recursive
           in: query
           allowEmptyValue: true
@@ -461,6 +475,11 @@ paths:
           content:
             application/stix+json:
               schema: { $ref: "#/components/schemas/StixBundle" }
+        "400":
+          description: An empty `val`, or `val` together with `recursive`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "502":

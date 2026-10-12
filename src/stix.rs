@@ -418,6 +418,36 @@ pub fn export_namespace(
     })
 }
 
+/// Export one value of one namespace: the same indicator and sighting, with
+/// the same ids, that exporting the whole namespace would give it.
+///
+/// `None` when the namespace does not hold the value. Built by the very code
+/// the namespace export uses — the value is read exactly as a page of the
+/// namespace reads it — so the two can never disagree about an id.
+pub fn export_value(
+    db: &crate::db::Database,
+    settings: &crate::config::StixSettings,
+    namespace: &str,
+    value: &str,
+    untyped: Untyped,
+) -> Option<Export> {
+    let values = [db.view(namespace, value, 0, false)?];
+    let part = Part {
+        namespace,
+        values: &values,
+        default_type: settings.type_of_namespace(namespace),
+    };
+    let mut export = bundle_of(&[part], &settings.export, untyped);
+    // Its own bundle id. Left alone it would be the namespace's, and a
+    // consumer caching by bundle id would take this one value for the whole
+    // export. Only the bundle's id differs; every object in it is unchanged.
+    export.bundle["id"] = Value::String(format!(
+        "bundle--{}",
+        uuid_for(&format!("bundle:{namespace}:{value}"))
+    ));
+    Some(export)
+}
+
 /// Export several namespaces into one bundle.
 ///
 /// `filter` is the same substring match browsing uses, so an automation can ask

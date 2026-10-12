@@ -322,6 +322,9 @@ pub struct ExportQuery {
     /// absent, leaves them out. Absent is the default so that an existing
     /// caller's bundle does not change shape under it.
     untyped: Option<String>,
+    /// Export this one value rather than the whole namespace: how a client
+    /// learns the ids SightingDB gives it without exporting everything.
+    val: Option<String>,
 }
 
 impl ExportQuery {
@@ -1078,6 +1081,10 @@ pub async fn export_stix(
         return error_response(&ApiError::ConfigNamespace);
     }
 
+    if let Some(value) = query.val.as_deref() {
+        return export_stix_value(&state, &req, &namespace, value, &query).await;
+    }
+
     if query.recursive.is_some() {
         // The subtree can span this server and its mirrors, so what it
         // contains is asked of the galaxy as well as of the local catalogue —
@@ -1126,6 +1133,58 @@ pub async fn export_stix(
     };
 
     stix_response(export)
+}
+
+/// `GET /stix/<namespace>?val=<value>` — one value's indicator and sighting.
+///
+/// Answered by whichever server holds the namespace, like a read: a router
+/// passes it to the mirror chosen for that value, unchanged, so the ids are
+/// the ones that mirror's own export would contain.
+async fn export_stix_value(
+    state: &State,
+    req: &HttpRequest,
+    namespace: &str,
+    value: &str,
+    query: &ExportQuery,
+) -> HttpResponse {
+    if query.recursive.is_some() {
+        return HttpResponse::BadRequest().json(Message::new(
+            "val= names one value in one namespace, so it cannot be combined with recursive.",
+        ));
+    }
+    if value.is_empty() {
+        return error_response(&ApiError::EmptyValue);
+    }
+
+    if let Some(forward) = should_forward(state, req, namespace) {
+        let hops = match forward {
+            Ok(hops) => hops,
+            Err(resp) => return resp,
+        };
+        if let Some(galaxy) = state.galaxy.as_ref() {
+            let path = req
+                .uri()
+                .path_and_query()
+                .map_or_else(|| req.uri().path().to_string(), |p| p.as_str().to_string());
+            return match galaxy.forward_read(namespace, value, &path, hops, "").await {
+                Ok(answer) => relayed(answer),
+                // Nowhere in the galaxy: the 404 the rest of `/stix` gives,
+                // rather than the 421 a forwarded read would.
+                Err(crate::galaxy::ForwardError::NoHolder) => {
+                    error_response(&ApiError::NotFound(NotFound::namespace(namespace, value)))
+                }
+                Err(e) => forward_failed(&e),
+            };
+        }
+    }
+
+    match crate::stix::export_value(&state.db, &state.stix, namespace, value, query.untyped()) {
+        Some(export) => stix_response(export),
+        None if state.db.namespace_exists(namespace) => {
+            error_response(&ApiError::NotFound(NotFound::value(namespace, value)))
+        }
+        None => error_response(&ApiError::NotFound(NotFound::namespace(namespace, value))),
+    }
 }
 
 /// Every namespace under what was asked for, here and on the mirrors.
@@ -3664,6 +3723,134 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// One value's bundle carries exactly the ids the namespace export gives
+    /// it, which is the point of asking for one value: learning those ids
+    /// without exporting everything.
+    #[actix_web::test]
+    async fn a_stix_export_of_one_value_has_the_same_ids_as_the_whole_namespace() {
+        let st = state(false);
+        let app = app!(st);
+        for uri in [
+            "/w/feeds/ips?val=1.1.1.1",
+            "/w/feeds/ips?val=2.2.2.2",
+            "/w/feeds/ips?val=3.3.3.3&tags=stix-id:indicator--6f2b2b7a-1c1e-4c6e-9d5a-0d4f1a2b3c4d",
+        ] {
+            test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        }
+
+        let ids = |bundle: &Value, kind: &str| -> Vec<String> {
+            bundle["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|o| o["type"] == kind)
+                .map(|o| o["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/stix/feeds/ips").to_request(),
+        )
+        .await;
+        let whole: Value = test::read_body_json(resp).await;
+
+        for value in ["2.2.2.2", "3.3.3.3"] {
+            let resp = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/stix/feeds/ips?val={value}"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers().get("X-SightingDB-Exported").unwrap(), "1");
+            let one: Value = test::read_body_json(resp).await;
+
+            let indicator = ids(&one, "indicator");
+            let sighting = ids(&one, "sighting");
+            assert_eq!(indicator.len(), 1, "{one}");
+            assert_eq!(sighting.len(), 1, "{one}");
+            assert!(ids(&whole, "indicator").contains(&indicator[0]), "{value}");
+            assert!(ids(&whole, "sighting").contains(&sighting[0]), "{value}");
+        }
+
+        // The bundle itself is not the namespace's, or a consumer caching by
+        // bundle id would mistake one value for the whole export.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/feeds/ips?val=2.2.2.2")
+                .to_request(),
+        )
+        .await;
+        let one: Value = test::read_body_json(resp).await;
+        assert_ne!(one["id"], whole["id"]);
+
+        // An id the value arrived with is the one given back.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/feeds/ips?val=3.3.3.3")
+                .to_request(),
+        )
+        .await;
+        let one: Value = test::read_body_json(resp).await;
+        assert_eq!(
+            ids(&one, "indicator"),
+            ["indicator--6f2b2b7a-1c1e-4c6e-9d5a-0d4f1a2b3c4d"]
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_stix_export_of_one_value_says_what_is_missing() {
+        let st = state(false);
+        let app = app!(st);
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/w/feeds/ips?val=1.1.1.1")
+                .to_request(),
+        )
+        .await;
+
+        for (uri, status) in [
+            ("/stix/feeds/ips?val=9.9.9.9", StatusCode::NOT_FOUND),
+            ("/stix/nope?val=1.1.1.1", StatusCode::NOT_FOUND),
+            ("/stix/feeds/ips?val=", StatusCode::BAD_REQUEST),
+            ("/stix/feeds?val=1.1.1.1&recursive", StatusCode::BAD_REQUEST),
+        ] {
+            let resp =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(resp.status(), status, "{uri}");
+        }
+    }
+
+    /// Through a router, one value is asked of the mirror that holds it.
+    #[actix_web::test]
+    async fn a_router_asks_a_mirror_for_one_values_stix() {
+        let st = router_towards(&["feeds"]);
+        let app = app!(st);
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/feeds/ips?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "it did not ask");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/stix/other/thing?val=1.2.3.4")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// A namespace nowhere in the galaxy is still a 404. The mirror here holds

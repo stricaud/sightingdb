@@ -519,6 +519,28 @@ partial.
 to 100000. A bundle is read by a machine, but it is still one response held in
 memory.
 
+### Exporting one value
+
+`?val=<value>` exports just that value: its indicator and its sighting, with
+exactly the ids the whole namespace's export gives them. It is how a client
+asks "what does SightingDB call this?" without exporting everything:
+
+	$ curl -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/stix/feeds/misp/ips?val=1.2.3.4' |
+	  jq -r '.objects[] | select(.type == "indicator" or .type == "sighting") | .id'
+	indicator--407cd7a8-da80-5fa3-b02a-9ae7ccc848e0
+	sighting--43ec94b4-476f-5985-a5a2-0100e2f28153
+
+The type is worked out, and a `stix-id:` tag honoured, exactly as in a full
+export, so the answer is right even where computing the id yourself would need
+to guess the observable type. A value the namespace does not hold is `404`; a
+value with no observable type is skipped as always, so add `untyped=include`
+to get an id for it regardless. `val` cannot be combined with `recursive`.
+
+The bundle's own id is derived from the namespace *and* the value, so it is
+never mistaken for the namespace's bundle. Through a router it is answered by
+the mirror holding the namespace, chosen by the value like any read.
+
 ### Exporting a whole subtree
 
 By default an export covers the one namespace named. `?recursive` (or

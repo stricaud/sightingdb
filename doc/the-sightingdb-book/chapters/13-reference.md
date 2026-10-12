@@ -63,6 +63,7 @@ codes. A test keeps it from drifting.
 | `count` | `/r` | Answer with the number of values instead. |
 | `for_merge` | `/r` | The per-node shape a peer is offered. |
 | `recursive` | `/stix` | Include the namespaces below this one. |
+| `val=` | `/stix` | Export only this value, with the ids a full export gives it. |
 | `untyped=include` | `/stix` | Export values with no observable type. |
 | `limit=`, `q=` | listings, `/stix` | Page size; substring filter. |
 

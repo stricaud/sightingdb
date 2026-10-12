@@ -934,6 +934,20 @@ values currently have none.
 `limit=` caps how many values one export reads (10,000 by default, 100,000 at
 most); `X-SightingDB-Truncated` says when the namespace held more.
 
+### Exporting one value
+
+`?val=<value>` on `GET /stix/<namespace>` exports just that value — its
+indicator and sighting, with the same ids the whole namespace's export gives
+them. It is the way to learn what SightingDB calls a value without exporting
+everything, and it resolves the observable type and any `stix-id:` tag exactly
+as a full export does:
+
+	$ curl -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/stix/feeds/misp/ips?val=1.2.3.4' |
+	  jq -r '.objects[] | select(.type == "indicator" or .type == "sighting") | .id'
+	indicator--407cd7a8-da80-5fa3-b02a-9ae7ccc848e0
+	sighting--43ec94b4-476f-5985-a5a2-0100e2f28153
+
 ### Exporting a subtree
 
 An export covers the one namespace named. Add `recursive` — `?recursive` on

@@ -89,6 +89,42 @@ namespace — not an illustration of the idea, the same two strings hashed the
 same way. And they will not change between releases: the namespace above is a
 constant precisely so that they cannot.
 
+### Asking the server instead
+
+Computing an id yourself needs the observable type, and the server is the one
+that decides it — from a `stix-type:` tag, then the namespace's
+`[stix.types]` mapping, then the shape of the value. A value that arrived as
+STIX keeps the indicator id its publisher gave it, in a `stix-id:` tag, and
+that overrides the formula altogether. Guess either wrong and you hold an id
+nothing else uses.
+
+So when the server is to hand, ask it. `val=` exports one value rather than
+the whole namespace:
+
+```bash
+curl -H 'Authorization: changeme' \
+  'http://localhost:9999/stix/feeds/misp/ips?val=1.2.3.4' |
+jq -r '.objects[] | select(.type == "indicator" or .type == "sighting") | .id'
+```
+
+```text
+indicator--407cd7a8-da80-5fa3-b02a-9ae7ccc848e0
+sighting--43ec94b4-476f-5985-a5a2-0100e2f28153
+```
+
+Same code as the full export, so the same ids, with the type worked out and the
+`stix-id:` tag honoured. A value the namespace does not hold is a `404`. A
+value with no observable type is skipped as it would be in a full export; add
+`untyped=include` to have an id for it anyway. Through a load balancer the
+question goes to the mirror holding the namespace, as any read does.
+
+The one thing that differs is the bundle's own id, which is derived from the
+namespace and the value: a consumer that caches bundles by id must not mistake
+one value for the namespace's whole export.
+
+Use the formula where there is no server to ask — offline, or to know an id
+before the value has even been written — and the server everywhere else.
+
 Note which name carries what. The indicator's has only the observable type and
 the value in it, so the same domain seen in four namespaces is one indicator.
 The sighting's has the namespace as well, so each of those four is its own
