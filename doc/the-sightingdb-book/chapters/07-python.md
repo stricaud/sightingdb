@@ -124,6 +124,33 @@ if not db.exists("feeds/misp/ips", address, shadow=False):
     alert("first time we have ever seen this")
 ```
 
+## What was written lately
+
+`latest()` is `/_api/latest` (chapter 5): the most recent writes, newest first,
+each with its namespace, and only those in namespaces your key may read.
+
+```python
+for write in db.latest(20, namespace="feeds"):
+    print(write.written_at, write.namespace, write.value)
+```
+
+`follow()` turns it into a stream. It polls, and yields each new write once,
+oldest first:
+
+```python
+for write in db.follow(namespace="feeds", interval=5):
+    enrich(write.namespace, write.value)
+```
+
+This is where the polling details that are easy to get wrong are handled.
+`since` is in whole seconds and includes that second, so every poll would
+otherwise report the previous poll's last second again. With no `since`,
+"from now" is taken from the server's record at the first poll rather than
+from this machine's clock, so a client running a few seconds fast does not
+silently skip what arrives. Pointed at several servers, both ask all of them
+and merge the answers, because a server that was down for a while has gaps
+the others do not.
+
 ## The rest
 
 ```python

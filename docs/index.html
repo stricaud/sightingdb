@@ -409,11 +409,12 @@ reads</a></li>
 <li><a href="#writing-1" id="toc-writing-1"><span class="toc-section-number">7.2</span> Writing</a></li>
 <li><a href="#writing-a-lot" id="toc-writing-a-lot"><span class="toc-section-number">7.3</span> Writing a lot</a></li>
 <li><a href="#reading-1" id="toc-reading-1"><span class="toc-section-number">7.4</span> Reading</a></li>
-<li><a href="#the-rest" id="toc-the-rest"><span class="toc-section-number">7.5</span> The rest</a></li>
-<li><a href="#asynchronously" id="toc-asynchronously"><span class="toc-section-number">7.6</span> Asynchronously</a></li>
-<li><a href="#talking-to-several-servers" id="toc-talking-to-several-servers"><span class="toc-section-number">7.7</span> Talking to several
+<li><a href="#what-was-written-lately-1" id="toc-what-was-written-lately-1"><span class="toc-section-number">7.5</span> What was written lately</a></li>
+<li><a href="#the-rest" id="toc-the-rest"><span class="toc-section-number">7.6</span> The rest</a></li>
+<li><a href="#asynchronously" id="toc-asynchronously"><span class="toc-section-number">7.7</span> Asynchronously</a></li>
+<li><a href="#talking-to-several-servers" id="toc-talking-to-several-servers"><span class="toc-section-number">7.8</span> Talking to several
 servers</a></li>
-<li><a href="#a-worked-example" id="toc-a-worked-example"><span class="toc-section-number">7.8</span> A worked example</a></li>
+<li><a href="#a-worked-example" id="toc-a-worked-example"><span class="toc-section-number">7.9</span> A worked example</a></li>
 </ul></li>
 <li><a href="#galaxies" id="toc-galaxies"><span class="toc-section-number">8</span> Galaxies</a>
 <ul>
@@ -1831,38 +1832,60 @@ represents an analyst actually asking.</p>
 <div class="sourceCode" id="cb63"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb63-1"><a href="#cb63-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="kw">not</span> db.exists(<span class="st">&quot;feeds/misp/ips&quot;</span>, address, shadow<span class="op">=</span><span class="va">False</span>):</span>
 <span id="cb63-2"><a href="#cb63-2" aria-hidden="true" tabindex="-1"></a>    alert(<span class="st">&quot;first time we have ever seen this&quot;</span>)</span></code></pre></div>
 </section>
-<section id="the-rest" class="level2" data-number="7.5">
-<h2 data-number="7.5"><span class="header-section-number">7.5</span> The
+<section id="what-was-written-lately-1" class="level2" data-number="7.5">
+<h2 data-number="7.5"><span class="header-section-number">7.5</span>
+What was written lately</h2>
+<p><code>latest()</code> is <code>/_api/latest</code> (chapter 5): the
+most recent writes, newest first, each with its namespace, and only
+those in namespaces your key may read.</p>
+<div class="sourceCode" id="cb64"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb64-1"><a href="#cb64-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> write <span class="kw">in</span> db.latest(<span class="dv">20</span>, namespace<span class="op">=</span><span class="st">&quot;feeds&quot;</span>):</span>
+<span id="cb64-2"><a href="#cb64-2" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(write.written_at, write.namespace, write.value)</span></code></pre></div>
+<p><code>follow()</code> turns it into a stream. It polls, and yields
+each new write once, oldest first:</p>
+<div class="sourceCode" id="cb65"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb65-1"><a href="#cb65-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> write <span class="kw">in</span> db.follow(namespace<span class="op">=</span><span class="st">&quot;feeds&quot;</span>, interval<span class="op">=</span><span class="dv">5</span>):</span>
+<span id="cb65-2"><a href="#cb65-2" aria-hidden="true" tabindex="-1"></a>    enrich(write.namespace, write.value)</span></code></pre></div>
+<p>This is where the polling details that are easy to get wrong are
+handled. <code>since</code> is in whole seconds and includes that
+second, so every poll would otherwise report the previous poll’s last
+second again. With no <code>since</code>, “from now” is taken from the
+server’s record at the first poll rather than from this machine’s clock,
+so a client running a few seconds fast does not silently skip what
+arrives. Pointed at several servers, both ask all of them and merge the
+answers, because a server that was down for a while has gaps the others
+do not.</p>
+</section>
+<section id="the-rest" class="level2" data-number="7.6">
+<h2 data-number="7.6"><span class="header-section-number">7.6</span> The
 rest</h2>
-<div class="sourceCode" id="cb64"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb64-1"><a href="#cb64-1" aria-hidden="true" tabindex="-1"></a>db.list_values(<span class="st">&quot;feeds/misp/ips&quot;</span>, shadow<span class="op">=</span><span class="va">False</span>)   <span class="co"># every value, as Attributes</span></span>
-<span id="cb64-2"><a href="#cb64-2" aria-hidden="true" tabindex="-1"></a>db.delete(<span class="st">&quot;feeds/misp/ips&quot;</span>, missing_ok<span class="op">=</span><span class="va">True</span>)     <span class="co"># the whole namespace</span></span>
-<span id="cb64-3"><a href="#cb64-3" aria-hidden="true" tabindex="-1"></a>db.info()                                         <span class="co"># version, what it stores</span></span>
-<span id="cb64-4"><a href="#cb64-4" aria-hidden="true" tabindex="-1"></a>db.ping()                                         <span class="co"># is it there</span></span>
-<span id="cb64-5"><a href="#cb64-5" aria-hidden="true" tabindex="-1"></a>db.close()</span></code></pre></div>
+<div class="sourceCode" id="cb66"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb66-1"><a href="#cb66-1" aria-hidden="true" tabindex="-1"></a>db.list_values(<span class="st">&quot;feeds/misp/ips&quot;</span>, shadow<span class="op">=</span><span class="va">False</span>)   <span class="co"># every value, as Attributes</span></span>
+<span id="cb66-2"><a href="#cb66-2" aria-hidden="true" tabindex="-1"></a>db.delete(<span class="st">&quot;feeds/misp/ips&quot;</span>, missing_ok<span class="op">=</span><span class="va">True</span>)     <span class="co"># the whole namespace</span></span>
+<span id="cb66-3"><a href="#cb66-3" aria-hidden="true" tabindex="-1"></a>db.info()                                         <span class="co"># version, what it stores</span></span>
+<span id="cb66-4"><a href="#cb66-4" aria-hidden="true" tabindex="-1"></a>db.ping()                                         <span class="co"># is it there</span></span>
+<span id="cb66-5"><a href="#cb66-5" aria-hidden="true" tabindex="-1"></a>db.close()</span></code></pre></div>
 <p><code>SightingDB</code> is a context manager, so
 <code>with SightingDB() as db:</code> closes the connection for you.</p>
 </section>
-<section id="asynchronously" class="level2" data-number="7.6">
-<h2 data-number="7.6"><span class="header-section-number">7.6</span>
+<section id="asynchronously" class="level2" data-number="7.7">
+<h2 data-number="7.7"><span class="header-section-number">7.7</span>
 Asynchronously</h2>
 <p><code>AsyncSightingDB</code> has the same API with
 <code>await</code>:</p>
-<div class="sourceCode" id="cb65"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb65-1"><a href="#cb65-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> sightingdb <span class="im">import</span> AsyncSightingDB</span>
-<span id="cb65-2"><a href="#cb65-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb65-3"><a href="#cb65-3" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="cf">with</span> AsyncSightingDB(url<span class="op">=</span>..., apikey<span class="op">=</span>...) <span class="im">as</span> db:</span>
-<span id="cb65-4"><a href="#cb65-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> db.write(<span class="st">&quot;feeds/misp/ips&quot;</span>, <span class="st">&quot;198.51.100.23&quot;</span>)</span>
-<span id="cb65-5"><a href="#cb65-5" aria-hidden="true" tabindex="-1"></a>    seen <span class="op">=</span> <span class="cf">await</span> db.read(<span class="st">&quot;feeds/misp/ips&quot;</span>, <span class="st">&quot;198.51.100.23&quot;</span>, shadow<span class="op">=</span><span class="va">False</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb67"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb67-1"><a href="#cb67-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> sightingdb <span class="im">import</span> AsyncSightingDB</span>
+<span id="cb67-2"><a href="#cb67-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb67-3"><a href="#cb67-3" aria-hidden="true" tabindex="-1"></a><span class="cf">async</span> <span class="cf">with</span> AsyncSightingDB(url<span class="op">=</span>..., apikey<span class="op">=</span>...) <span class="im">as</span> db:</span>
+<span id="cb67-4"><a href="#cb67-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">await</span> db.write(<span class="st">&quot;feeds/misp/ips&quot;</span>, <span class="st">&quot;198.51.100.23&quot;</span>)</span>
+<span id="cb67-5"><a href="#cb67-5" aria-hidden="true" tabindex="-1"></a>    seen <span class="op">=</span> <span class="cf">await</span> db.read(<span class="st">&quot;feeds/misp/ips&quot;</span>, <span class="st">&quot;198.51.100.23&quot;</span>, shadow<span class="op">=</span><span class="va">False</span>)</span></code></pre></div>
 </section>
-<section id="talking-to-several-servers" class="level2" data-number="7.7">
-<h2 data-number="7.7"><span class="header-section-number">7.7</span>
+<section id="talking-to-several-servers" class="level2" data-number="7.8">
+<h2 data-number="7.8"><span class="header-section-number">7.8</span>
 Talking to several servers</h2>
 <p>A client can point at a load balancer — chapter 8 — and nothing
 changes. It can also fan out itself, which is useful when you would
 rather not run one:</p>
-<div class="sourceCode" id="cb66"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb66-1"><a href="#cb66-1" aria-hidden="true" tabindex="-1"></a>db <span class="op">=</span> SightingDB(</span>
-<span id="cb66-2"><a href="#cb66-2" aria-hidden="true" tabindex="-1"></a>    urls<span class="op">=</span>[<span class="st">&quot;https://node-a.example:9999&quot;</span>, <span class="st">&quot;https://node-b.example:9999&quot;</span>],</span>
-<span id="cb66-3"><a href="#cb66-3" aria-hidden="true" tabindex="-1"></a>    apikey<span class="op">=</span><span class="st">&quot;changeme&quot;</span>,</span>
-<span id="cb66-4"><a href="#cb66-4" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+<div class="sourceCode" id="cb68"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb68-1"><a href="#cb68-1" aria-hidden="true" tabindex="-1"></a>db <span class="op">=</span> SightingDB(</span>
+<span id="cb68-2"><a href="#cb68-2" aria-hidden="true" tabindex="-1"></a>    urls<span class="op">=</span>[<span class="st">&quot;https://node-a.example:9999&quot;</span>, <span class="st">&quot;https://node-b.example:9999&quot;</span>],</span>
+<span id="cb68-3"><a href="#cb68-3" aria-hidden="true" tabindex="-1"></a>    apikey<span class="op">=</span><span class="st">&quot;changeme&quot;</span>,</span>
+<span id="cb68-4"><a href="#cb68-4" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
 <p>Writes then go to <strong>every</strong> node and reads to
 <strong>one</strong>. Two things make that correct rather than merely
 parallel, and both are easy to get wrong.</p>
@@ -1878,40 +1901,40 @@ apart transiently while they catch up with each other, so two
 consecutive reads served by different nodes could show a count going
 <em>down</em>. The client picks the node by hashing the value, which
 also moves the fewest values when the node list changes.</p>
-<div class="sourceCode" id="cb67"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb67-1"><a href="#cb67-1" aria-hidden="true" tabindex="-1"></a>db.fans_out      <span class="co"># True when there is more than one</span></span>
-<span id="cb67-2"><a href="#cb67-2" aria-hidden="true" tabindex="-1"></a>db.urls          <span class="co"># what it is pointing at</span></span></code></pre></div>
+<div class="sourceCode" id="cb69"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb69-1"><a href="#cb69-1" aria-hidden="true" tabindex="-1"></a>db.fans_out      <span class="co"># True when there is more than one</span></span>
+<span id="cb69-2"><a href="#cb69-2" aria-hidden="true" tabindex="-1"></a>db.urls          <span class="co"># what it is pointing at</span></span></code></pre></div>
 <p>With one URL none of this happens: no extra headers, no hashing.
 Pointing at one server behaves exactly as it did before any of this
 existed.</p>
 </section>
-<section id="a-worked-example" class="level2" data-number="7.8">
-<h2 data-number="7.8"><span class="header-section-number">7.8</span> A
+<section id="a-worked-example" class="level2" data-number="7.9">
+<h2 data-number="7.9"><span class="header-section-number">7.9</span> A
 worked example</h2>
 <p>Enrich a stream of addresses, recording each as seen and reporting
 the new ones:</p>
-<div class="sourceCode" id="cb68"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb68-1"><a href="#cb68-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> datetime <span class="im">import</span> timedelta</span>
-<span id="cb68-2"><a href="#cb68-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> sightingdb <span class="im">import</span> SightingDB, Sighting</span>
-<span id="cb68-3"><a href="#cb68-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb68-4"><a href="#cb68-4" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> SightingDB() <span class="im">as</span> db:</span>
-<span id="cb68-5"><a href="#cb68-5" aria-hidden="true" tabindex="-1"></a>    addresses <span class="op">=</span> [line.strip() <span class="cf">for</span> line <span class="kw">in</span> <span class="bu">open</span>(<span class="st">&quot;today.txt&quot;</span>)]</span>
-<span id="cb68-6"><a href="#cb68-6" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb68-7"><a href="#cb68-7" aria-hidden="true" tabindex="-1"></a>    <span class="co"># One round trip to find out which are new...</span></span>
-<span id="cb68-8"><a href="#cb68-8" aria-hidden="true" tabindex="-1"></a>    before <span class="op">=</span> {</span>
-<span id="cb68-9"><a href="#cb68-9" aria-hidden="true" tabindex="-1"></a>        result.value: result.found</span>
-<span id="cb68-10"><a href="#cb68-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> result <span class="kw">in</span> db.read_many(</span>
-<span id="cb68-11"><a href="#cb68-11" aria-hidden="true" tabindex="-1"></a>            [Sighting(<span class="st">&quot;myorg/proxy/ips&quot;</span>, a, noshadow<span class="op">=</span><span class="va">True</span>) <span class="cf">for</span> a <span class="kw">in</span> addresses]</span>
-<span id="cb68-12"><a href="#cb68-12" aria-hidden="true" tabindex="-1"></a>        )</span>
-<span id="cb68-13"><a href="#cb68-13" aria-hidden="true" tabindex="-1"></a>    }</span>
-<span id="cb68-14"><a href="#cb68-14" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb68-15"><a href="#cb68-15" aria-hidden="true" tabindex="-1"></a>    <span class="co"># ...and one to record them all.</span></span>
-<span id="cb68-16"><a href="#cb68-16" aria-hidden="true" tabindex="-1"></a>    db.write_many(</span>
-<span id="cb68-17"><a href="#cb68-17" aria-hidden="true" tabindex="-1"></a>        [Sighting(<span class="st">&quot;myorg/proxy/ips&quot;</span>, a, ttl<span class="op">=</span>timedelta(days<span class="op">=</span><span class="dv">90</span>)) <span class="cf">for</span> a <span class="kw">in</span> addresses],</span>
-<span id="cb68-18"><a href="#cb68-18" aria-hidden="true" tabindex="-1"></a>        strict<span class="op">=</span><span class="va">False</span>,</span>
-<span id="cb68-19"><a href="#cb68-19" aria-hidden="true" tabindex="-1"></a>    )</span>
-<span id="cb68-20"><a href="#cb68-20" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb68-21"><a href="#cb68-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> address <span class="kw">in</span> addresses:</span>
-<span id="cb68-22"><a href="#cb68-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">not</span> before.get(address):</span>
-<span id="cb68-23"><a href="#cb68-23" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="st">&quot;first sighting:&quot;</span>, address)</span></code></pre></div>
+<div class="sourceCode" id="cb70"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb70-1"><a href="#cb70-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> datetime <span class="im">import</span> timedelta</span>
+<span id="cb70-2"><a href="#cb70-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> sightingdb <span class="im">import</span> SightingDB, Sighting</span>
+<span id="cb70-3"><a href="#cb70-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb70-4"><a href="#cb70-4" aria-hidden="true" tabindex="-1"></a><span class="cf">with</span> SightingDB() <span class="im">as</span> db:</span>
+<span id="cb70-5"><a href="#cb70-5" aria-hidden="true" tabindex="-1"></a>    addresses <span class="op">=</span> [line.strip() <span class="cf">for</span> line <span class="kw">in</span> <span class="bu">open</span>(<span class="st">&quot;today.txt&quot;</span>)]</span>
+<span id="cb70-6"><a href="#cb70-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb70-7"><a href="#cb70-7" aria-hidden="true" tabindex="-1"></a>    <span class="co"># One round trip to find out which are new...</span></span>
+<span id="cb70-8"><a href="#cb70-8" aria-hidden="true" tabindex="-1"></a>    before <span class="op">=</span> {</span>
+<span id="cb70-9"><a href="#cb70-9" aria-hidden="true" tabindex="-1"></a>        result.value: result.found</span>
+<span id="cb70-10"><a href="#cb70-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> result <span class="kw">in</span> db.read_many(</span>
+<span id="cb70-11"><a href="#cb70-11" aria-hidden="true" tabindex="-1"></a>            [Sighting(<span class="st">&quot;myorg/proxy/ips&quot;</span>, a, noshadow<span class="op">=</span><span class="va">True</span>) <span class="cf">for</span> a <span class="kw">in</span> addresses]</span>
+<span id="cb70-12"><a href="#cb70-12" aria-hidden="true" tabindex="-1"></a>        )</span>
+<span id="cb70-13"><a href="#cb70-13" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb70-14"><a href="#cb70-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb70-15"><a href="#cb70-15" aria-hidden="true" tabindex="-1"></a>    <span class="co"># ...and one to record them all.</span></span>
+<span id="cb70-16"><a href="#cb70-16" aria-hidden="true" tabindex="-1"></a>    db.write_many(</span>
+<span id="cb70-17"><a href="#cb70-17" aria-hidden="true" tabindex="-1"></a>        [Sighting(<span class="st">&quot;myorg/proxy/ips&quot;</span>, a, ttl<span class="op">=</span>timedelta(days<span class="op">=</span><span class="dv">90</span>)) <span class="cf">for</span> a <span class="kw">in</span> addresses],</span>
+<span id="cb70-18"><a href="#cb70-18" aria-hidden="true" tabindex="-1"></a>        strict<span class="op">=</span><span class="va">False</span>,</span>
+<span id="cb70-19"><a href="#cb70-19" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb70-20"><a href="#cb70-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb70-21"><a href="#cb70-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> address <span class="kw">in</span> addresses:</span>
+<span id="cb70-22"><a href="#cb70-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">not</span> before.get(address):</span>
+<span id="cb70-23"><a href="#cb70-23" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="st">&quot;first sighting:&quot;</span>, address)</span></code></pre></div>
 <p>Two requests for the whole file, rather than two per address.</p>
 </section>
 </section>
@@ -2013,7 +2036,7 @@ counted the write as <em>its own</em>, the merge would add the two
 together and three writes would become six — and six again at the next
 merge.</p>
 <p>So <strong>a sighting is counted per server</strong>:</p>
-<div class="sourceCode" id="cb69"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb69-1"><a href="#cb69-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;counts&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;lb&quot;</span><span class="fu">:</span> <span class="dv">3</span><span class="fu">},</span> <span class="dt">&quot;first_seen&quot;</span><span class="fu">:</span> <span class="er">...</span><span class="fu">,</span> <span class="dt">&quot;last_seen&quot;</span><span class="fu">:</span> <span class="er">...</span><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb71"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb71-1"><a href="#cb71-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;counts&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;lb&quot;</span><span class="fu">:</span> <span class="dv">3</span><span class="fu">},</span> <span class="dt">&quot;first_seen&quot;</span><span class="fu">:</span> <span class="er">...</span><span class="fu">,</span> <span class="dt">&quot;last_seen&quot;</span><span class="fu">:</span> <span class="er">...</span><span class="fu">}</span></span></code></pre></div>
 <p>Both mirrors record <code>{&quot;lb&quot;: 3}</code>, because the write is
 attributed to the entry point the client actually reached and not to
 whichever mirror stored it. Merging two copies takes the greater value
@@ -2075,10 +2098,10 @@ actually reached.</p>
 Keys are the boundary</h2>
 <p>Every peer entry carries the key <em>this</em> server authenticates
 to that peer with:</p>
-<div class="sourceCode" id="cb70"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb70-1"><a href="#cb70-1" aria-hidden="true" tabindex="-1"></a><span class="dt">peers</span> <span class="op">=</span> <span class="op">[</span></span>
-<span id="cb70-2"><a href="#cb70-2" aria-hidden="true" tabindex="-1"></a>  <span class="op">{ </span><span class="dt">url</span><span class="op"> =</span> <span class="st">&quot;https://node-a:9999&quot;</span><span class="op">, </span><span class="dt">key</span><span class="op"> =</span> <span class="st">&quot;lb-full&quot;</span><span class="op"> },</span></span>
-<span id="cb70-3"><a href="#cb70-3" aria-hidden="true" tabindex="-1"></a>  <span class="op">{ </span><span class="dt">url</span><span class="op"> =</span> <span class="st">&quot;https://node-c:9999&quot;</span><span class="op">, </span><span class="dt">key</span><span class="op"> =</span> <span class="st">&quot;lb-ips&quot;</span><span class="op">, </span><span class="dt">namespaces</span><span class="op"> =</span> <span class="op">[</span><span class="st">&quot;misp/ips&quot;</span><span class="op">] },</span></span>
-<span id="cb70-4"><a href="#cb70-4" aria-hidden="true" tabindex="-1"></a><span class="op">]</span></span></code></pre></div>
+<div class="sourceCode" id="cb72"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb72-1"><a href="#cb72-1" aria-hidden="true" tabindex="-1"></a><span class="dt">peers</span> <span class="op">=</span> <span class="op">[</span></span>
+<span id="cb72-2"><a href="#cb72-2" aria-hidden="true" tabindex="-1"></a>  <span class="op">{ </span><span class="dt">url</span><span class="op"> =</span> <span class="st">&quot;https://node-a:9999&quot;</span><span class="op">, </span><span class="dt">key</span><span class="op"> =</span> <span class="st">&quot;lb-full&quot;</span><span class="op"> },</span></span>
+<span id="cb72-3"><a href="#cb72-3" aria-hidden="true" tabindex="-1"></a>  <span class="op">{ </span><span class="dt">url</span><span class="op"> =</span> <span class="st">&quot;https://node-c:9999&quot;</span><span class="op">, </span><span class="dt">key</span><span class="op"> =</span> <span class="st">&quot;lb-ips&quot;</span><span class="op">, </span><span class="dt">namespaces</span><span class="op"> =</span> <span class="op">[</span><span class="st">&quot;misp/ips&quot;</span><span class="op">] },</span></span>
+<span id="cb72-4"><a href="#cb72-4" aria-hidden="true" tabindex="-1"></a><span class="op">]</span></span></code></pre></div>
 <p>Those keys live in the <strong>peers’</strong> ACLs, and it is the
 peer that enforces them. Give the load balancer <code>rw:misp/ips</code>
 on node-c and it cannot write anywhere else there — however it is
@@ -2144,7 +2167,7 @@ and taking parts of it out of service.</p>
 <h2 data-number="9.1"><span class="header-section-number">9.1</span>
 Build one in four containers</h2>
 <p>The fastest way to see all of it:</p>
-<div class="sourceCode" id="cb71"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb71-1"><a href="#cb71-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose <span class="at">-f</span> doc/docker/docker-compose.yml up <span class="at">--build</span></span></code></pre></div>
+<div class="sourceCode" id="cb73"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb73-1"><a href="#cb73-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose <span class="at">-f</span> doc/docker/docker-compose.yml up <span class="at">--build</span></span></code></pre></div>
 <p>A load balancer on 9999 and three nodes on 9991–9993, two full
 mirrors and one holding a single namespace, loaded with real indicators
 from CIRCL’s public OSINT feed. <code>doc/docker/README.md</code> lists
@@ -2159,22 +2182,22 @@ service for everything behind it.</p>
 <p><strong>First, on the new node</strong>, create the key the load
 balancer will use. It is the node’s own ACL that decides what that key
 opens, so make it the narrowest thing that works:</p>
-<div class="sourceCode" id="cb72"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb72-1"><a href="#cb72-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;node admin key&gt;&#39;</span> <span class="dt">\</span></span>
-<span id="cb72-2"><a href="#cb72-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST https://new-node.example:9999/_management/api/keys <span class="dt">\</span></span>
-<span id="cb72-3"><a href="#cb72-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
-<span id="cb72-4"><a href="#cb72-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;key&quot;: &quot;lb-to-new-node&quot;, &quot;admin&quot;: false,</span></span>
-<span id="cb72-5"><a href="#cb72-5" aria-hidden="true" tabindex="-1"></a><span class="st">       &quot;read&quot;: [&quot;&quot;], &quot;write&quot;: [&quot;&quot;]}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb74"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb74-1"><a href="#cb74-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;node admin key&gt;&#39;</span> <span class="dt">\</span></span>
+<span id="cb74-2"><a href="#cb74-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST https://new-node.example:9999/_management/api/keys <span class="dt">\</span></span>
+<span id="cb74-3"><a href="#cb74-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb74-4"><a href="#cb74-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;key&quot;: &quot;lb-to-new-node&quot;, &quot;admin&quot;: false,</span></span>
+<span id="cb74-5"><a href="#cb74-5" aria-hidden="true" tabindex="-1"></a><span class="st">       &quot;read&quot;: [&quot;&quot;], &quot;write&quot;: [&quot;&quot;]}&#39;</span></span></code></pre></div>
 <p><code>read</code> and <code>write</code> are lists of namespace
 prefixes and <code>&quot;&quot;</code> means all of them, so that is read and
 write everywhere — what a full mirror needs. For a node that only holds
 <code>feeds</code>, name it and the key cannot reach past it:</p>
-<div class="sourceCode" id="cb73"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb73-1"><a href="#cb73-1" aria-hidden="true" tabindex="-1"></a>  <span class="ex">-d</span> <span class="st">&#39;{&quot;key&quot;: &quot;lb-to-feeds&quot;, &quot;admin&quot;: false,</span></span>
-<span id="cb73-2"><a href="#cb73-2" aria-hidden="true" tabindex="-1"></a><span class="st">       &quot;read&quot;: [&quot;feeds&quot;], &quot;write&quot;: [&quot;feeds&quot;]}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb75"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb75-1"><a href="#cb75-1" aria-hidden="true" tabindex="-1"></a>  <span class="ex">-d</span> <span class="st">&#39;{&quot;key&quot;: &quot;lb-to-feeds&quot;, &quot;admin&quot;: false,</span></span>
+<span id="cb75-2"><a href="#cb75-2" aria-hidden="true" tabindex="-1"></a><span class="st">       &quot;read&quot;: [&quot;feeds&quot;], &quot;write&quot;: [&quot;feeds&quot;]}&#39;</span></span></code></pre></div>
 <p><strong>Then, on the load balancer</strong>, add the peer:</p>
-<div class="sourceCode" id="cb74"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb74-1"><a href="#cb74-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;lb admin key&gt;&#39;</span> <span class="dt">\</span></span>
-<span id="cb74-2"><a href="#cb74-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST https://lb.example:9999/_management/api/galaxy/peers <span class="dt">\</span></span>
-<span id="cb74-3"><a href="#cb74-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
-<span id="cb74-4"><a href="#cb74-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;url&quot;: &quot;https://new-node.example:9999&quot;, &quot;key&quot;: &quot;lb-to-new-node&quot;}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb76"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb76-1"><a href="#cb76-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;lb admin key&gt;&#39;</span> <span class="dt">\</span></span>
+<span id="cb76-2"><a href="#cb76-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST https://lb.example:9999/_management/api/galaxy/peers <span class="dt">\</span></span>
+<span id="cb76-3"><a href="#cb76-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb76-4"><a href="#cb76-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;url&quot;: &quot;https://new-node.example:9999&quot;, &quot;key&quot;: &quot;lb-to-new-node&quot;}&#39;</span></span></code></pre></div>
 <p>Leave <code>namespaces</code> out for a full mirror; name them for a
 partial one. It must agree with the node’s own
 <code>[storage] namespaces</code>.</p>
@@ -2205,11 +2228,11 @@ not heal: the node has no way to know what it is missing.</p>
 <p>The fix is to give the new node a <code>[galaxy]</code> section
 naming at least one existing node, and a non-zero
 <code>sync_interval</code>:</p>
-<div class="sourceCode" id="cb76"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb76-1"><a href="#cb76-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[galaxy]</span></span>
-<span id="cb76-2"><a href="#cb76-2" aria-hidden="true" tabindex="-1"></a><span class="dt">sync_interval</span> <span class="op">=</span> <span class="dv">300</span></span>
-<span id="cb76-3"><a href="#cb76-3" aria-hidden="true" tabindex="-1"></a><span class="dt">peers</span> <span class="op">=</span> <span class="op">[</span></span>
-<span id="cb76-4"><a href="#cb76-4" aria-hidden="true" tabindex="-1"></a>  <span class="op">{ </span><span class="dt">url</span><span class="op"> =</span> <span class="st">&quot;https://node-a.example:9999&quot;</span><span class="op">, </span><span class="dt">key</span><span class="op"> =</span> <span class="st">&quot;new-node-to-node-a&quot;</span><span class="op"> },</span></span>
-<span id="cb76-5"><a href="#cb76-5" aria-hidden="true" tabindex="-1"></a><span class="op">]</span></span></code></pre></div>
+<div class="sourceCode" id="cb78"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb78-1"><a href="#cb78-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[galaxy]</span></span>
+<span id="cb78-2"><a href="#cb78-2" aria-hidden="true" tabindex="-1"></a><span class="dt">sync_interval</span> <span class="op">=</span> <span class="dv">300</span></span>
+<span id="cb78-3"><a href="#cb78-3" aria-hidden="true" tabindex="-1"></a><span class="dt">peers</span> <span class="op">=</span> <span class="op">[</span></span>
+<span id="cb78-4"><a href="#cb78-4" aria-hidden="true" tabindex="-1"></a>  <span class="op">{ </span><span class="dt">url</span><span class="op"> =</span> <span class="st">&quot;https://node-a.example:9999&quot;</span><span class="op">, </span><span class="dt">key</span><span class="op"> =</span> <span class="st">&quot;new-node-to-node-a&quot;</span><span class="op"> },</span></span>
+<span id="cb78-5"><a href="#cb78-5" aria-hidden="true" tabindex="-1"></a><span class="op">]</span></span></code></pre></div>
 <p>It then asks that node what it holds, compares, and pulls what it is
 missing. While it does, it reports <code>catching_up</code> and the load
 balancer sends reads elsewhere. With that in place, the same test:</p>
@@ -2217,8 +2240,8 @@ balancer sends reads elsewhere. With that in place, the same test:</p>
 <p>The key for <em>that</em> direction is read-only — pulling is a read,
 and a node catching up has no business writing on the node it pulls
 from:</p>
-<div class="sourceCode" id="cb78"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb78-1"><a href="#cb78-1" aria-hidden="true" tabindex="-1"></a>  <span class="ex">-d</span> <span class="st">&#39;{&quot;key&quot;: &quot;new-node-to-node-a&quot;, &quot;admin&quot;: false,</span></span>
-<span id="cb78-2"><a href="#cb78-2" aria-hidden="true" tabindex="-1"></a><span class="st">       &quot;read&quot;: [&quot;&quot;], &quot;write&quot;: []}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb80"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb80-1"><a href="#cb80-1" aria-hidden="true" tabindex="-1"></a>  <span class="ex">-d</span> <span class="st">&#39;{&quot;key&quot;: &quot;new-node-to-node-a&quot;, &quot;admin&quot;: false,</span></span>
+<span id="cb80-2"><a href="#cb80-2" aria-hidden="true" tabindex="-1"></a><span class="st">       &quot;read&quot;: [&quot;&quot;], &quot;write&quot;: []}&#39;</span></span></code></pre></div>
 <p>A node with no <code>[galaxy]</code> at all never reports catching
 up, because it has nothing to catch up from. That is a valid
 configuration — a node that only ever holds what arrives from now on —
@@ -2230,10 +2253,10 @@ as long as it is the one you meant.</p>
 Changing one</h2>
 <p>Rotating a key, or changing what a node holds, is
 <code>PUT</code>:</p>
-<div class="sourceCode" id="cb79"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb79-1"><a href="#cb79-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;lb admin key&gt;&#39;</span> <span class="dt">\</span></span>
-<span id="cb79-2"><a href="#cb79-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> PUT https://lb.example:9999/_management/api/galaxy/peers <span class="dt">\</span></span>
-<span id="cb79-3"><a href="#cb79-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
-<span id="cb79-4"><a href="#cb79-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;url&quot;: &quot;https://new-node.example:9999&quot;, &quot;key&quot;: &quot;a-rotated-key&quot;}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb81"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb81-1"><a href="#cb81-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;lb admin key&gt;&#39;</span> <span class="dt">\</span></span>
+<span id="cb81-2"><a href="#cb81-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> PUT https://lb.example:9999/_management/api/galaxy/peers <span class="dt">\</span></span>
+<span id="cb81-3"><a href="#cb81-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb81-4"><a href="#cb81-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;url&quot;: &quot;https://new-node.example:9999&quot;, &quot;key&quot;: &quot;a-rotated-key&quot;}&#39;</span></span></code></pre></div>
 <p>Adding and changing are separate verbs on purpose. An upsert would
 mean that typing an address that already exists silently replaces its
 key, and that key is the one thing bounding what the load balancer may
@@ -2248,10 +2271,10 @@ hand it out.</p>
 <section id="taking-one-out-of-service" class="level2" data-number="9.4">
 <h2 data-number="9.4"><span class="header-section-number">9.4</span>
 Taking one out of service</h2>
-<div class="sourceCode" id="cb80"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb80-1"><a href="#cb80-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;lb admin key&gt;&#39;</span> <span class="dt">\</span></span>
-<span id="cb80-2"><a href="#cb80-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST https://lb.example:9999/_management/api/galaxy/peers/enabled <span class="dt">\</span></span>
-<span id="cb80-3"><a href="#cb80-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
-<span id="cb80-4"><a href="#cb80-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;url&quot;: &quot;https://node-b.example:9999&quot;, &quot;enabled&quot;: false}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb82"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb82-1"><a href="#cb82-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;lb admin key&gt;&#39;</span> <span class="dt">\</span></span>
+<span id="cb82-2"><a href="#cb82-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST https://lb.example:9999/_management/api/galaxy/peers/enabled <span class="dt">\</span></span>
+<span id="cb82-3"><a href="#cb82-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb82-4"><a href="#cb82-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;url&quot;: &quot;https://node-b.example:9999&quot;, &quot;enabled&quot;: false}&#39;</span></span></code></pre></div>
 <p>The peer is <strong>kept</strong> — address, key, what it holds — and
 this server sends it nothing at all: no forwarded request, no catch-up,
 no gossip, not even a health probe. For a node going down for
@@ -2260,10 +2283,10 @@ find its key again to put it back. <code>Disable</code> and
 <code>Enable</code> on the Galaxy page are the same call.</p>
 <p>It survives a restart, because it is written to the
 <code>peers_file</code>:</p>
-<div class="sourceCode" id="cb81"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb81-1"><a href="#cb81-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[[peers]]</span></span>
-<span id="cb81-2"><a href="#cb81-2" aria-hidden="true" tabindex="-1"></a><span class="dt">url</span> <span class="op">=</span> <span class="st">&quot;https://node-b.example:9999&quot;</span></span>
-<span id="cb81-3"><a href="#cb81-3" aria-hidden="true" tabindex="-1"></a><span class="dt">key</span> <span class="op">=</span> <span class="st">&quot;lb-full&quot;</span></span>
-<span id="cb81-4"><a href="#cb81-4" aria-hidden="true" tabindex="-1"></a><span class="dt">enabled</span> <span class="op">=</span> <span class="cn">false</span></span></code></pre></div>
+<div class="sourceCode" id="cb83"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb83-1"><a href="#cb83-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[[peers]]</span></span>
+<span id="cb83-2"><a href="#cb83-2" aria-hidden="true" tabindex="-1"></a><span class="dt">url</span> <span class="op">=</span> <span class="st">&quot;https://node-b.example:9999&quot;</span></span>
+<span id="cb83-3"><a href="#cb83-3" aria-hidden="true" tabindex="-1"></a><span class="dt">key</span> <span class="op">=</span> <span class="st">&quot;lb-full&quot;</span></span>
+<span id="cb83-4"><a href="#cb83-4" aria-hidden="true" tabindex="-1"></a><span class="dt">enabled</span> <span class="op">=</span> <span class="cn">false</span></span></code></pre></div>
 <p><strong>A namespace only that peer held is out of reach while it is
 off</strong>, and reads of it answer <code>421</code>. That is what
 taking a node out of service means rather than a side effect of it —
@@ -2274,8 +2297,8 @@ decisions.</p>
 <section id="removing-one" class="level2" data-number="9.5">
 <h2 data-number="9.5"><span class="header-section-number">9.5</span>
 Removing one</h2>
-<div class="sourceCode" id="cb82"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb82-1"><a href="#cb82-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;lb admin key&gt;&#39;</span> <span class="at">-X</span> DELETE <span class="dt">\</span></span>
-<span id="cb82-2"><a href="#cb82-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;https://lb.example:9999/_management/api/galaxy/peers?url=https%3A%2F%2Fnode-b.example%3A9999&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb84"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb84-1"><a href="#cb84-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: &lt;lb admin key&gt;&#39;</span> <span class="at">-X</span> DELETE <span class="dt">\</span></span>
+<span id="cb84-2"><a href="#cb84-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;https://lb.example:9999/_management/api/galaxy/peers?url=https%3A%2F%2Fnode-b.example%3A9999&#39;</span></span></code></pre></div>
 <p>Nothing stored on the node is deleted; this server stops using it.
 Its health is forgotten with it, so re-adding the same address starts
 unprobed rather than inheriting a stale “offline”.</p>
@@ -2285,9 +2308,9 @@ unprobed rather than inheriting a stale “offline”.</p>
 What you cannot change over the API</h2>
 <p>A peer written into <code>[galaxy] peers</code> in the configuration
 file:</p>
-<div class="sourceCode" id="cb83"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb83-1"><a href="#cb83-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;https://node-a.example:9999 is declared in the configuration file,</span></span>
-<span id="cb83-2"><a href="#cb83-2" aria-hidden="true" tabindex="-1"></a><span class="st"> so removing it here would not last: it would come back at the next restart.</span></span>
-<span id="cb83-3"><a href="#cb83-3" aria-hidden="true" tabindex="-1"></a><span class="st"> Remove it from [galaxy] peers instead.&quot;</span><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb85"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb85-1"><a href="#cb85-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;https://node-a.example:9999 is declared in the configuration file,</span></span>
+<span id="cb85-2"><a href="#cb85-2" aria-hidden="true" tabindex="-1"></a><span class="st"> so removing it here would not last: it would come back at the next restart.</span></span>
+<span id="cb85-3"><a href="#cb85-3" aria-hidden="true" tabindex="-1"></a><span class="st"> Remove it from [galaxy] peers instead.&quot;</span><span class="fu">}</span></span></code></pre></div>
 <p>That file is yours and the program does not rewrite it, so a change
 made here would be undone by the next restart. Either edit it, or move
 the peer out of it so the API owns it. <code>sightingdb --setup</code>
@@ -2298,14 +2321,14 @@ the easier starting point.</p>
 <section id="watching-it" class="level2" data-number="9.7">
 <h2 data-number="9.7"><span class="header-section-number">9.7</span>
 Watching it</h2>
-<div class="sourceCode" id="cb84"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb84-1"><a href="#cb84-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb84-2"><a href="#cb84-2" aria-hidden="true" tabindex="-1"></a>  https://lb.example:9999/_management/api/galaxy/peers</span></code></pre></div>
-<div class="sourceCode" id="cb85"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb85-1"><a href="#cb85-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;peers&quot;</span><span class="fu">:</span><span class="ot">[</span></span>
-<span id="cb85-2"><a href="#cb85-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;url&quot;</span><span class="fu">:</span><span class="st">&quot;https://node-a:9999&quot;</span><span class="fu">,</span><span class="dt">&quot;namespaces&quot;</span><span class="fu">:</span><span class="kw">null</span><span class="fu">,</span><span class="dt">&quot;fixed&quot;</span><span class="fu">:</span><span class="kw">false</span><span class="fu">,</span><span class="dt">&quot;enabled&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span></span>
-<span id="cb85-3"><a href="#cb85-3" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;health&quot;</span><span class="fu">:{</span><span class="dt">&quot;online&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span><span class="dt">&quot;probed&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span><span class="dt">&quot;last_seen&quot;</span><span class="fu">:</span><span class="dv">1791678296</span><span class="fu">,</span></span>
-<span id="cb85-4"><a href="#cb85-4" aria-hidden="true" tabindex="-1"></a>             <span class="dt">&quot;latency_ms&quot;</span><span class="fu">:</span><span class="dv">1</span><span class="fu">,</span><span class="dt">&quot;version&quot;</span><span class="fu">:</span><span class="st">&quot;0.7.1&quot;</span><span class="fu">,</span><span class="dt">&quot;error&quot;</span><span class="fu">:</span><span class="kw">null</span><span class="fu">,</span></span>
-<span id="cb85-5"><a href="#cb85-5" aria-hidden="true" tabindex="-1"></a>             <span class="dt">&quot;failures&quot;</span><span class="fu">:</span><span class="dv">0</span><span class="fu">,</span><span class="dt">&quot;catching_up&quot;</span><span class="fu">:</span><span class="kw">false</span><span class="fu">}}</span><span class="ot">]</span><span class="fu">,</span></span>
-<span id="cb85-6"><a href="#cb85-6" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;editable&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb86"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb86-1"><a href="#cb86-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb86-2"><a href="#cb86-2" aria-hidden="true" tabindex="-1"></a>  https://lb.example:9999/_management/api/galaxy/peers</span></code></pre></div>
+<div class="sourceCode" id="cb87"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb87-1"><a href="#cb87-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;peers&quot;</span><span class="fu">:</span><span class="ot">[</span></span>
+<span id="cb87-2"><a href="#cb87-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;url&quot;</span><span class="fu">:</span><span class="st">&quot;https://node-a:9999&quot;</span><span class="fu">,</span><span class="dt">&quot;namespaces&quot;</span><span class="fu">:</span><span class="kw">null</span><span class="fu">,</span><span class="dt">&quot;fixed&quot;</span><span class="fu">:</span><span class="kw">false</span><span class="fu">,</span><span class="dt">&quot;enabled&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb87-3"><a href="#cb87-3" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;health&quot;</span><span class="fu">:{</span><span class="dt">&quot;online&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span><span class="dt">&quot;probed&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span><span class="dt">&quot;last_seen&quot;</span><span class="fu">:</span><span class="dv">1791678296</span><span class="fu">,</span></span>
+<span id="cb87-4"><a href="#cb87-4" aria-hidden="true" tabindex="-1"></a>             <span class="dt">&quot;latency_ms&quot;</span><span class="fu">:</span><span class="dv">1</span><span class="fu">,</span><span class="dt">&quot;version&quot;</span><span class="fu">:</span><span class="st">&quot;0.7.1&quot;</span><span class="fu">,</span><span class="dt">&quot;error&quot;</span><span class="fu">:</span><span class="kw">null</span><span class="fu">,</span></span>
+<span id="cb87-5"><a href="#cb87-5" aria-hidden="true" tabindex="-1"></a>             <span class="dt">&quot;failures&quot;</span><span class="fu">:</span><span class="dv">0</span><span class="fu">,</span><span class="dt">&quot;catching_up&quot;</span><span class="fu">:</span><span class="kw">false</span><span class="fu">}}</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb87-6"><a href="#cb87-6" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;editable&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">}</span></span></code></pre></div>
 <p><code>probed: false</code> with <code>online: false</code> means “not
 asked yet”, which is not the same as down. <code>last_seen</code> is
 when this server last got a health reply from that peer — nothing to do
@@ -2585,23 +2608,23 @@ sighting is. This is the chapter where that pays.</p>
 <section id="exporting-stix-2.1" class="level2" data-number="11.1">
 <h2 data-number="11.1"><span class="header-section-number">11.1</span>
 Exporting STIX 2.1</h2>
-<div class="sourceCode" id="cb86"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb86-1"><a href="#cb86-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb86-2"><a href="#cb86-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds/misp/ips&#39;</span> <span class="op">&gt;</span> bundle.json</span></code></pre></div>
+<div class="sourceCode" id="cb88"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb88-1"><a href="#cb88-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb88-2"><a href="#cb88-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds/misp/ips&#39;</span> <span class="op">&gt;</span> bundle.json</span></code></pre></div>
 <p>A namespace becomes a bundle shaped after the OASIS <em>Sighting of
 an Indicator</em> example: for each value an <code>indicator</code>
 carrying the pattern, and a <code>sighting</code> that refers to it with
 the count and the window.</p>
-<div class="sourceCode" id="cb87"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb87-1"><a href="#cb87-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;bundle&quot;</span><span class="fu">,</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;bundle--...&quot;</span><span class="fu">,</span><span class="dt">&quot;objects&quot;</span><span class="fu">:</span><span class="ot">[</span></span>
-<span id="cb87-2"><a href="#cb87-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;identity&quot;</span><span class="fu">,</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;identity--...&quot;</span><span class="fu">,</span><span class="dt">&quot;name&quot;</span><span class="fu">:</span><span class="st">&quot;SightingDB&quot;</span><span class="fu">,</span> <span class="er">...</span><span class="fu">}</span><span class="ot">,</span></span>
-<span id="cb87-3"><a href="#cb87-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;indicator&quot;</span><span class="fu">,</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;indicator--...&quot;</span><span class="fu">,</span></span>
-<span id="cb87-4"><a href="#cb87-4" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;pattern&quot;</span><span class="fu">:</span><span class="st">&quot;[ipv4-addr:value = &#39;198.51.100.23&#39;]&quot;</span><span class="fu">,</span><span class="dt">&quot;pattern_type&quot;</span><span class="fu">:</span><span class="st">&quot;stix&quot;</span><span class="fu">,</span></span>
-<span id="cb87-5"><a href="#cb87-5" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;object_marking_refs&quot;</span><span class="fu">:</span><span class="ot">[</span><span class="st">&quot;marking-definition--...&quot;</span><span class="ot">]</span><span class="fu">,</span> <span class="er">...</span><span class="fu">}</span><span class="ot">,</span></span>
-<span id="cb87-6"><a href="#cb87-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;sighting&quot;</span><span class="fu">,</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;sighting--...&quot;</span><span class="fu">,</span></span>
-<span id="cb87-7"><a href="#cb87-7" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;count&quot;</span><span class="fu">:</span><span class="dv">5</span><span class="fu">,</span><span class="dt">&quot;first_seen&quot;</span><span class="fu">:</span><span class="st">&quot;...&quot;</span><span class="fu">,</span><span class="dt">&quot;last_seen&quot;</span><span class="fu">:</span><span class="st">&quot;...&quot;</span><span class="fu">,</span></span>
-<span id="cb87-8"><a href="#cb87-8" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;sighting_of_ref&quot;</span><span class="fu">:</span><span class="st">&quot;indicator--...&quot;</span><span class="fu">,</span></span>
-<span id="cb87-9"><a href="#cb87-9" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;where_sighted_refs&quot;</span><span class="fu">:</span><span class="ot">[</span><span class="st">&quot;identity--...&quot;</span><span class="ot">]</span><span class="fu">,</span></span>
-<span id="cb87-10"><a href="#cb87-10" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;x_sightingdb_namespace&quot;</span><span class="fu">:</span><span class="st">&quot;feeds/misp/ips&quot;</span><span class="fu">}</span><span class="ot">,</span></span>
-<span id="cb87-11"><a href="#cb87-11" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;marking-definition&quot;</span><span class="fu">,</span><span class="dt">&quot;name&quot;</span><span class="fu">:</span><span class="st">&quot;TLP:AMBER&quot;</span><span class="fu">,</span> <span class="er">...</span><span class="fu">}</span><span class="ot">]</span><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb89"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb89-1"><a href="#cb89-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;bundle&quot;</span><span class="fu">,</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;bundle--...&quot;</span><span class="fu">,</span><span class="dt">&quot;objects&quot;</span><span class="fu">:</span><span class="ot">[</span></span>
+<span id="cb89-2"><a href="#cb89-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;identity&quot;</span><span class="fu">,</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;identity--...&quot;</span><span class="fu">,</span><span class="dt">&quot;name&quot;</span><span class="fu">:</span><span class="st">&quot;SightingDB&quot;</span><span class="fu">,</span> <span class="er">...</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb89-3"><a href="#cb89-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;indicator&quot;</span><span class="fu">,</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;indicator--...&quot;</span><span class="fu">,</span></span>
+<span id="cb89-4"><a href="#cb89-4" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;pattern&quot;</span><span class="fu">:</span><span class="st">&quot;[ipv4-addr:value = &#39;198.51.100.23&#39;]&quot;</span><span class="fu">,</span><span class="dt">&quot;pattern_type&quot;</span><span class="fu">:</span><span class="st">&quot;stix&quot;</span><span class="fu">,</span></span>
+<span id="cb89-5"><a href="#cb89-5" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;object_marking_refs&quot;</span><span class="fu">:</span><span class="ot">[</span><span class="st">&quot;marking-definition--...&quot;</span><span class="ot">]</span><span class="fu">,</span> <span class="er">...</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb89-6"><a href="#cb89-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;sighting&quot;</span><span class="fu">,</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;sighting--...&quot;</span><span class="fu">,</span></span>
+<span id="cb89-7"><a href="#cb89-7" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;count&quot;</span><span class="fu">:</span><span class="dv">5</span><span class="fu">,</span><span class="dt">&quot;first_seen&quot;</span><span class="fu">:</span><span class="st">&quot;...&quot;</span><span class="fu">,</span><span class="dt">&quot;last_seen&quot;</span><span class="fu">:</span><span class="st">&quot;...&quot;</span><span class="fu">,</span></span>
+<span id="cb89-8"><a href="#cb89-8" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;sighting_of_ref&quot;</span><span class="fu">:</span><span class="st">&quot;indicator--...&quot;</span><span class="fu">,</span></span>
+<span id="cb89-9"><a href="#cb89-9" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;where_sighted_refs&quot;</span><span class="fu">:</span><span class="ot">[</span><span class="st">&quot;identity--...&quot;</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb89-10"><a href="#cb89-10" aria-hidden="true" tabindex="-1"></a>   <span class="dt">&quot;x_sightingdb_namespace&quot;</span><span class="fu">:</span><span class="st">&quot;feeds/misp/ips&quot;</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb89-11"><a href="#cb89-11" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;marking-definition&quot;</span><span class="fu">,</span><span class="dt">&quot;name&quot;</span><span class="fu">:</span><span class="st">&quot;TLP:AMBER&quot;</span><span class="fu">,</span> <span class="er">...</span><span class="fu">}</span><span class="ot">]</span><span class="fu">}</span></span></code></pre></div>
 <p>The namespace travels as <code>x_sightingdb_namespace</code>, which
 is a custom property and so carries the <code>x_</code> prefix the
 specification requires.</p>
@@ -2660,14 +2683,14 @@ you have fixed and a name you can reconstruct.</p>
 </table>
 <p>Which means you can mint the same ids yourself, without this
 server:</p>
-<div class="sourceCode" id="cb90"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb90-1"><a href="#cb90-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> uuid</span>
-<span id="cb90-2"><a href="#cb90-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb90-3"><a href="#cb90-3" aria-hidden="true" tabindex="-1"></a>SIGHTINGDB <span class="op">=</span> uuid.UUID(<span class="st">&quot;3ef11775-6174-4718-92bf-16705b732650&quot;</span>)</span>
-<span id="cb90-4"><a href="#cb90-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb90-5"><a href="#cb90-5" aria-hidden="true" tabindex="-1"></a>value, observable, namespace <span class="op">=</span> <span class="st">&quot;evil.example&quot;</span>, <span class="st">&quot;domain-name&quot;</span>, <span class="st">&quot;feeds/misp/domains&quot;</span></span>
-<span id="cb90-6"><a href="#cb90-6" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb90-7"><a href="#cb90-7" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;indicator--&quot;</span> <span class="op">+</span> <span class="bu">str</span>(uuid.uuid5(SIGHTINGDB, <span class="ss">f&quot;indicator:</span><span class="sc">{</span>observable<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>value<span class="sc">}</span><span class="ss">&quot;</span>)))</span>
-<span id="cb90-8"><a href="#cb90-8" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;sighting--&quot;</span>  <span class="op">+</span> <span class="bu">str</span>(uuid.uuid5(SIGHTINGDB, <span class="ss">f&quot;sighting:</span><span class="sc">{</span>namespace<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>observable<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>value<span class="sc">}</span><span class="ss">&quot;</span>)))</span></code></pre></div>
+<div class="sourceCode" id="cb92"><pre class="sourceCode python"><code class="sourceCode python"><span id="cb92-1"><a href="#cb92-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> uuid</span>
+<span id="cb92-2"><a href="#cb92-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb92-3"><a href="#cb92-3" aria-hidden="true" tabindex="-1"></a>SIGHTINGDB <span class="op">=</span> uuid.UUID(<span class="st">&quot;3ef11775-6174-4718-92bf-16705b732650&quot;</span>)</span>
+<span id="cb92-4"><a href="#cb92-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb92-5"><a href="#cb92-5" aria-hidden="true" tabindex="-1"></a>value, observable, namespace <span class="op">=</span> <span class="st">&quot;evil.example&quot;</span>, <span class="st">&quot;domain-name&quot;</span>, <span class="st">&quot;feeds/misp/domains&quot;</span></span>
+<span id="cb92-6"><a href="#cb92-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb92-7"><a href="#cb92-7" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;indicator--&quot;</span> <span class="op">+</span> <span class="bu">str</span>(uuid.uuid5(SIGHTINGDB, <span class="ss">f&quot;indicator:</span><span class="sc">{</span>observable<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>value<span class="sc">}</span><span class="ss">&quot;</span>)))</span>
+<span id="cb92-8"><a href="#cb92-8" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;sighting--&quot;</span>  <span class="op">+</span> <span class="bu">str</span>(uuid.uuid5(SIGHTINGDB, <span class="ss">f&quot;sighting:</span><span class="sc">{</span>namespace<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>observable<span class="sc">}</span><span class="ss">:</span><span class="sc">{</span>value<span class="sc">}</span><span class="ss">&quot;</span>)))</span></code></pre></div>
 <p>Those are exactly the ids the export produces for that value in that
 namespace — not an illustration of the idea, the same two strings hashed
 the same way. And they will not change between releases: the namespace
@@ -2684,9 +2707,9 @@ gave it, in a <code>stix-id:</code> tag, and that overrides the formula
 altogether. Guess either wrong and you hold an id nothing else uses.</p>
 <p>So when the server is to hand, ask it. <code>val=</code> exports one
 value rather than the whole namespace:</p>
-<div class="sourceCode" id="cb91"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb91-1"><a href="#cb91-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb91-2"><a href="#cb91-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds/misp/ips?val=1.2.3.4&#39;</span> <span class="kw">|</span></span>
-<span id="cb91-3"><a href="#cb91-3" aria-hidden="true" tabindex="-1"></a><span class="ex">jq</span> <span class="at">-r</span> <span class="st">&#39;.objects[] | select(.type == &quot;indicator&quot; or .type == &quot;sighting&quot;) | .id&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb93"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb93-1"><a href="#cb93-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb93-2"><a href="#cb93-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds/misp/ips?val=1.2.3.4&#39;</span> <span class="kw">|</span></span>
+<span id="cb93-3"><a href="#cb93-3" aria-hidden="true" tabindex="-1"></a><span class="ex">jq</span> <span class="at">-r</span> <span class="st">&#39;.objects[] | select(.type == &quot;indicator&quot; or .type == &quot;sighting&quot;) | .id&#39;</span></span></code></pre></div>
 <pre class="text"><code>indicator--407cd7a8-da80-5fa3-b02a-9ae7ccc848e0
 sighting--43ec94b4-476f-5985-a5a2-0100e2f28153</code></pre>
 <p>Same code as the full export, so the same ids, with the type worked
@@ -2744,8 +2767,8 @@ backwards.</li>
 <p>A value that none of those identify is <strong>skipped</strong> and
 counted in <code>X-SightingDB-Skipped</code>, never guessed at. If you
 would rather have it, ask:</p>
-<div class="sourceCode" id="cb93"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb93-1"><a href="#cb93-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb93-2"><a href="#cb93-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds/misp/ips?untyped=include&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb95"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb95-1"><a href="#cb95-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb95-2"><a href="#cb95-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds/misp/ips?untyped=include&#39;</span></span></code></pre></div>
 <p>Those go out as a custom observable type, flagged, so a consumer can
 tell them from a value whose type is actually known.</p>
 </section>
@@ -2796,11 +2819,11 @@ than one that refused, so it says.</p>
 <section id="a-subtree-or-several-namespaces" class="level3" data-number="11.1.5">
 <h3 data-number="11.1.5"><span class="header-section-number">11.1.5</span> A subtree, or several
 namespaces</h3>
-<div class="sourceCode" id="cb94"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb94-1"><a href="#cb94-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb94-2"><a href="#cb94-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds?recursive&#39;</span></span></code></pre></div>
-<div class="sourceCode" id="cb95"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb95-1"><a href="#cb95-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
-<span id="cb95-2"><a href="#cb95-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST http://localhost:9999/_api/stix <span class="dt">\</span></span>
-<span id="cb95-3"><a href="#cb95-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;namespaces&quot;:[&quot;feeds/misp/ips&quot;,&quot;watchlist/ips&quot;],&quot;q&quot;:&quot;198.51&quot;,&quot;limit&quot;:500}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb96"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb96-1"><a href="#cb96-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb96-2"><a href="#cb96-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/stix/feeds?recursive&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb97"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb97-1"><a href="#cb97-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb97-2"><a href="#cb97-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-X</span> POST http://localhost:9999/_api/stix <span class="dt">\</span></span>
+<span id="cb97-3"><a href="#cb97-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;namespaces&quot;:[&quot;feeds/misp/ips&quot;,&quot;watchlist/ips&quot;],&quot;q&quot;:&quot;198.51&quot;,&quot;limit&quot;:500}&#39;</span></span></code></pre></div>
 <p>Through a load balancer, each namespace is exported by the mirror
 that holds it and the bundles are folded into one. The result is
 byte-identical to what a single server holding all of them would produce
@@ -2809,14 +2832,14 @@ reconciliation.</p>
 </section>
 <section id="configuring-who-you-are" class="level3" data-number="11.1.6">
 <h3 data-number="11.1.6"><span class="header-section-number">11.1.6</span> Configuring who you are</h3>
-<div class="sourceCode" id="cb96"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb96-1"><a href="#cb96-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[stix]</span></span>
-<span id="cb96-2"><a href="#cb96-2" aria-hidden="true" tabindex="-1"></a><span class="dt">identity</span> <span class="op">=</span> <span class="st">&quot;Beta Cyber Intelligence Company&quot;</span></span>
-<span id="cb96-3"><a href="#cb96-3" aria-hidden="true" tabindex="-1"></a><span class="dt">identity_class</span> <span class="op">=</span> <span class="st">&quot;organization&quot;</span></span>
-<span id="cb96-4"><a href="#cb96-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb96-5"><a href="#cb96-5" aria-hidden="true" tabindex="-1"></a><span class="kw">[stix.types]</span></span>
-<span id="cb96-6"><a href="#cb96-6" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/ips&quot;</span> <span class="op">=</span> <span class="st">&quot;ipv4-addr&quot;</span></span>
-<span id="cb96-7"><a href="#cb96-7" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/domains&quot;</span> <span class="op">=</span> <span class="st">&quot;domain-name&quot;</span></span>
-<span id="cb96-8"><a href="#cb96-8" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/hashes&quot;</span> <span class="op">=</span> <span class="st">&quot;file.SHA-256&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb98"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb98-1"><a href="#cb98-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[stix]</span></span>
+<span id="cb98-2"><a href="#cb98-2" aria-hidden="true" tabindex="-1"></a><span class="dt">identity</span> <span class="op">=</span> <span class="st">&quot;Beta Cyber Intelligence Company&quot;</span></span>
+<span id="cb98-3"><a href="#cb98-3" aria-hidden="true" tabindex="-1"></a><span class="dt">identity_class</span> <span class="op">=</span> <span class="st">&quot;organization&quot;</span></span>
+<span id="cb98-4"><a href="#cb98-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb98-5"><a href="#cb98-5" aria-hidden="true" tabindex="-1"></a><span class="kw">[stix.types]</span></span>
+<span id="cb98-6"><a href="#cb98-6" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/ips&quot;</span> <span class="op">=</span> <span class="st">&quot;ipv4-addr&quot;</span></span>
+<span id="cb98-7"><a href="#cb98-7" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/domains&quot;</span> <span class="op">=</span> <span class="st">&quot;domain-name&quot;</span></span>
+<span id="cb98-8"><a href="#cb98-8" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;feeds/misp/hashes&quot;</span> <span class="op">=</span> <span class="st">&quot;file.SHA-256&quot;</span></span></code></pre></div>
 <p><code>identity</code> is who the bundle is published by and who the
 sightings are attributed to when no <code>identity:</code> tag says
 otherwise. <code>[stix.types]</code> saves tagging every value in a
@@ -2833,7 +2856,7 @@ namespace that only ever holds one kind of thing.</p>
 <section id="importing-stix" class="level2" data-number="11.2">
 <h2 data-number="11.2"><span class="header-section-number">11.2</span>
 Importing STIX</h2>
-<div class="sourceCode" id="cb97"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb97-1"><a href="#cb97-1" aria-hidden="true" tabindex="-1"></a><span class="ex">sightingdb</span> <span class="at">--import-stix</span> ./bundles/</span></code></pre></div>
+<div class="sourceCode" id="cb99"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb99-1"><a href="#cb99-1" aria-hidden="true" tabindex="-1"></a><span class="ex">sightingdb</span> <span class="at">--import-stix</span> ./bundles/</span></code></pre></div>
 <p>A file or a directory. It loads, writes, saves and exits — no
 listeners start, so it is safe to run against a server’s data directory
 while that server is stopped.</p>
@@ -2991,8 +3014,8 @@ a proxy configured.</td>
 grants are by prefix. If the server keeps its keys in
 <code>acl_file</code>, create it in the interface (chapter 10);
 otherwise:</p>
-<div class="sourceCode" id="cb99"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb99-1"><a href="#cb99-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[acl]</span></span>
-<span id="cb99-2"><a href="#cb99-2" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;misp&quot;</span> <span class="op">=</span> <span class="st">&quot;rw:misp&quot;</span>     <span class="co"># &quot;r:misp&quot; if MISP only reads</span></span></code></pre></div>
+<div class="sourceCode" id="cb101"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb101-1"><a href="#cb101-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[acl]</span></span>
+<span id="cb101-2"><a href="#cb101-2" aria-hidden="true" tabindex="-1"></a><span class="dt">&quot;misp&quot;</span> <span class="op">=</span> <span class="st">&quot;rw:misp&quot;</span>     <span class="co"># &quot;r:misp&quot; if MISP only reads</span></span></code></pre></div>
 <p>The connection list has a <strong>Run</strong> button per connection,
 which asks the server who it is:</p>
 <figure>
@@ -3062,10 +3085,10 @@ drawing a graph is not someone looking a value up.</p>
 <h3 data-number="11.3.3"><span class="header-section-number">11.3.3</span> Feeding it</h3>
 <p>Anything that sees a value records it as its digest, in the namespace
 MISP reads:</p>
-<div class="sourceCode" id="cb100"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb100-1"><a href="#cb100-1" aria-hidden="true" tabindex="-1"></a><span class="va">value</span><span class="op">=</span>8.8.8.8</span>
-<span id="cb100-2"><a href="#cb100-2" aria-hidden="true" tabindex="-1"></a><span class="va">digest</span><span class="op">=</span><span class="va">$(</span><span class="bu">printf</span> %s <span class="st">&quot;</span><span class="va">$value</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">sha256sum</span> <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-d</span><span class="st">&#39; &#39;</span> <span class="at">-f1</span><span class="va">)</span></span>
-<span id="cb100-3"><a href="#cb100-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="st">&quot;http://localhost:9999/w/misp?val=</span><span class="va">$digest</span><span class="st">&quot;</span></span>
-<span id="cb100-4"><a href="#cb100-4" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="st">&quot;http://localhost:9999/w/misp/false-positive?val=</span><span class="va">$digest</span><span class="st">&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb102"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb102-1"><a href="#cb102-1" aria-hidden="true" tabindex="-1"></a><span class="va">value</span><span class="op">=</span>8.8.8.8</span>
+<span id="cb102-2"><a href="#cb102-2" aria-hidden="true" tabindex="-1"></a><span class="va">digest</span><span class="op">=</span><span class="va">$(</span><span class="bu">printf</span> %s <span class="st">&quot;</span><span class="va">$value</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">sha256sum</span> <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-d</span><span class="st">&#39; &#39;</span> <span class="at">-f1</span><span class="va">)</span></span>
+<span id="cb102-3"><a href="#cb102-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="st">&quot;http://localhost:9999/w/misp?val=</span><span class="va">$digest</span><span class="st">&quot;</span></span>
+<span id="cb102-4"><a href="#cb102-4" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="st">&quot;http://localhost:9999/w/misp/false-positive?val=</span><span class="va">$digest</span><span class="st">&quot;</span></span></code></pre></div>
 <p>The digest is of the attribute’s whole value, as MISP holds it:
 <code>1.2.3.4|80</code> is hashed as one string.</p>
 </section>
@@ -3102,13 +3125,13 @@ Plugin.ZeroMQ_attribute_notifications_enable = true
 Plugin.ZeroMQ_event_notifications_enable = true</code></pre>
 <p>On SightingDB’s, keeping digests only, in a namespace of their
 own:</p>
-<div class="sourceCode" id="cb102"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb102-1"><a href="#cb102-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq]</span></span>
-<span id="cb102-2"><a href="#cb102-2" aria-hidden="true" tabindex="-1"></a><span class="dt">endpoint</span> <span class="op">=</span> <span class="st">&quot;tcp://misp.example:50000&quot;</span></span>
-<span id="cb102-3"><a href="#cb102-3" aria-hidden="true" tabindex="-1"></a><span class="dt">format</span> <span class="op">=</span> <span class="st">&quot;misp&quot;</span></span>
-<span id="cb102-4"><a href="#cb102-4" aria-hidden="true" tabindex="-1"></a><span class="dt">topics</span> <span class="op">=</span> <span class="op">[</span><span class="st">&quot;misp_json_attribute&quot;</span><span class="op">,</span> <span class="st">&quot;misp_json&quot;</span><span class="op">]</span></span>
-<span id="cb102-5"><a href="#cb102-5" aria-hidden="true" tabindex="-1"></a><span class="dt">require_to_ids</span> <span class="op">=</span> <span class="cn">false</span></span>
-<span id="cb102-6"><a href="#cb102-6" aria-hidden="true" tabindex="-1"></a><span class="dt">hashed_namespace</span> <span class="op">=</span> <span class="st">&quot;misp/published&quot;</span></span>
-<span id="cb102-7"><a href="#cb102-7" aria-hidden="true" tabindex="-1"></a><span class="dt">store_values</span> <span class="op">=</span> <span class="cn">false</span></span></code></pre></div>
+<div class="sourceCode" id="cb104"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb104-1"><a href="#cb104-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq]</span></span>
+<span id="cb104-2"><a href="#cb104-2" aria-hidden="true" tabindex="-1"></a><span class="dt">endpoint</span> <span class="op">=</span> <span class="st">&quot;tcp://misp.example:50000&quot;</span></span>
+<span id="cb104-3"><a href="#cb104-3" aria-hidden="true" tabindex="-1"></a><span class="dt">format</span> <span class="op">=</span> <span class="st">&quot;misp&quot;</span></span>
+<span id="cb104-4"><a href="#cb104-4" aria-hidden="true" tabindex="-1"></a><span class="dt">topics</span> <span class="op">=</span> <span class="op">[</span><span class="st">&quot;misp_json_attribute&quot;</span><span class="op">,</span> <span class="st">&quot;misp_json&quot;</span><span class="op">]</span></span>
+<span id="cb104-5"><a href="#cb104-5" aria-hidden="true" tabindex="-1"></a><span class="dt">require_to_ids</span> <span class="op">=</span> <span class="cn">false</span></span>
+<span id="cb104-6"><a href="#cb104-6" aria-hidden="true" tabindex="-1"></a><span class="dt">hashed_namespace</span> <span class="op">=</span> <span class="st">&quot;misp/published&quot;</span></span>
+<span id="cb104-7"><a href="#cb104-7" aria-hidden="true" tabindex="-1"></a><span class="dt">store_values</span> <span class="op">=</span> <span class="cn">false</span></span></code></pre></div>
 <p><code>hashed_namespace</code> records the SHA-256 of every ingested
 attribute — mapped type or not — into that one namespace, which then
 holds a digest of every value MISP has, with a count of how often it was
@@ -3119,21 +3142,21 @@ left out.</p>
 <p>To keep the values as well, for the interface and the STIX export,
 leave <code>store_values</code> at its default and map types as
 usual:</p>
-<div class="sourceCode" id="cb103"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb103-1"><a href="#cb103-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq]</span></span>
-<span id="cb103-2"><a href="#cb103-2" aria-hidden="true" tabindex="-1"></a><span class="dt">endpoint</span> <span class="op">=</span> <span class="st">&quot;tcp://misp.example:50000&quot;</span></span>
-<span id="cb103-3"><a href="#cb103-3" aria-hidden="true" tabindex="-1"></a><span class="dt">format</span> <span class="op">=</span> <span class="st">&quot;misp&quot;</span></span>
-<span id="cb103-4"><a href="#cb103-4" aria-hidden="true" tabindex="-1"></a><span class="dt">default_namespace</span> <span class="op">=</span> <span class="st">&quot;misp/other&quot;</span></span>
-<span id="cb103-5"><a href="#cb103-5" aria-hidden="true" tabindex="-1"></a><span class="dt">require_to_ids</span> <span class="op">=</span> <span class="cn">false</span></span>
-<span id="cb103-6"><a href="#cb103-6" aria-hidden="true" tabindex="-1"></a><span class="dt">hashed_namespace</span> <span class="op">=</span> <span class="st">&quot;misp/published&quot;</span></span>
-<span id="cb103-7"><a href="#cb103-7" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb103-8"><a href="#cb103-8" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq.types]</span></span>
-<span id="cb103-9"><a href="#cb103-9" aria-hidden="true" tabindex="-1"></a><span class="dt">ip-src</span> <span class="op">=</span> <span class="st">&quot;misp/ips&quot;</span></span>
-<span id="cb103-10"><a href="#cb103-10" aria-hidden="true" tabindex="-1"></a><span class="dt">ip-dst</span> <span class="op">=</span> <span class="st">&quot;misp/ips&quot;</span></span>
-<span id="cb103-11"><a href="#cb103-11" aria-hidden="true" tabindex="-1"></a><span class="dt">domain</span> <span class="op">=</span> <span class="st">&quot;misp/domains&quot;</span></span>
-<span id="cb103-12"><a href="#cb103-12" aria-hidden="true" tabindex="-1"></a><span class="dt">hostname</span> <span class="op">=</span> <span class="st">&quot;misp/domains&quot;</span></span>
-<span id="cb103-13"><a href="#cb103-13" aria-hidden="true" tabindex="-1"></a><span class="dt">url</span> <span class="op">=</span> <span class="st">&quot;misp/urls&quot;</span></span>
-<span id="cb103-14"><a href="#cb103-14" aria-hidden="true" tabindex="-1"></a><span class="dt">md5</span> <span class="op">=</span> <span class="st">&quot;misp/hashes&quot;</span></span>
-<span id="cb103-15"><a href="#cb103-15" aria-hidden="true" tabindex="-1"></a><span class="dt">sha256</span> <span class="op">=</span> <span class="st">&quot;misp/hashes&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb105"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb105-1"><a href="#cb105-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq]</span></span>
+<span id="cb105-2"><a href="#cb105-2" aria-hidden="true" tabindex="-1"></a><span class="dt">endpoint</span> <span class="op">=</span> <span class="st">&quot;tcp://misp.example:50000&quot;</span></span>
+<span id="cb105-3"><a href="#cb105-3" aria-hidden="true" tabindex="-1"></a><span class="dt">format</span> <span class="op">=</span> <span class="st">&quot;misp&quot;</span></span>
+<span id="cb105-4"><a href="#cb105-4" aria-hidden="true" tabindex="-1"></a><span class="dt">default_namespace</span> <span class="op">=</span> <span class="st">&quot;misp/other&quot;</span></span>
+<span id="cb105-5"><a href="#cb105-5" aria-hidden="true" tabindex="-1"></a><span class="dt">require_to_ids</span> <span class="op">=</span> <span class="cn">false</span></span>
+<span id="cb105-6"><a href="#cb105-6" aria-hidden="true" tabindex="-1"></a><span class="dt">hashed_namespace</span> <span class="op">=</span> <span class="st">&quot;misp/published&quot;</span></span>
+<span id="cb105-7"><a href="#cb105-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb105-8"><a href="#cb105-8" aria-hidden="true" tabindex="-1"></a><span class="kw">[zmq.types]</span></span>
+<span id="cb105-9"><a href="#cb105-9" aria-hidden="true" tabindex="-1"></a><span class="dt">ip-src</span> <span class="op">=</span> <span class="st">&quot;misp/ips&quot;</span></span>
+<span id="cb105-10"><a href="#cb105-10" aria-hidden="true" tabindex="-1"></a><span class="dt">ip-dst</span> <span class="op">=</span> <span class="st">&quot;misp/ips&quot;</span></span>
+<span id="cb105-11"><a href="#cb105-11" aria-hidden="true" tabindex="-1"></a><span class="dt">domain</span> <span class="op">=</span> <span class="st">&quot;misp/domains&quot;</span></span>
+<span id="cb105-12"><a href="#cb105-12" aria-hidden="true" tabindex="-1"></a><span class="dt">hostname</span> <span class="op">=</span> <span class="st">&quot;misp/domains&quot;</span></span>
+<span id="cb105-13"><a href="#cb105-13" aria-hidden="true" tabindex="-1"></a><span class="dt">url</span> <span class="op">=</span> <span class="st">&quot;misp/urls&quot;</span></span>
+<span id="cb105-14"><a href="#cb105-14" aria-hidden="true" tabindex="-1"></a><span class="dt">md5</span> <span class="op">=</span> <span class="st">&quot;misp/hashes&quot;</span></span>
+<span id="cb105-15"><a href="#cb105-15" aria-hidden="true" tabindex="-1"></a><span class="dt">sha256</span> <span class="op">=</span> <span class="st">&quot;misp/hashes&quot;</span></span></code></pre></div>
 <p>Attributes are read from single-attribute publications and from whole
 events, including attributes nested inside objects — which is where most
 of a modern MISP event’s attributes live. Only mapped types are ingested
@@ -3291,9 +3314,9 @@ Operations</h1>
 <section id="is-it-alive" class="level2" data-number="12.1">
 <h2 data-number="12.1"><span class="header-section-number">12.1</span>
 Is it alive</h2>
-<div class="sourceCode" id="cb104"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb104-1"><a href="#cb104-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-fsS</span> http://localhost:9999/health</span></code></pre></div>
-<div class="sourceCode" id="cb105"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb105-1"><a href="#cb105-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span><span class="st">&quot;ok&quot;</span><span class="fu">,</span><span class="dt">&quot;version&quot;</span><span class="fu">:</span><span class="st">&quot;0.7.1&quot;</span><span class="fu">,</span><span class="dt">&quot;uptime_seconds&quot;</span><span class="fu">:</span><span class="dv">864</span><span class="fu">,</span></span>
-<span id="cb105-2"><a href="#cb105-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;resident_shards&quot;</span><span class="fu">:</span><span class="dv">4</span><span class="fu">,</span><span class="dt">&quot;shards&quot;</span><span class="fu">:</span><span class="dv">7</span><span class="fu">,</span><span class="dt">&quot;catching_up&quot;</span><span class="fu">:</span><span class="kw">false</span><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb106"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb106-1"><a href="#cb106-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-fsS</span> http://localhost:9999/health</span></code></pre></div>
+<div class="sourceCode" id="cb107"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb107-1"><a href="#cb107-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span><span class="st">&quot;ok&quot;</span><span class="fu">,</span><span class="dt">&quot;version&quot;</span><span class="fu">:</span><span class="st">&quot;0.7.1&quot;</span><span class="fu">,</span><span class="dt">&quot;uptime_seconds&quot;</span><span class="fu">:</span><span class="dv">864</span><span class="fu">,</span></span>
+<span id="cb107-2"><a href="#cb107-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;resident_shards&quot;</span><span class="fu">:</span><span class="dv">4</span><span class="fu">,</span><span class="dt">&quot;shards&quot;</span><span class="fu">:</span><span class="dv">7</span><span class="fu">,</span><span class="dt">&quot;catching_up&quot;</span><span class="fu">:</span><span class="kw">false</span><span class="fu">}</span></span></code></pre></div>
 <p>No key, which is what makes it usable as a container healthcheck and
 a load balancer probe. <code>resident_shards</code> against
 <code>shards</code> is how much of the database is in memory;
@@ -3334,12 +3357,12 @@ memory, <code>warm</code> writes it out and drops it after
 the next sweep. Evicted data is <strong>read back when it is next
 used</strong>, so <code>cold</code> costs one load per burst of activity
 rather than one per operation.</p>
-<div class="sourceCode" id="cb106"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb106-1"><a href="#cb106-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="at">-X</span> POST http://localhost:9999/_api/tier <span class="dt">\</span></span>
-<span id="cb106-2"><a href="#cb106-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
-<span id="cb106-3"><a href="#cb106-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;namespace&quot;:&quot;archive&quot;,&quot;tier&quot;:&quot;warm&quot;,&quot;warm_idle&quot;:86400}&#39;</span></span></code></pre></div>
-<div class="sourceCode" id="cb107"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb107-1"><a href="#cb107-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;shard&quot;</span><span class="fu">:</span><span class="st">&quot;archive&quot;</span><span class="fu">,</span><span class="dt">&quot;tier&quot;</span><span class="fu">:</span><span class="st">&quot;warm&quot;</span><span class="fu">,</span><span class="dt">&quot;warm_idle&quot;</span><span class="fu">:</span><span class="dv">86400</span><span class="fu">,</span></span>
-<span id="cb107-2"><a href="#cb107-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;own_tier&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span><span class="dt">&quot;own_warm_idle&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span></span>
-<span id="cb107-3"><a href="#cb107-3" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;effect&quot;</span><span class="fu">:</span><span class="st">&quot;&#39;archive&#39; and everything under it is dropped after 86400s untouched&quot;</span><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb108"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb108-1"><a href="#cb108-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="at">-X</span> POST http://localhost:9999/_api/tier <span class="dt">\</span></span>
+<span id="cb108-2"><a href="#cb108-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb108-3"><a href="#cb108-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;namespace&quot;:&quot;archive&quot;,&quot;tier&quot;:&quot;warm&quot;,&quot;warm_idle&quot;:86400}&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb109"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb109-1"><a href="#cb109-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;shard&quot;</span><span class="fu">:</span><span class="st">&quot;archive&quot;</span><span class="fu">,</span><span class="dt">&quot;tier&quot;</span><span class="fu">:</span><span class="st">&quot;warm&quot;</span><span class="fu">,</span><span class="dt">&quot;warm_idle&quot;</span><span class="fu">:</span><span class="dv">86400</span><span class="fu">,</span></span>
+<span id="cb109-2"><a href="#cb109-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;own_tier&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span><span class="dt">&quot;own_warm_idle&quot;</span><span class="fu">:</span><span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb109-3"><a href="#cb109-3" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;effect&quot;</span><span class="fu">:</span><span class="st">&quot;&#39;archive&#39; and everything under it is dropped after 86400s untouched&quot;</span><span class="fu">}</span></span></code></pre></div>
 <p>The reply says the effect out loud, because a change made from a row
 deep in a tree is a change to everything beside it. Either field takes
 <code>&quot;default&quot;</code> to stop overriding.</p>
@@ -3360,8 +3383,8 @@ people look up” is interesting for a while and not forever.</p>
 <section id="what-was-refused" class="level2" data-number="12.5">
 <h2 data-number="12.5"><span class="header-section-number">12.5</span>
 What was refused</h2>
-<div class="sourceCode" id="cb108"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb108-1"><a href="#cb108-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb108-2"><a href="#cb108-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/_management/api/rejections&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb110"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb110-1"><a href="#cb110-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb110-2"><a href="#cb110-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/_management/api/rejections&#39;</span></span></code></pre></div>
 <p>Newest first, from every write path including the ZMQ ingest, which
 has no caller of its own to tell. This is the answer to “the feed says
 it sent fifty thousand and I have forty-nine thousand”.</p>
@@ -3371,8 +3394,8 @@ fact about the data.</p>
 <section id="how-busy-each-namespace-is" class="level2" data-number="12.6">
 <h2 data-number="12.6"><span class="header-section-number">12.6</span>
 How busy each namespace is</h2>
-<div class="sourceCode" id="cb109"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb109-1"><a href="#cb109-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
-<span id="cb109-2"><a href="#cb109-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/_management/api/activity?granularity=day&amp;buckets=7&#39;</span></span></code></pre></div>
+<div class="sourceCode" id="cb111"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb111-1"><a href="#cb111-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&#39;Authorization: changeme&#39;</span> <span class="dt">\</span></span>
+<span id="cb111-2"><a href="#cb111-2" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;http://localhost:9999/_management/api/activity?granularity=day&amp;buckets=7&#39;</span></span></code></pre></div>
 <p>Reads and writes per top-level namespace, one count per bucket, with
 the totals for the window and for the window before it.
 <code>granularity</code> is <code>hour</code> or <code>day</code>,
@@ -3387,10 +3410,10 @@ counting off.</p>
 <section id="certificates" class="level2" data-number="12.7">
 <h2 data-number="12.7"><span class="header-section-number">12.7</span>
 Certificates</h2>
-<div class="sourceCode" id="cb110"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb110-1"><a href="#cb110-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[daemon]</span></span>
-<span id="cb110-2"><a href="#cb110-2" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl</span> <span class="op">=</span> <span class="cn">true</span></span>
-<span id="cb110-3"><a href="#cb110-3" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_cert</span> <span class="op">=</span> <span class="st">&quot;/etc/sightingdb/tls/cert.pem&quot;</span></span>
-<span id="cb110-4"><a href="#cb110-4" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_key</span> <span class="op">=</span> <span class="st">&quot;/etc/sightingdb/tls/key.pem&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb112"><pre class="sourceCode toml"><code class="sourceCode toml"><span id="cb112-1"><a href="#cb112-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[daemon]</span></span>
+<span id="cb112-2"><a href="#cb112-2" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl</span> <span class="op">=</span> <span class="cn">true</span></span>
+<span id="cb112-3"><a href="#cb112-3" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_cert</span> <span class="op">=</span> <span class="st">&quot;/etc/sightingdb/tls/cert.pem&quot;</span></span>
+<span id="cb112-4"><a href="#cb112-4" aria-hidden="true" tabindex="-1"></a><span class="dt">ssl_key</span> <span class="op">=</span> <span class="st">&quot;/etc/sightingdb/tls/key.pem&quot;</span></span></code></pre></div>
 <p><code>sightingdb --install-selfsigned-keys</code> writes a pair at
 those paths for getting started. The Configuration page shows the expiry
 and warns at 30 days.</p>
