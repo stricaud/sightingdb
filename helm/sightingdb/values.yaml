@@ -289,6 +289,9 @@ config:
     # interface's Activity page, saved as activity.json in dbdir. false makes
     # counting a single flag check, for when write latency matters more.
     activity: true
+    # Recent writes remembered for /_api/latest, each caller shown those its
+    # key may read. 0 switches it off.
+    latest_writes: 10000
     # ssl, ssl_cert, ssl_key, daemonize, log_out, log_err and acl_file are set
     # by the chart from `tls`, `acl` and `persistence`; they are not listed
     # here because two places to set one thing is one too many.

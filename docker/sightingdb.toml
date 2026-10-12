@@ -31,6 +31,8 @@ shadow_ttl = 2_592_000
 # Read and write counts per top-level namespace for the management interface's
 # Activity page, saved beside the database. false makes counting free.
 activity = true
+# Recent writes remembered for /_api/latest. 0 switches it off.
+latest_writes = 10_000
 
 # Rewritten by the management interface, so it lives on the volume rather than
 # in the image: keys have to survive a restart, and the image is read-only.

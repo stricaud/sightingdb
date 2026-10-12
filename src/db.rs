@@ -725,6 +725,9 @@ pub struct Database {
     /// Reads and writes per top-level namespace, for the management
     /// interface. Counted by the reader and writer, not here.
     activity: crate::activity::Activity,
+    /// The values written most recently, for `/_api/latest`. Recorded by the
+    /// writer, not here.
+    latest: crate::latest::Latest,
 }
 
 impl Database {
@@ -763,6 +766,7 @@ impl Database {
             store: RwLock::new(None),
             tiers: RwLock::new(TierPolicy::default()),
             activity: Default::default(),
+            latest: Default::default(),
         }
     }
 
@@ -824,6 +828,7 @@ impl Database {
             store: RwLock::new(None),
             tiers: RwLock::new(TierPolicy::default()),
             activity: Default::default(),
+            latest: Default::default(),
         }
     }
 
@@ -1088,6 +1093,11 @@ impl Database {
                 self.release_consensus(&value);
             }
         }
+        // Last, holding no database lock: its own mutex is outside the
+        // ordering rule at the top of this file.
+        if removed {
+            self.latest.forget_namespace(name);
+        }
         removed
     }
 
@@ -1299,6 +1309,10 @@ impl Database {
     /// This server's name in its own counters. See [`LOCAL_NODE`].
     pub fn activity(&self) -> &crate::activity::Activity {
         &self.activity
+    }
+
+    pub fn latest(&self) -> &crate::latest::Latest {
+        &self.latest
     }
 
     pub fn node(&self) -> &str {

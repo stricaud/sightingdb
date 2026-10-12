@@ -55,7 +55,7 @@ pub fn write_tagged_as(
 
     let node = origin.unwrap_or_else(|| db.node());
     db.activity().record_write(namespace);
-    Ok(db.write_tagged_as(
+    let written = db.write_tagged_as(
         node,
         namespace,
         value,
@@ -65,7 +65,10 @@ pub fn write_tagged_as(
             ttl,
         },
         tags,
-    ))
+    );
+    // After the write, so a client that sees it listed can read it back.
+    db.latest().record(namespace, value);
+    Ok(written)
 }
 
 /// Everything [`write_tagged`] refuses before it touches the database.

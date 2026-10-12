@@ -64,6 +64,7 @@ That is a working server. Everything below has a default.
 | `shadow_ttl` | `2592000` | How long a record of "somebody searched for this" lasts. |
 | `post_limit` | 2.5 GB | The largest bulk request accepted. |
 | `rejection_log` | `1000` | How many refused values to keep for the interface. |
+| `latest_writes` | `10000` | Recent writes remembered for `/_api/latest`. `0` switches it off. |
 | `activity` | `true` | Count reads and writes per top-level namespace for the Activity view. `false` makes counting free. |
 | `node_id` | `"local"` | **This server's name in its own counters.** |
 | `acl_file`, `tags_file` | none | The machine-owned files above. |

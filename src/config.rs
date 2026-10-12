@@ -60,6 +60,8 @@ pub struct Settings {
     /// Count reads and writes per top-level namespace for the management
     /// interface's activity view.
     pub activity: bool,
+    /// How many recent writes `/_api/latest` remembers. 0 switches it off.
+    pub latest_writes: usize,
     /// This server's name in its own counters. See [`crate::db::LOCAL_NODE`].
     pub node_id: String,
     /// API keys. `None` means no `[acl]` table and no `acl_file`.
@@ -297,6 +299,8 @@ struct RawDaemon {
     rejection_log: usize,
     #[serde(default = "yes")]
     activity: bool,
+    #[serde(default = "default_latest_writes")]
+    latest_writes: usize,
     /// This server's name in its own counters. Absent means "local", which is
     /// right until it joins a galaxy — two servers sharing an id would each
     /// take the other's contribution for their own.
@@ -456,6 +460,9 @@ fn default_sweep_interval() -> u64 {
 }
 fn default_rejection_log() -> usize {
     crate::rejections::DEFAULT_CAPACITY
+}
+fn default_latest_writes() -> usize {
+    crate::latest::DEFAULT_CAPACITY
 }
 fn default_dns_ip() -> String {
     // Loopback, not every interface: DNS answers without authentication.
@@ -638,6 +645,7 @@ impl RawConfig {
             shadow_ttl: daemon.shadow_ttl,
             rejection_log: daemon.rejection_log,
             activity: daemon.activity,
+            latest_writes: daemon.latest_writes,
             node_id,
             acl,
             acl_file,
@@ -1308,6 +1316,7 @@ post_limit = 1234
 sweep_interval = 30
 stats_retention = 720
 activity = false
+latest_writes = 50
 "#,
         ))
         .unwrap();
@@ -1318,6 +1327,7 @@ activity = false
         assert_eq!(settings.sweep_interval, 30);
         assert_eq!(settings.stats_retention, 720);
         assert!(!settings.activity);
+        assert_eq!(settings.latest_writes, 50);
     }
 
     /// The configurations shipped in the repository must load. Keys are

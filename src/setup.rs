@@ -387,6 +387,13 @@ impl Plan {
             "# interface's Activity view. Off makes counting a single flag check.",
         );
         w(&mut out, "activity = true");
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# Recent writes remembered for /_api/latest, each caller shown",
+        );
+        w(&mut out, "# those its key may read. 0 switches it off.");
+        w(&mut out, "latest_writes = 10000");
 
         w(&mut out, "");
         if self.mode.in_galaxy() {

@@ -602,6 +602,72 @@ paths:
                     items: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
+  /_api/latest:
+    get:
+      tags: [sightings]
+      summary: The values written most recently, per key
+      description: |
+        The most recent writes this server stored, newest first, each with the
+        namespace it went to. An entry is shown only if the key may read that
+        namespace, so two keys get different answers from the same record;
+        what a key may not read is absent rather than refused.
+
+        One entry per value and namespace: writing a value again moves it to
+        the front rather than listing it twice. The server remembers
+        `latest_writes` of them (`[daemon]`, 10000 by default, 0 to switch it
+        off), so a key that may read only a quiet namespace can be shown fewer
+        than it asked for once its values have aged out. `capacity` in the
+        answer says how much is remembered in all.
+
+        Every accepted write is recorded — `/w`, `/wb`, the ZMQ ingest and the
+        management interface — and a refused one is not. A galaxy merge is not
+        a write, and a router stores nothing, so ask the servers that hold the
+        data. Deleting a namespace forgets its entries. Saved with snapshots
+        as `latest.json`.
+      parameters:
+        - name: limit
+          in: query
+          description: How many, newest first. Larger values are capped, not refused.
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+        - name: since
+          in: query
+          description: |
+            Only values written at or after this Unix time. A client polling
+            for what is new passes the newest `written` it has already seen,
+            and skips anything it has already handled at that same second.
+          schema: { type: integer, format: int64 }
+        - name: namespace
+          in: query
+          description: Only namespaces at or under this one, on whole path segments.
+          schema: { type: string }
+          example: feeds
+      responses:
+        "200":
+          description: The latest writes this key may see
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        namespace: { type: string }
+                        value: { type: string }
+                        written:
+                          type: integer
+                          format: int64
+                          description: |
+                            Unix time the write arrived — not the sighting's
+                            own timestamp, which a client may have set.
+                  limit: { type: integer, description: "The limit applied, after capping." }
+                  capacity:
+                    type: integer
+                    description: How many writes the server remembers in all; 0 when switched off.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /_api/stix:
     post:
       tags: [stix]

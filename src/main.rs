@@ -11,6 +11,7 @@ mod error;
 mod galaxy;
 mod handlers;
 mod ingest;
+mod latest;
 mod maintenance;
 mod persistence;
 mod rejections;
@@ -239,6 +240,7 @@ fn run() -> Result<()> {
     let level = settings.compression_level;
     let db = open_database(&settings, dbdir.as_deref())?;
     db.activity().set_enabled(settings.activity);
+    db.latest().set_capacity(settings.latest_writes);
 
     if let Some(dir) = dbdir.as_deref() {
         db.attach_store(
@@ -480,6 +482,7 @@ fn server_info(
         stats_retention: settings.stats_retention,
         shadow_ttl: settings.shadow_ttl,
         activity: settings.activity,
+        latest_writes: settings.latest_writes,
         dns: settings.dns.as_ref().map(|dns| admin::DnsInfo {
             listen: dns.listen.clone(),
             zone: dns.zone.clone(),
@@ -705,6 +708,9 @@ fn open_database(settings: &Settings, dbdir: Option<&Path>) -> Result<Database> 
     };
     if let Some(activity) = persistence::load_activity(path) {
         db.activity().restore(activity);
+    }
+    if let Some(latest) = persistence::load_latest(path) {
+        db.latest().restore(latest);
     }
     Ok(db)
 }

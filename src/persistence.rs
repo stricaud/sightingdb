@@ -40,6 +40,8 @@ const INTERNAL_FILE: &str = "sightingdb.json.zst";
 /// Read and write counts per top-level namespace. Plain JSON, and deliberately
 /// not ending in [`SHARD_SUFFIX`], so it is never mistaken for a shard.
 const ACTIVITY_FILE: &str = "activity.json";
+/// The most recent writes, for `/_api/latest`. Not a shard either.
+const LATEST_FILE: &str = "latest.json";
 
 /// The shard a namespace belongs to.
 ///
@@ -129,9 +131,15 @@ pub fn save(db: &Database, dbdir: &Path, level: i32, all: bool) -> Result<SaveRe
     }
 
     if let Some(activity) = db.activity().take_snapshot(all)
-        && let Err(e) = save_activity(dbdir, &activity)
+        && let Err(e) = save_json(dbdir, ACTIVITY_FILE, &activity)
     {
         db.activity().mark_dirty();
+        return Err(e);
+    }
+    if let Some(latest) = db.latest().take_snapshot(all)
+        && let Err(e) = save_json(dbdir, LATEST_FILE, &latest)
+    {
+        db.latest().mark_dirty();
         return Err(e);
     }
 
@@ -174,13 +182,14 @@ fn write_shard(db: &Database, dbdir: &Path, shard: &str, level: i32) -> Result<u
     Ok(bytes)
 }
 
-fn save_activity(dbdir: &Path, activity: &crate::activity::ActivityData) -> Result<()> {
-    let path = dbdir.join(ACTIVITY_FILE);
+/// A small JSON file beside the shards, replaced atomically.
+fn save_json(dbdir: &Path, name: &str, data: &impl serde::Serialize) -> Result<()> {
+    let path = dbdir.join(name);
     let temp = path.with_extension("tmp");
     {
         let file = File::create(&temp).with_context(|| format!("creating {}", temp.display()))?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, activity).context("serializing activity")?;
+        serde_json::to_writer(&mut writer, data).with_context(|| format!("serializing {name}"))?;
         writer
             .flush()
             .with_context(|| format!("flushing {}", temp.display()))?;
@@ -194,7 +203,17 @@ fn save_activity(dbdir: &Path, activity: &crate::activity::ActivityData) -> Resu
 /// Unreadable counts are logged and dropped rather than refusing to start:
 /// they describe how the database was used, not what it holds.
 pub fn load_activity(dbdir: &Path) -> Option<crate::activity::ActivityData> {
-    let path = dbdir.join(ACTIVITY_FILE);
+    load_json(dbdir, ACTIVITY_FILE)
+}
+
+/// The recent writes a previous run saved, if any. Dropped if unreadable, for
+/// the same reason: they say what arrived lately, not what is stored.
+pub fn load_latest(dbdir: &Path) -> Option<Vec<crate::latest::Entry>> {
+    load_json(dbdir, LATEST_FILE)
+}
+
+fn load_json<T: serde::de::DeserializeOwned>(dbdir: &Path, name: &str) -> Option<T> {
+    let path = dbdir.join(name);
     let file = File::open(&path).ok()?;
     match serde_json::from_reader(BufReader::new(file)) {
         Ok(data) => Some(data),
@@ -634,6 +653,24 @@ mod tests {
         );
         assert_eq!(report.roots[0].name, "feeds");
         assert_eq!(report.roots[0].total.writes, 1);
+    }
+
+    #[test]
+    fn the_latest_writes_survive_a_restart() {
+        let dir = TempDir::new("latest");
+        let db = Database::default();
+        crate::sighting_writer::write(&db, "feeds/ips", "1.1.1.1", None, None).unwrap();
+        crate::sighting_writer::write(&db, "feeds/ips", "2.2.2.2", None, None).unwrap();
+        save(&db, &dir.0, default_level(), false).unwrap();
+
+        load(&dir.0).unwrap().unwrap();
+        let restored = Database::default();
+        restored
+            .latest()
+            .restore(load_latest(&dir.0).expect("saved"));
+        let found = restored.latest().recent(10, None, "", |_| true);
+        let values: Vec<&str> = found.iter().map(|e| e.value.as_str()).collect();
+        assert_eq!(values, ["2.2.2.2", "1.1.1.1"]);
     }
 
     #[test]

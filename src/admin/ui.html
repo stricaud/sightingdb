@@ -2617,6 +2617,7 @@ async function showConfig() {
       ["Statistics retention", info.stats_retention ? `${info.stats_retention} buckets` : "unlimited"],
       ["Shadow TTL", info.shadow_ttl ? `${info.shadow_ttl}s` : "never expires"],
       ["Activity counting", info.activity ? "on" : "off"],
+      ["Latest writes kept", info.latest_writes ? `${info.latest_writes}` : "off"],
       ["DNS", info.dns ? `${info.dns.listen} for ${info.dns.zone}` : "disabled"],
       ["ZMQ ingest", info.zmq ? `${info.zmq.endpoint} (${info.zmq.format})` : "disabled"],
       ["TLS certificate", { html: certificateState(info) }],

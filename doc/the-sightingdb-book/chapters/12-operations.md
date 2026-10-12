@@ -29,9 +29,10 @@ A snapshot that exists but cannot be read is fatal at startup rather than
 ignored. Starting empty would look like catastrophic data loss, and the next
 save would make it real.
 
-Beside the shards sits `activity.json`, the read and write counts behind the
-interface's Activity page (chapter 10). It is treated differently on purpose:
-an unreadable one is logged and ignored, because it describes how the database
+Beside the shards sit `activity.json`, the read and write counts behind the
+interface's Activity page (chapter 10), and `latest.json`, the recent writes
+behind `/_api/latest` (chapter 5). They are treated differently on purpose: an
+unreadable one is logged and ignored, because it describes how the database
 was used rather than what it holds, and starting without it loses nothing that
 matters.
 

@@ -76,6 +76,12 @@ rejection_log = 1000
 # false turns that into a single flag check.
 activity = true
 
+# The most recent writes remembered for /_api/latest, one entry per value and
+# namespace — writing a value again moves it to the front. Each caller is shown
+# only those in namespaces its key may read. Saved beside the shards as
+# latest.json. 0 switches it off.
+latest_writes = 10000
+
 # This server's name in its own counters. Sightings are counted per node, so
 # that merging two copies of a value is a sum of separate contributions rather
 # than a replay of increments — an increment is not idempotent, and a sync that

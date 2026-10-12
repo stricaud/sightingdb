@@ -19,6 +19,7 @@ The short version of everything, for finding rather than reading.
 | `/_api/stix` | POST | Export several namespaces into one bundle. |
 | `/_api/merge` | POST | Fold a peer's copy of values into ours. |
 | `/_api/namespaces` | GET | What this server actually stores. |
+| `/_api/latest` | GET | The latest writes, filtered by what the key may read. |
 | `/_api/tier` | POST | Set a namespace's tier. |
 | `/_api/openapi.yaml` | GET | The whole API as OpenAPI 3. |
 | `/health` | GET | Liveness. No key needed. |
@@ -97,6 +98,7 @@ codes. A test keeps it from drifting.
 | | `post_limit` | 2.5 GB |
 | | `rejection_log` | `1000` |
 | | `activity` | `true` |
+| | `latest_writes` | `10000` |
 | | `node_id` | `"local"` — **unique per server in a galaxy** |
 | | `acl_file`, `tags_file` | none |
 | `[storage]` | `namespaces` | everything |

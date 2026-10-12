@@ -346,6 +346,23 @@ commit to it — it does not replace reading the `items` that `/wb` gives back.
 It also leaves no trace, which `/wb` cannot: probing with a real write records a
 sighting you then have to live with.
 
+### What was written lately
+
+`GET /_api/latest` lists the most recent writes, newest first, each with the
+namespace it went to — **filtered by what your key may read**, so two keys get
+different answers:
+
+	$ curl -H 'Authorization: changeme' 'http://127.0.0.1:9999/_api/latest?limit=10'
+	{"capacity":10000,"limit":10,"items":[
+	  {"namespace":"misp/domains","value":"bad.example","written":1791838382},
+	  {"namespace":"proxy/blocked","value":"evil.example","written":1791838382}]}
+
+`limit` defaults to 100 and is capped at 1000; `since=<unix time>` returns only
+what arrived since, for polling; `namespace=` narrows to a subtree. A value
+written again moves to the front rather than appearing twice. The server
+remembers `latest_writes` of them (`[daemon]`, default 10000, 0 is off), saved
+with snapshots as `latest.json`.
+
 ### Which values were rejected
 
 Every write path answers its own caller about a value it would not write — but
@@ -468,6 +485,8 @@ Beyond the listen address and TLS settings, `[daemon]` accepts:
 	rejection_log     Rejected values kept in memory (default 1000, 0 = off).
 	activity          Count reads and writes per top-level namespace for the
 	                  management Activity view (default true).
+	latest_writes     Recent writes remembered for /_api/latest (default 10000,
+	                  0 = off).
 
 The retention settings default to keeping everything, so upgrading an existing
 install never starts discarding data on its own. The configuration shipped in

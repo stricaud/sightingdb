@@ -60,6 +60,9 @@ data:
     {{- if not (kindIs "invalid" .activity) }}
     activity = {{ .activity }}
     {{- end }}
+    {{- if not (kindIs "invalid" .latest_writes) }}
+    latest_writes = {{ int64 .latest_writes }}
+    {{- end }}
     {{- end }}
 
     # The container is the process: forking would leave the kubelet watching a

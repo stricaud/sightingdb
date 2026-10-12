@@ -715,6 +715,7 @@ pub async fn help() -> impl Responder {
             "\t/vwb: check a bulk write without recording it (POST)\n",
             "\t/_api/merge: fold a peer's copy of values into ours (POST)\n",
             "\t/_api/namespaces: which namespaces exist here (GET)\n",
+            "\t/_api/latest: the values written most recently, per key (GET)\n",
             "\t/r: read (GET)\n",
             "\t/rs: read with statistics (GET)\n",
             "\t/rb: read in bulk mode (POST)\n",
@@ -2412,6 +2413,60 @@ pub async fn namespaces(
     HttpResponse::Ok().json(serde_json::json!({ "namespaces": found }))
 }
 
+/// `GET /_api/latest` — the values written most recently, and where.
+///
+/// Answered per key: an entry is shown only if the key may read the namespace
+/// it was written to, so two keys asking the same question get different
+/// answers. Like [`namespaces`], what the key may not read is absent rather
+/// than refused. See [`crate::latest`] for what is remembered and for how long.
+pub async fn latest(
+    state: State,
+    query: web::Query<LatestQuery>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let apikey = match api_key(&state, &req) {
+        Ok(apikey) => apikey,
+        Err(resp) => return resp,
+    };
+
+    let limit = query
+        .limit
+        .unwrap_or(crate::latest::DEFAULT_LIMIT)
+        .clamp(1, crate::latest::MAX_LIMIT);
+    let prefix = query.namespace.as_deref().unwrap_or("");
+
+    let acl = state.acl();
+    let items = state
+        .db
+        .latest()
+        .recent(limit, query.since, prefix, |name| match apikey {
+            None => true,
+            Some(key) => acl.can_read(key, name),
+        });
+    drop(acl);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "items": items,
+        "limit": limit,
+        // How much the server remembers in all, so a caller shown fewer than
+        // it asked for can tell "that is all there is" from "the rest aged
+        // out". Not how many are held: that would count what this key cannot
+        // see.
+        "capacity": state.db.latest().capacity(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LatestQuery {
+    /// How many, newest first. 100 by default and 1000 at most.
+    limit: Option<usize>,
+    /// Only values written at or after this Unix time: what a client polling
+    /// for what is new passes back from the last answer it got.
+    since: Option<i64>,
+    /// Only namespaces at or under this one, matched on whole path segments.
+    namespace: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct NamespacesQuery {
     /// Only namespaces at or under this one. Absent means all of them.
@@ -2537,6 +2592,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
         .route("/vwb", web::post().to(validate_bulk))
         .route("/_api/merge", web::post().to(merge))
         .route("/_api/namespaces", web::get().to(namespaces))
+        .route("/_api/latest", web::get().to(latest))
         .route("/d/{namespace:.*}", web::get().to(delete))
         .route("/stix/{namespace:.*}", web::get().to(export_stix))
         .route("/_api/stix", web::post().to(export_stix_api))
@@ -4999,6 +5055,142 @@ mod tests {
         assert_eq!(bodies[0], bodies[1]);
     }
 
+    /// Two keys asking for the latest writes see what each may read, and no
+    /// more: the record is shared, the answer is not.
+    #[actix_web::test]
+    async fn the_latest_writes_are_filtered_by_what_each_key_may_read() {
+        let mut inner = SharedState::new(true);
+        inner
+            .acl
+            .get_mut()
+            .unwrap()
+            .set("feeds-only", parse_grants("r:feeds").unwrap());
+        let st: State = web::Data::new(inner);
+        let app = app!(st);
+
+        for uri in [
+            "/w/feeds/ips?val=1.1.1.1",
+            "/w/secret/x?val=classified",
+            "/w/feeds/urls?val=http://a.example",
+            // Written again: moves to the front rather than appearing twice.
+            "/w/feeds/ips?val=1.1.1.1",
+            // Refused, so not a write and not listed.
+            "/w/feeds/ips?val=",
+        ] {
+            test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(uri)
+                    .insert_header(("Authorization", KEY))
+                    .to_request(),
+            )
+            .await;
+        }
+
+        let listed = |body: &Value| -> Vec<String> {
+            body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    format!(
+                        "{}:{}",
+                        i["namespace"].as_str().unwrap(),
+                        i["value"].as_str().unwrap()
+                    )
+                })
+                .collect()
+        };
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/_api/latest")
+                .insert_header(("Authorization", KEY))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(
+            listed(&body),
+            [
+                "feeds/ips:1.1.1.1",
+                "feeds/urls:http://a.example",
+                "secret/x:classified"
+            ]
+        );
+        assert!(body["items"][0]["written"].as_i64().unwrap() > 0, "{body}");
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/_api/latest")
+                .insert_header(("Authorization", "feeds-only"))
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(
+            listed(&body),
+            ["feeds/ips:1.1.1.1", "feeds/urls:http://a.example"]
+        );
+
+        // Narrowed, limited, and the hard cap applied rather than refused.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/_api/latest?namespace=feeds/urls&limit=5000")
+                .insert_header(("Authorization", KEY))
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(listed(&body), ["feeds/urls:http://a.example"]);
+        assert_eq!(body["limit"], crate::latest::MAX_LIMIT);
+
+        // A deleted namespace takes its entries with it.
+        test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/d/secret/x")
+                .insert_header(("Authorization", KEY))
+                .to_request(),
+        )
+        .await;
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/_api/latest?limit=1&since=0")
+                .insert_header(("Authorization", KEY))
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(listed(&body), ["feeds/ips:1.1.1.1"]);
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/_api/latest")
+                .insert_header(("Authorization", KEY))
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(resp).await;
+        assert!(
+            !listed(&body).iter().any(|e| e.starts_with("secret/")),
+            "{body}"
+        );
+
+        // No key, no answer.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/_api/latest").to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[actix_web::test]
     async fn several_grants_on_one_key_are_unioned() {
         let mut inner = SharedState::new(true);
@@ -5142,6 +5334,7 @@ mod tests {
             "/stix/{namespace}",
             "/_api/merge",
             "/_api/namespaces",
+            "/_api/latest",
             "/_api/stix",
             "/_api/tier",
             "/_api/openapi.yaml",

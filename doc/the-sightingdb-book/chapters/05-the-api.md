@@ -159,6 +159,44 @@ Results are positional: item *n* answers item *n*, and a miss is an error
 object in place of an attribute rather than a gap. `/rbs` is the same with
 statistics.
 
+### What was written lately
+
+```bash
+curl -H 'Authorization: changeme' 'http://localhost:9999/_api/latest?limit=10'
+```
+
+```json
+{"capacity":10000,"limit":10,"items":[
+  {"namespace":"misp/domains","value":"bad.example","written":1791838382},
+  {"namespace":"proxy/blocked","value":"evil.example","written":1791838382},
+  {"namespace":"misp/ips","value":"203.0.113.7","written":1791838382}]}
+```
+
+The most recent writes, newest first, each with the namespace it went to — and
+only those in namespaces **your key may read**. A key granted `r:misp` asking
+the same question gets the two `misp` entries and never learns that `proxy`
+was written to. The record is shared; the answer is per key.
+
+- `limit` — how many, 100 by default. Anything over 1000 is capped to 1000
+  rather than refused.
+- `since` — only writes at or after this Unix time. Poll with the newest
+  `written` you have seen, and skip what you already handled in that second.
+- `namespace` — only that namespace and those below it.
+
+A value written again moves to the front instead of being listed twice, so one
+noisy feed does not push everything else out. `written` is when the write
+*arrived*, which is what "latest" means; the sighting's own timestamp may have
+been set in the past by the client.
+
+The server remembers `latest_writes` entries in all (chapter 4), and that is
+shared between every key. A key that can read only a quiet namespace may be
+shown fewer than it asked for, because its values have been pushed out by
+everyone else's. Raise `latest_writes` if that matters.
+
+It is not an internal namespace, and could not be one: access is granted by
+namespace path, so a key allowed to read `_latest` would see every write in
+it. What is filtered is the namespace each value went to.
+
 ## Deleting
 
 ```bash

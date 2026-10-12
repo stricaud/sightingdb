@@ -292,6 +292,8 @@ pub struct ServerInfo {
     pub shadow_ttl: u64,
     /// Whether reads and writes are being counted for the activity view.
     pub activity: bool,
+    /// How many recent writes `/_api/latest` remembers; 0 is off.
+    pub latest_writes: usize,
     pub dns: Option<DnsInfo>,
     pub zmq: Option<ZmqInfo>,
     pub namespaces: usize,

@@ -416,6 +416,43 @@ read, so a scoped key does not learn the names of subtrees it cannot reach.
 
 Not forwarded, by design: the question is about this server.
 
+### `GET /_api/latest` — the values written most recently
+
+	$ curl -H 'Authorization: changeme' 'http://127.0.0.1:9999/_api/latest?limit=10'
+	{"capacity":10000,"limit":10,"items":[
+	  {"namespace":"misp/domains","value":"bad.example","written":1791838382},
+	  {"namespace":"proxy/blocked","value":"evil.example","written":1791838382},
+	  {"namespace":"misp/ips","value":"203.0.113.7","written":1791838382}]}
+
+The same request with a key granted only `r:misp`:
+
+	$ curl -H 'Authorization: misp-reader' 'http://127.0.0.1:9999/_api/latest'
+	{"capacity":10000,"limit":100,"items":[
+	  {"namespace":"misp/domains","value":"bad.example","written":1791838382},
+	  {"namespace":"misp/ips","value":"203.0.113.7","written":1791838382}]}
+
+Newest first, each value with the namespace it was written to, and **filtered by
+what the key may read**: the record is shared, the answer is per key. Takes
+`limit` (100 by default, capped at 1000), `since` (only writes at or after that
+Unix time — what a client polling for what is new passes back) and `namespace`
+(only that namespace and those below it).
+
+One entry per value and namespace: writing a value again moves it to the front
+instead of listing it twice, so one busy feed does not push everything else
+out. The server remembers `latest_writes` of them (`[daemon]`, 10000 by
+default, 0 to switch it off); a key that reads only a quiet namespace may be
+shown fewer than it asked for once those have aged out. `written` is when the
+write arrived, not the sighting's own timestamp.
+
+Every accepted write counts, from every path; a refused one does not. Deleting
+a namespace forgets its entries. The record is saved with snapshots as
+`latest.json`, so a poller does not lose its place at a restart. Not forwarded:
+a router stores nothing, so ask the servers that hold the data.
+
+This is deliberately not an internal namespace. Read access is granted by
+namespace path, so a key that could read a `_latest` namespace would see every
+write in it — the filtering has to be by the namespace each value went to.
+
 ### `POST /rb` — read many values
 
 	$ curl -H 'Authorization: changeme' -H 'Content-Type: application/json' \
