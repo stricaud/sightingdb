@@ -6,6 +6,12 @@
 //     docker compose -f doc/docker/docker-compose.yml up -d
 //     make screenshots
 //
+// The activity shots want weeks of history, which a freshly started galaxy
+// does not have: seed `activity.json` in a node's dbdir before starting it.
+// To retake only some shots, name them:
+//
+//     SIGHTINGDB_SHOTS=activity,activity-year make screenshots
+//
 // Light mode is forced: the interface follows the system theme, and a dark
 // screenshot on a white page looks like a mistake rather than a choice.
 //
@@ -20,6 +26,7 @@ const LB = process.env.SIGHTINGDB_LB ?? "http://localhost:9999";
 const NODE = process.env.SIGHTINGDB_NODE ?? "http://localhost:9991";
 const KEY = process.env.SIGHTINGDB_KEY ?? "demo";
 const OUT = "images";
+const ONLY = (process.env.SIGHTINGDB_SHOTS ?? "").split(",").filter(Boolean);
 
 // Resolved from mermaid-cli's own directory rather than from here: npm
 // hoists its dependencies, so where puppeteer actually sits depends on the
@@ -104,6 +111,67 @@ const shots = [
     },
     note: "the keys a server accepts, and what each may reach",
   },
+  {
+    name: "activity",
+    at: `${NODE}/_management/`,
+    wait: "#nav-activity",
+    async prepare(page) {
+      await page.click("#nav-activity");
+      await page.waitForSelector("#act-list .act-root", { timeout: 15000 });
+    },
+    // The strips only; the comparison chart below them is its own figure.
+    region: "#act-list",
+    note: "reads and writes per top-level namespace, 90 days",
+  },
+  {
+    name: "activity-compare",
+    at: `${NODE}/_management/`,
+    wait: "#nav-activity",
+    async prepare(page) {
+      await page.click("#nav-activity");
+      await page.waitForSelector("#act-list .act-root", { timeout: 15000 });
+      await new Promise((r) => setTimeout(r, 1000));
+    },
+    region: "#act-compare",
+    note: "namespaces compared on one chart",
+  },
+  {
+    name: "activity-year",
+    at: `${NODE}/_management/`,
+    wait: "#nav-activity",
+    async prepare(page) {
+      await page.click("#nav-activity");
+      await page.waitForSelector("#act-list .act-root", { timeout: 15000 });
+      await page.select("#act-window", "day:365");
+      await page.waitForSelector("#act-list .act-cal", { timeout: 15000 });
+      // A year is seven rows a metric, so one namespace is a figure. The one
+      // with a gap in it shows what the calendar is for.
+      await page.type("#act-filter", process.env.SIGHTINGDB_YEAR_OF ?? "osint");
+      await page.$eval("#act-filter", (input) => input.blur());
+    },
+    region: "#act-list",
+    note: "a year of one namespace as a calendar",
+  },
+  {
+    name: "activity-hours",
+    at: `${NODE}/_management/`,
+    wait: "#nav-activity",
+    async prepare(page) {
+      await page.click("#nav-activity");
+      await page.waitForSelector("#act-list .act-root", { timeout: 15000 });
+      // Clicking a day is how anyone gets here, so do that: the second
+      // strip cell from the end is yesterday, a whole day of hours.
+      await page.click("#act-list .act-root .act-strip div:nth-last-child(2)");
+      await page.waitForFunction(
+        () => document.querySelector("#act-window").value === "hour:24",
+        { timeout: 15000 });
+      // Off the strips, or the cell under the pointer is drawn outlined.
+      await page.mouse.move(0, 0);
+      await new Promise((r) => setTimeout(r, 500));
+    },
+    region: "#act-list",
+    note: "one day opened as its hours",
+  },
 ];
 
 mkdirSync(OUT, { recursive: true });
@@ -114,7 +182,7 @@ const browser = await puppeteer.launch({
 });
 
 let failures = 0;
-for (const shot of shots) {
+for (const shot of shots.filter((s) => !ONLY.length || ONLY.includes(s.name))) {
   const page = await browser.newPage();
   try {
     await page.setViewport({ width: 1150, height: 880, deviceScaleFactor: 2 });
@@ -130,6 +198,25 @@ for (const shot of shots) {
     await page.goto(shot.at, { waitUntil: "networkidle2", timeout: 30000 });
     if (shot.wait) await page.waitForSelector(shot.wait, { timeout: 20000 });
     if (shot.prepare) await shot.prepare(page);
+
+    // A shot of one part of a page is the controls above it plus that part,
+    // so the figure still says which window it is showing.
+    if (shot.region) {
+      const clip = await page.evaluate((selector) => {
+        const top = document.querySelector("main").getBoundingClientRect().top;
+        const r = document.querySelector(selector).getBoundingClientRect();
+        const from = selector === "#act-list" ? top : r.top - 8;
+        return { y: Math.max(0, Math.floor(from)), bottom: Math.ceil(r.bottom) + 12 };
+      }, shot.region);
+      const height = Math.min(clip.bottom - clip.y, 690);
+      await page.screenshot({
+        path: `${OUT}/ui-${shot.name}.png`,
+        clip: { x: 0, y: clip.y, width: 1150, height },
+        captureBeyondViewport: true,
+      });
+      console.log(`  ui-${shot.name}.png   ${shot.note}`);
+      continue;
+    }
 
     // Trim to what is actually drawn: a full viewport of empty page below the
     // table makes every figure in the book mostly whitespace.

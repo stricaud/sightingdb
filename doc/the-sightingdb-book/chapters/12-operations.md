@@ -29,6 +29,12 @@ A snapshot that exists but cannot be read is fatal at startup rather than
 ignored. Starting empty would look like catastrophic data loss, and the next
 save would make it real.
 
+Beside the shards sits `activity.json`, the read and write counts behind the
+interface's Activity page (chapter 10). It is treated differently on purpose:
+an unreadable one is logged and ignored, because it describes how the database
+was used rather than what it holds, and starting without it loses nothing that
+matters.
+
 Snapshots carry a format version and are migrated forward on load, so an
 upgrade reads what the previous version wrote. The migration happens in memory
 and lands on disk at the next save.
@@ -85,6 +91,23 @@ thousand and I have forty-nine thousand".
 
 Bounded and in memory. A record kept to make something visible, not a fact
 about the data.
+
+## How busy each namespace is
+
+```bash
+curl -H 'Authorization: changeme' \
+  'http://localhost:9999/_management/api/activity?granularity=day&buckets=7'
+```
+
+Reads and writes per top-level namespace, one count per bucket, with the totals
+for the window and for the window before it. `granularity` is `hour` or `day`,
+`end` is any Unix time in the last bucket wanted, and `buckets` is how many.
+It is what the Activity page draws, and it is as easy to feed into whatever
+else watches the server: a namespace whose reads drop to zero is a feed nobody
+consumes any more, and one whose writes drop to zero is an ingest that has
+stopped.
+
+`activity = false` in `[daemon]` switches the counting off.
 
 ## Certificates
 

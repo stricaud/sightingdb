@@ -33,6 +33,7 @@ Management, all under `/_management/api/`:
 | `info` | GET | What this server was configured to do. |
 | `namespaces` | GET, POST | List, or create an empty one. |
 | `tree` | GET | One level of the namespace tree. |
+| `activity` | GET | Reads and writes per top-level namespace over time. |
 | `values`, `value` | GET | Values in a namespace; one value. |
 | `sightings` | GET | Where else a value has been seen. |
 | `tags` | GET, POST | The vocabulary; replace a value's tags. |

@@ -53,6 +53,65 @@ peers table is where a node is added, re-keyed, disabled or removed — chapter
 Note what `Last answered` means: when this server last got a health reply from
 that peer. It is about the server, not about any value.
 
+## Activity
+
+How busy each top-level namespace has been: every read and every accepted
+write, counted against the first segment of the namespace, so `feeds/misp/ips`
+counts towards `feeds`. It answers the questions the data itself cannot —
+is anyone still querying this feed, did the ingest stop on Tuesday, which
+customer is doing all the reading.
+
+![Ninety days, one row per namespace. The honeypot's scanning campaign and the customer that arrived six weeks ago are both visible without reading a number.](images/ui-activity.png){width=100%}
+
+Each namespace is a row of cells, one per day or per hour, the way a status
+page draws uptime: **reads** in blue, **writes** in orange, darker for more.
+The shades are on one scale across every namespace on the page, so two cells
+of the same shade saw about the same traffic, whichever row they are in. A
+grey cell is a bucket in which nothing happened at all.
+
+Beside each name are the totals for the window and how they compare with the
+window of the same length just before it — ▲ 17% against the previous ninety
+days, here. When that earlier window reaches back past what is kept, the
+comparison is left out rather than computed against half a window.
+
+**Browsing.** The window is 24 or 48 hours, a week by the hour, or 30 days, 90
+days or a year by the day. **Earlier** and **Later** move a whole window at a
+time, so nothing is shown twice; **Now** comes back. Hovering a cell gives its
+exact counts. **Clicking a day opens its 24 hours**, which is the way into a
+spike:
+
+![The day before, by the hour. Working hours show on every namespace but the honeypot, which is written to around the clock.](images/ui-activity-hours.png){width=100%}
+
+A year is drawn as a calendar instead, one column per week and one row per
+weekday, because 365 slivers in a row are unreadable. Gaps and weekly rhythms
+are what it is for:
+
+![A year of one namespace. Twenty days when the feed delivered nothing, and nobody read it either.](images/ui-activity-year.png){width=100%}
+
+**Comparing.** Tick namespaces to draw them on one chart below — the busiest
+three are ticked to begin with, and up to eight can be. It shows reads or
+writes, never both: they differ by orders of magnitude and would not share an
+axis.
+
+![Three namespaces' reads on one chart.](images/ui-activity-compare.png){width=100%}
+
+What is counted is what clients asked for. Every route counts — `/r`, `/rb`,
+`/w`, `/wb`, DNS, the ZMQ ingest, and values added from this interface. A read
+of a value that is not there still counts; a write that was refused does not.
+The database's own bookkeeping — `_all`, `_shadow/*`, `_config/*` — is not
+counted, and neither are galaxy merges: a value one node forwards to another
+was a write on the first node, not a second write on the second.
+
+Hours are kept for 31 days and days for 400, all in UTC. The counts are saved
+with snapshots as `activity.json` in `dbdir`, so they survive a restart. A
+namespace's row is shown only to a key that can read all of it: a total for
+`feeds` says something about everything under it.
+
+Counting costs a brief lock on every read and write. If that matters more than
+the picture, `activity = false` in `[daemon]` turns it into a single flag
+check; the page then says counting is off, and still shows whatever was counted
+before.
+
 ## Keys
 
 ![What each key may reach.](images/ui-keys.png){width=100%}
