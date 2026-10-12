@@ -54,6 +54,9 @@ data:
     {{- if not (kindIs "invalid" .shadow_ttl) }}
     shadow_ttl = {{ int64 .shadow_ttl }}
     {{- end }}
+    {{- if not (kindIs "invalid" .rejection_log) }}
+    rejection_log = {{ int64 .rejection_log }}
+    {{- end }}
     {{- if not (kindIs "invalid" .activity) }}
     activity = {{ .activity }}
     {{- end }}

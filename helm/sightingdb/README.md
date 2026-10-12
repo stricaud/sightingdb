@@ -86,7 +86,7 @@ hatches for something the chart does not model yet.
 | `nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`, `priorityClassName` | | Ordinary scheduling controls. |
 | `terminationGracePeriodSeconds` | `120` | The database is written out on the way down. |
 | `extraArgs`, `extraEnv`, `extraEnvFrom`, `extraVolumes`, `extraVolumeMounts`, `extraInitContainers` | | |
-| `config.daemon.*` | | `enabled`, `listen_ip`, `listen_port`, `authenticate`, `post_limit`, `dbdir`, `snapshot_interval`, `compression_level`, `sweep_interval`, `stats_retention`, `shadow_ttl`, `activity`. |
+| `config.daemon.*` | | `enabled`, `listen_ip`, `listen_port`, `authenticate`, `post_limit`, `dbdir`, `snapshot_interval`, `compression_level`, `sweep_interval`, `stats_retention`, `shadow_ttl`, `rejection_log`, `activity`. |
 | `config.storage.*` | | `default_tier`, `warm_idle`, `tiers`. |
 | `config.dns.*` | disabled | `zone`, `listen_ip`, `listen_port`, `ttl`, `rate_limit`, `threads`, `shadow`, `namespaces`. |
 | `config.zmq.*` | disabled | `endpoint`, `topics`, `format`, `require_to_ids`, `default_namespace`, `ttl`, `reconnect`, `hashed_namespace`, `store_values`, `types`. |

@@ -281,6 +281,10 @@ config:
     # Seconds a shadow sighting — a record of something searched for — lives.
     # 0 keeps them forever.
     shadow_ttl: 2592000
+    # Refused values kept in memory for the management interface's
+    # rejections list, newest first; the oldest go once the cap is reached.
+    # Nothing survives a restart. 0 switches the record off.
+    rejection_log: 1000
     # Count reads and writes per top-level namespace for the management
     # interface's Activity page, saved as activity.json in dbdir. false makes
     # counting a single flag check, for when write latency matters more.
