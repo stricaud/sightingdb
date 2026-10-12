@@ -209,9 +209,9 @@ import and then an export round-trip.
 ## SightingDB and MISP
 
 SightingDB feeds MISP's own **sightings** and **false-positives**: what it has
-counted for a value is added to the counts MISP shows for that attribute, in
-the same cell, popover and graph, as one more source beside the organisations
-that reported it. Everything travels as the SHA-256 of the value — MISP looks
+counted for a value is added to the counts MISP shows for that attribute, as
+one more source beside the organisations that reported it, and drawn beside
+MISP's own in the sightings graph. Everything travels as the SHA-256 of the value — MISP looks
 values up by their digest — so a SightingDB that holds only digests still gives
 MISP everything it needs, and holds nothing that reveals what was seen.
 
@@ -250,8 +250,8 @@ something having been seen. Everything else using SightingDB sees all of it.
 
 The connection settings below — the false-positive namespace, pushing, the API
 key — need a MISP recent enough to have those fields. An older MISP shows
-SightingDB's sightings in a column of their own, ignores false-positives, never
-writes, and sends no key.
+SightingDB's sightings only in a column of their own, ignores false-positives,
+never writes, and sends no key.
 
 ### The connection in MISP
 
@@ -269,13 +269,13 @@ connection*:
 
 | Field | What to put there |
 | --- | --- |
-| Name | How the server is named in the sightings popover. |
+| Name | How the server is named in the popover, the column and the graph. |
 | Host | With its scheme: `http://sightingdb` or `https://sightingdb.example`. No trailing slash, no port. |
 | Port | `9999` unless `listen_port` says otherwise. |
 | Namespace | Where sightings are read from. Left empty, MISP uses a namespace literally called `all`. |
 | False-positive namespace | Where false-positives are read from. Filled in as `<namespace>/false-positive` while you type the namespace; empty leaves false-positives out. |
 | API key | Sent as the `Authorization` header. Leave it empty only for a server running with `authenticate = false`. It is never shown again; leaving it empty when editing keeps the stored one. |
-| Owner, Description | Kept with the connection. |
+| Owner, Description | Shown in the SightingDB column's details. |
 | Enabled | Nothing is queried until it is. |
 | Push sightings | Write the sightings and false-positives recorded in MISP to this server, under `/misp` below each namespace. |
 | Skip Proxy | Tick it when SightingDB is on the same network as MISP and MISP has a proxy configured. |
@@ -298,9 +298,9 @@ who it is:
 
 ### What MISP shows
 
-Nothing changes on the page: the sightings cell of each attribute counts
-SightingDB's sightings and false-positives with MISP's own, and its popover
-names SightingDB as one more source:
+The sightings cell of each attribute counts SightingDB's sightings and
+false-positives with MISP's own, and its popover names SightingDB as one more
+source:
 
 ![Sightings: MISP's own, and SightingDB's, with the date SightingDB will expire the value.](images/misp-sightingdb-sightings.png){width=100%}
 
@@ -313,11 +313,23 @@ counts SightingDB among the expirations and shows the date, `last_seen` plus
 the TTL, beside any organisation's. A new sighting moves `last_seen`, and the
 date with it.
 
-The sightings graph — the wrench next to an attribute's thumbs, or the one on
-the event — adds SightingDB's hourly statistics (`stats_retention`, chapter 4)
-to its Sighting and False-positive lines:
+To see SightingDB on its own, press **SightingDB** in the attribute toolbar. A
+column appears with one line per server that knew the value, as `Name: count`,
+followed by its false-positives in red when it has any; hovering it shows when
+the value was first and last seen, its last false-positive, and when it
+expires:
 
-![An attribute's sightings over time, SightingDB's included.](images/misp-sightingdb-graph.png){width=100%}
+![The SightingDB column, with a hit's details.](images/misp-sightingdb-column.png){width=100%}
+
+The sightings graph — the wrench next to an attribute's thumbs, or the one on
+the event — keeps MISP's Sighting and False-positive lines for MISP's own, and
+draws SightingDB's beside them, from the hourly statistics it keeps
+(`stats_retention`, chapter 4): one line for its sightings, and one for its
+false-positives when the connection has a false-positive namespace.
+
+![An attribute's sightings over time: MISP's, and SightingDB's.](images/misp-sightingdb-graph.png){width=100%}
+
+![A value reported harmless, by MISP's analysts and by SightingDB's sources.](images/misp-sightingdb-graph-false-positives.png){width=100%}
 
 The lookups behind the counts send every attribute of the page in one
 `POST /rb` per connection, sightings and false-positives together, without
