@@ -302,9 +302,16 @@ Nothing changes on the page: the sightings cell of each attribute counts
 SightingDB's sightings and false-positives with MISP's own, and its popover
 names SightingDB as one more source:
 
-![Sightings: MISP's own, and SightingDB's.](images/misp-sightingdb-sightings.png){width=100%}
+![Sightings: MISP's own, and SightingDB's, with the date SightingDB will expire the value.](images/misp-sightingdb-sightings.png){width=100%}
 
 ![False-positives, the same way.](images/misp-sightingdb-false-positives.png){width=100%}
+
+**A TTL is shown as an expiration.** A value written with a `ttl` stops being
+valid that many seconds after its last sighting, which is what an expiration
+means in MISP. So when the value in the sightings namespace has one, MISP
+counts SightingDB among the expirations and shows the date, `last_seen` plus
+the TTL, beside any organisation's. A new sighting moves `last_seen`, and the
+date with it.
 
 The sightings graph — the wrench next to an attribute's thumbs, or the one on
 the event — adds SightingDB's hourly statistics (`stats_retention`, chapter 4)
@@ -342,8 +349,13 @@ added through MISP's API — is written to `misp/misp`, and the thumbs-down to
 `misp/false-positive/misp`, as the digest with the time it was recorded. It
 happens as the sighting is saved, with a five-second limit: a SightingDB that
 is down or slow never stops MISP saving the sighting, and the failure goes to
-MISP's error log. An expiration is a date, not something to count, and is not
-pushed.
+MISP's error log.
+
+**Expirations are not pushed.** In MISP an expiration is a judgement that an
+indicator is no longer valid; nothing is deleted. The nearest thing SightingDB
+has is a TTL, and an expired TTL is swept away — the value and its history
+gone, for every user of the namespace. Turning one into the other would make
+deciding an indicator is stale the same as erasing that it was ever seen.
 
 MISP does not read these back: MISP-to-MISP sharing of sightings is what MISP
 synchronisation is for. They are there for everything else that uses
