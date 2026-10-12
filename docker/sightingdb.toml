@@ -28,6 +28,9 @@ sweep_interval = 60
 # 30 days of hourly statistics per value, and 30 days of shadow sightings.
 stats_retention = 720
 shadow_ttl = 2_592_000
+# Read and write counts per top-level namespace for the management interface's
+# Activity page, saved beside the database. false makes counting free.
+activity = true
 
 # Rewritten by the management interface, so it lives on the volume rather than
 # in the image: keys have to survive a restart, and the image is read-only.

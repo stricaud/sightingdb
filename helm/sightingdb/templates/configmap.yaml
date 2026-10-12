@@ -54,6 +54,9 @@ data:
     {{- if not (kindIs "invalid" .shadow_ttl) }}
     shadow_ttl = {{ int64 .shadow_ttl }}
     {{- end }}
+    {{- if not (kindIs "invalid" .activity) }}
+    activity = {{ .activity }}
+    {{- end }}
     {{- end }}
 
     # The container is the process: forking would leave the kubelet watching a

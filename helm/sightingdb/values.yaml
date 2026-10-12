@@ -281,6 +281,10 @@ config:
     # Seconds a shadow sighting — a record of something searched for — lives.
     # 0 keeps them forever.
     shadow_ttl: 2592000
+    # Count reads and writes per top-level namespace for the management
+    # interface's Activity page, saved as activity.json in dbdir. false makes
+    # counting a single flag check, for when write latency matters more.
+    activity: true
     # ssl, ssl_cert, ssl_key, daemonize, log_out, log_err and acl_file are set
     # by the chart from `tls`, `acl` and `persistence`; they are not listed
     # here because two places to set one thing is one too many.

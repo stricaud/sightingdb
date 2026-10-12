@@ -1320,6 +1320,19 @@ activity = false
         assert!(!settings.activity);
     }
 
+    /// The configurations shipped in the repository must load. Keys are
+    /// strict, so a setting added to one under a wrong name — or before the
+    /// build that knows it — would stop the container or the install from
+    /// starting, and nothing else would notice until it did.
+    #[test]
+    fn the_shipped_configurations_load() {
+        for shipped in ["docker/sightingdb.toml", "etc/sightingdb.toml"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(shipped);
+            let settings = Settings::load(&path).unwrap_or_else(|e| panic!("{shipped}: {e:#}"));
+            assert!(settings.activity, "{shipped} switched activity off");
+        }
+    }
+
     /// A misspelled key used to be silently ignored, which is how a setting
     /// quietly fails to apply.
     #[test]
