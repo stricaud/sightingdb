@@ -16,6 +16,10 @@ categories = ["database-implementations", "command-line-utilities"]
 # client library, so they are no use inside the crate tarball — and their
 # presence makes CI's cache step probe for Rust test directories that do not
 # exist. docker/ is likewise a deployment concern, not part of the library.
+# docs/ is the published book (GitHub Pages) and doc/the-sightingdb-book its
+# source: together over 10 MB of HTML, PDF and screenshots, which is crates.io's
+# upload limit, and none of it is needed to build. The files the binary does
+# compile in from doc/ — openapi.yaml and the small logo — stay.
 exclude = [
     "rust-toolchain.toml",
     ".cargo/*",
@@ -23,6 +27,8 @@ exclude = [
     ".github/*",
     "tests/*",
     "docker/*",
+    "docs/*",
+    "doc/the-sightingdb-book/*",
 ]
 
 [[bin]]
