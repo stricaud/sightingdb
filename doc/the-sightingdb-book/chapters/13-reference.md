@@ -94,6 +94,7 @@ codes. A test keeps it from drifting.
 | | `shadow_ttl` | `2592000` seconds |
 | | `post_limit` | 2.5 GB |
 | | `rejection_log` | `1000` |
+| | `activity` | `true` |
 | | `node_id` | `"local"` — **unique per server in a galaxy** |
 | | `acl_file`, `tags_file` | none |
 | `[storage]` | `namespaces` | everything |

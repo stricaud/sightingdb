@@ -466,6 +466,8 @@ Beyond the listen address and TLS settings, `[daemon]` accepts:
 	stats_retention   Hourly statistics buckets kept per value (default 0 = unlimited).
 	shadow_ttl        Seconds a shadow sighting is kept (default 0 = forever).
 	rejection_log     Rejected values kept in memory (default 1000, 0 = off).
+	activity          Count reads and writes per top-level namespace for the
+	                  management Activity view (default true).
 
 The retention settings default to keeping everything, so upgrading an existing
 install never starts discarding data on its own. The configuration shipped in

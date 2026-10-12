@@ -722,6 +722,9 @@ pub struct Database {
     /// because there would be nowhere to put it.
     store: RwLock<Option<Store>>,
     tiers: RwLock<TierPolicy>,
+    /// Reads and writes per top-level namespace, for the management
+    /// interface. Counted by the reader and writer, not here.
+    activity: crate::activity::Activity,
 }
 
 impl Database {
@@ -759,6 +762,7 @@ impl Database {
             shards: RwLock::new(HashMap::new()),
             store: RwLock::new(None),
             tiers: RwLock::new(TierPolicy::default()),
+            activity: Default::default(),
         }
     }
 
@@ -819,6 +823,7 @@ impl Database {
             shards: RwLock::new(shards),
             store: RwLock::new(None),
             tiers: RwLock::new(TierPolicy::default()),
+            activity: Default::default(),
         }
     }
 
@@ -1292,6 +1297,10 @@ impl Database {
     }
 
     /// This server's name in its own counters. See [`LOCAL_NODE`].
+    pub fn activity(&self) -> &crate::activity::Activity {
+        &self.activity
+    }
+
     pub fn node(&self) -> &str {
         &self.node
     }

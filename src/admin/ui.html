@@ -120,6 +120,47 @@
   fieldset { border: 1px solid var(--line); border-radius: 8px; margin: .8rem 0; }
   legend { color: var(--muted); font-size: .8rem; text-transform: uppercase;
            letter-spacing: .04em; padding: 0 .3rem; }
+  /* Activity: one strip of buckets per top-level namespace, like a status
+     page. Each metric is its own one-hue ramp, light to dark for "more";
+     dark mode takes its own steps rather than an inverted copy. */
+  :root {
+    --r0: #cde2fb; --r1: #86b6ef; --r2: #3987e5; --r3: #1c5cab;
+    --w0: #fbd9c8; --w1: #f4a27f; --w2: #eb6834; --w3: #b8461b;
+    --empty: #ebedf0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --r0: #173a63; --r1: #1c5cab; --r2: #3987e5; --r3: #86b6ef;
+            --w0: #5a2a14; --w1: #a3441c; --w2: #d95926; --w3: #f4a27f;
+            --empty: #22272e; }
+  }
+  .act-root { display: grid; grid-template-columns: 15rem 1fr; gap: .4rem 1rem;
+              padding: .7rem 0; border-bottom: 1px solid var(--line); align-items: start; }
+  .act-root:last-child { border-bottom: none; }
+  .act-name { display: flex; gap: .4rem; align-items: baseline; font-family: var(--mono);
+              word-break: break-all; }
+  .act-name a { text-decoration: none; font-weight: 600; }
+  .act-name a:hover { text-decoration: underline; }
+  .act-sum { font-size: .82rem; color: var(--muted); line-height: 1.6; }
+  .act-sum b { color: var(--fg); font-weight: 600; }
+  .act-rows { display: grid; grid-template-columns: 3.4rem 1fr; gap: 3px .5rem;
+              align-items: center; min-width: 0; }
+  .act-label { font-size: .75rem; color: var(--muted); text-align: right; }
+  .act-strip { display: grid; gap: 2px; height: 20px; }
+  .act-strip.dense { gap: 1px; }
+  .act-strip div, .act-cal div { background: var(--empty); border-radius: 2px; cursor: pointer; }
+  .act-strip div:hover, .act-cal div:hover { outline: 1px solid var(--fg); }
+  .act-cal { display: grid; grid-template-rows: repeat(7, 10px); grid-auto-flow: column;
+             grid-auto-columns: 10px; gap: 2px; overflow-x: auto; }
+  .act-cal div.pad { visibility: hidden; }
+  .act-axis { display: flex; justify-content: space-between; font-size: .72rem;
+              color: var(--muted); grid-column: 2; }
+  .act-legend { display: inline-flex; gap: 2px; align-items: center; font-size: .75rem; }
+  .act-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  #act-tip { position: fixed; z-index: 30; pointer-events: none; background: var(--bg);
+             border: 1px solid var(--line); border-radius: 6px; padding: .3rem .5rem;
+             font-size: .8rem; box-shadow: 0 4px 14px rgba(0,0,0,.18); white-space: nowrap; }
+  #act-chart { width: 100%; height: 300px; }
+  @media (max-width: 700px) { .act-root { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -132,6 +173,7 @@
   <span class="spacer"></span>
   <span class="muted" id="version"></span>
   <button id="nav-browse">Browse</button>
+  <button id="nav-activity">Activity</button>
   <button id="nav-tags">Tags</button>
   <button id="nav-keys">Keys</button>
   <button id="nav-galaxy">Galaxy</button>
@@ -356,6 +398,48 @@
     </div>
   </section>
 
+  <!-- Reads and writes per top-level namespace over time -->
+  <section id="view-activity" class="hidden">
+    <div class="row">
+      <h3 style="margin:0">Activity</h3>
+      <select id="act-window" title="How much time to show">
+        <option value="hour:24">24 hours</option>
+        <option value="hour:48">48 hours</option>
+        <option value="hour:168">7 days, by hour</option>
+        <option value="day:30">30 days</option>
+        <option value="day:90" selected>90 days</option>
+        <option value="day:365">1 year</option>
+      </select>
+      <button id="act-earlier" title="The window before this one">← Earlier</button>
+      <button id="act-now" title="Back to the present">Now</button>
+      <button id="act-later" title="The window after this one">Later →</button>
+      <span class="muted" id="act-range"></span>
+      <span class="spacer"></span>
+      <input id="act-filter" placeholder="Filter namespaces" size="18">
+      <button id="act-refresh">Refresh</button>
+    </div>
+    <div id="act-list"></div>
+    <p class="muted" id="act-empty"></p>
+    <div class="row" style="margin-top:1rem">
+      <h3 style="margin:0">Compare</h3>
+      <select id="act-metric">
+        <option value="reads">Reads</option>
+        <option value="writes">Writes</option>
+      </select>
+      <span class="muted" id="act-compare-hint"></span>
+    </div>
+    <div id="act-chart"></div>
+    <p class="muted">Every client read and accepted write, counted against the
+       first segment of its namespace — <code>feeds/misp/ips</code> counts towards
+       <code>feeds</code> — in UTC buckets. HTTP, DNS, the ZMQ ingest and values
+       added here all count; the database's own bookkeeping does not. Hours are
+       kept for 31 days, days for 400. Shades are on one scale across every
+       namespace, so strips can be compared with each other; the change beside
+       each total is against the window of the same length just before it,
+       when that window is still held. Click a day in the last month to see
+       its hours.</p>
+  </section>
+
   <!-- Server configuration, read-only -->
   <section id="view-config" class="hidden">
     <p class="muted">Read from the configuration file at startup. Change it there
@@ -558,7 +642,7 @@ const state = {
 };
 
 const VIEWS = ["view-namespaces", "view-values", "view-value", "view-keys", "view-tags",
-               "view-config", "view-galaxy"];
+               "view-config", "view-galaxy", "view-activity"];
 const $ = (id) => document.getElementById(id);
 const show = (...ids) => {
   for (const v of VIEWS) $(v).classList.toggle("hidden", !ids.includes(v));
@@ -2530,6 +2614,7 @@ async function showConfig() {
       ["Sweep interval", info.sweep_interval ? `${info.sweep_interval}s` : "disabled"],
       ["Statistics retention", info.stats_retention ? `${info.stats_retention} buckets` : "unlimited"],
       ["Shadow TTL", info.shadow_ttl ? `${info.shadow_ttl}s` : "never expires"],
+      ["Activity counting", info.activity ? "on" : "off"],
       ["DNS", info.dns ? `${info.dns.listen} for ${info.dns.zone}` : "disabled"],
       ["ZMQ ingest", info.zmq ? `${info.zmq.endpoint} (${info.zmq.format})` : "disabled"],
       ["TLS certificate", { html: certificateState(info) }],
@@ -2559,6 +2644,318 @@ async function showConfig() {
     }));
   } catch (e) { setError(e.message); }
 }
+
+// --- activity ----------------------------------------------------------------
+// One strip per top-level namespace, a cell per bucket, shaded by how much
+// happened in it — a status page's uptime bars, with reads and writes as two
+// separate one-hue ramps. A year of days is laid out as weeks instead, the way
+// a contribution calendar is, because 365 slivers in a row are unreadable.
+
+const act = {
+  report: null,
+  // Any instant in the last bucket shown; null follows the present.
+  end: null,
+  // Namespaces picked for the comparison chart, in the order they were
+  // picked. The order is what gives each its colour, so a namespace keeps
+  // its colour when another is added or removed.
+  picked: [],
+  chart: null,
+};
+
+// Categorical slots in a fixed order, light and dark steps of the same hues.
+const SERIES = {
+  light: ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"],
+  dark: ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"],
+};
+const MAX_COMPARED = SERIES.light.length;
+
+const fmtCount = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+const fmtExact = new Intl.NumberFormat();
+
+function actWindow() {
+  const [granularity, buckets] = $("act-window").value.split(":");
+  return { granularity, buckets: Number(buckets) };
+}
+
+/** A bucket's start as a UTC label at the report's resolution. */
+function bucketLabel(t, step) {
+  const iso = new Date(t * 1000).toISOString();
+  return step >= 86400 ? iso.slice(0, 10) : `${iso.slice(0, 10)} ${iso.slice(11, 16)}`;
+}
+
+async function showActivity() {
+  setError("");
+  show("view-activity");
+  await loadActivity();
+}
+
+async function loadActivity() {
+  const { granularity, buckets } = actWindow();
+  const end = act.end === null ? "" : `&end=${act.end}`;
+  try {
+    act.report = await api(
+      `/_management/api/activity?granularity=${granularity}&buckets=${buckets}${end}`);
+  } catch (e) { setError(e.message); return; }
+
+  const known = new Set(act.report.roots.map((r) => r.name));
+  act.picked = act.picked.filter((name) => known.has(name));
+  // Something to compare from the first look: the busiest few.
+  if (!act.picked.length) {
+    act.picked = act.report.roots
+      .filter((r) => r.total.r + r.total.w > 0).slice(0, 3).map((r) => r.name);
+  }
+  renderActivity();
+}
+
+/** Up, down or new, against the window before. Arrows, not colour alone.
+ *  Nothing when that window reaches back past what is retained, since a
+ *  year against the five weeks still held of the year before is no answer. */
+function change(now, before) {
+  const { start, buckets, step, oldest } = act.report;
+  if (oldest === null || start - buckets * step < oldest) return "";
+  if (!before) return now ? "new" : "";
+  const pct = Math.round(((now - before) / before) * 100);
+  if (pct === 0) return "= 0%";
+  return `${pct > 0 ? "▲" : "▼"} ${Math.abs(pct)}%`;
+}
+
+/** Shade 0–4: 0 is nothing at all, 1–4 split the range on a square-root scale,
+ *  so a quiet namespace still shows next to a busy one. */
+function level(value, max) {
+  if (!value || !max) return 0;
+  return Math.min(4, 1 + Math.floor(Math.sqrt(value / max) * 4 - 1e-9));
+}
+
+function renderActivity() {
+  const report = act.report;
+  const { step, start, buckets } = report;
+  const last = start + (buckets - 1) * step;
+
+  $("act-range").textContent =
+    `${bucketLabel(start, step)} → ${bucketLabel(last, step)} UTC` +
+    (report.enabled ? "" : " — counting is switched off (activity = false)");
+  $("act-later").disabled = last >= report.now;
+  $("act-now").disabled = act.end === null;
+  $("act-earlier").disabled = report.oldest === null || start <= report.oldest;
+
+  const filter = $("act-filter").value.trim().toLowerCase();
+  const roots = report.roots.filter((r) => r.name.toLowerCase().includes(filter));
+
+  // One scale per metric across every namespace shown, so two strips with
+  // the same shade had the same traffic.
+  let maxR = 0, maxW = 0;
+  for (const r of report.roots) {
+    for (const v of r.reads) maxR = Math.max(maxR, v);
+    for (const v of r.writes) maxW = Math.max(maxW, v);
+  }
+
+  const calendar = step >= 86400 && buckets > 120;
+  $("act-list").replaceChildren(...roots.map((root) => {
+    const row = document.createElement("div");
+    row.className = "act-root";
+
+    const head = document.createElement("div");
+    const name = document.createElement("label");
+    name.className = "act-name";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = act.picked.includes(root.name);
+    box.title = "Compare in the chart below";
+    box.onchange = () => {
+      if (box.checked) {
+        if (act.picked.length >= MAX_COMPARED) {
+          box.checked = false;
+          setError(`At most ${MAX_COMPARED} namespaces can be compared at once.`);
+          return;
+        }
+        act.picked.push(root.name);
+      } else {
+        act.picked = act.picked.filter((n) => n !== root.name);
+      }
+      setError("");
+      drawComparison();
+    };
+    const link = document.createElement("a");
+    link.href = `/_management/${root.name}`;
+    link.textContent = root.name;
+    link.onclick = (e) => { e.preventDefault(); go(root.name); };
+    name.append(box, link);
+
+    const sum = document.createElement("div");
+    sum.className = "act-sum";
+    sum.innerHTML =
+      `<b>${fmtCount.format(root.total.r)}</b> reads ` +
+      `<span title="against the window before">${change(root.total.r, root.previous.r)}</span><br>` +
+      `<b>${fmtCount.format(root.total.w)}</b> writes ` +
+      `<span title="against the window before">${change(root.total.w, root.previous.w)}</span>`;
+    head.append(name, sum);
+
+    const rows = document.createElement("div");
+    rows.className = "act-rows";
+    for (const [metric, label, values, max] of [
+      ["r", "reads", root.reads, maxR], ["w", "writes", root.writes, maxW]]) {
+      const tag = document.createElement("span");
+      tag.className = "act-label";
+      tag.textContent = label;
+      const cells = document.createElement("div");
+      if (calendar) {
+        cells.className = "act-cal";
+        // Weeks run down the columns from Sunday, so pad the first one.
+        const pad = new Date(start * 1000).getUTCDay();
+        for (let i = 0; i < pad; i++) {
+          const blank = document.createElement("div");
+          blank.className = "pad";
+          cells.append(blank);
+        }
+      } else {
+        cells.className = buckets > 60 ? "act-strip dense" : "act-strip";
+        cells.style.gridTemplateColumns = `repeat(${buckets}, 1fr)`;
+      }
+      values.forEach((v, i) => {
+        const cell = document.createElement("div");
+        const shade = level(v, max);
+        if (shade) cell.style.background = `var(--${metric}${shade - 1})`;
+        cell.dataset.root = root.name;
+        cell.dataset.metric = metric;
+        cell.dataset.i = i;
+        cells.append(cell);
+      });
+      rows.append(tag, cells);
+    }
+    if (!calendar) {
+      const axis = document.createElement("div");
+      axis.className = "act-axis";
+      axis.innerHTML = `<span>${bucketLabel(start, step)}</span><span>${bucketLabel(last, step)}</span>`;
+      rows.append(axis);
+    }
+    row.append(head, rows);
+    return row;
+  }));
+
+  $("act-empty").textContent = roots.length ? "" : (
+    filter ? "No namespace matches that filter."
+      : report.enabled
+        ? "Nothing has been read or written yet — or nothing this key may read."
+        : "Counting is switched off (activity = false in [daemon]) and nothing was counted before.");
+  drawComparison();
+}
+
+/** The tooltip follows the pointer over any cell; one listener for them all. */
+function cellAt(target) {
+  const cell = target.closest && target.closest("[data-root]");
+  if (!cell || !act.report) return null;
+  const root = act.report.roots.find((r) => r.name === cell.dataset.root);
+  if (!root) return null;
+  const i = Number(cell.dataset.i);
+  return { root, i, t: act.report.start + i * act.report.step };
+}
+
+const tip = document.createElement("div");
+tip.id = "act-tip";
+tip.className = "hidden";
+document.body.append(tip);
+
+$("act-list").addEventListener("mousemove", (e) => {
+  const hit = cellAt(e.target);
+  if (!hit) { tip.classList.add("hidden"); return; }
+  const { root, i, t } = hit;
+  const step = act.report.step;
+  tip.innerHTML =
+    `<b>${escapeHtml(root.name)}</b> · ${bucketLabel(t, step)}${step < 86400 ? " UTC" : ""}<br>` +
+    `${fmtExact.format(root.reads[i])} reads · ${fmtExact.format(root.writes[i])} writes`;
+  tip.classList.remove("hidden");
+  const x = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8);
+  tip.style.left = `${x}px`;
+  tip.style.top = `${e.clientY + 14}px`;
+});
+$("act-list").addEventListener("mouseleave", () => tip.classList.add("hidden"));
+
+// A day opens as its hours, which is the only way to see inside one.
+$("act-list").addEventListener("click", (e) => {
+  const hit = cellAt(e.target);
+  if (!hit || act.report.step < 86400) return;
+  // Hours are kept for 31 days; an older day has none to show.
+  if (hit.t + 86400 <= act.report.now - 31 * 86400) return;
+  $("act-window").value = "hour:24";
+  act.end = hit.t + 86400 - 1;
+  tip.classList.add("hidden");
+  loadActivity();
+});
+
+/** The picked namespaces as lines on one axis, one metric at a time: reads
+ *  and writes differ by orders of magnitude and would not share a scale. */
+function drawComparison() {
+  const report = act.report;
+  if (!report) return;
+  if (!act.chart) act.chart = echarts.init($("act-chart"), null, { renderer: "canvas" });
+
+  const metric = $("act-metric").value;
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const palette = dark ? SERIES.dark : SERIES.light;
+  const picked = act.picked
+    .map((name) => report.roots.find((r) => r.name === name))
+    .filter(Boolean);
+
+  $("act-compare-hint").textContent = picked.length
+    ? "" : "Tick namespaces above to compare them here.";
+
+  const times = Array.from({ length: report.buckets }, (_, i) =>
+    (report.start + i * report.step) * 1000);
+  const ink = dark ? "#e6e9ec" : "#1b1f24";
+  const muted = dark ? "#9aa4af" : "#5c6570";
+  const grid = dark ? "#2b3138" : "#eceff2";
+
+  act.chart.setOption({
+    // Buckets are UTC days and hours, and so is every label beside them.
+    useUTC: true,
+    backgroundColor: "transparent",
+    textStyle: { color: ink },
+    legend: { top: 0, textStyle: { color: muted }, icon: "roundRect" },
+    tooltip: {
+      trigger: "axis",
+      formatter: (points) => {
+        const t = points[0].value[0] / 1000;
+        const rows = points
+          .slice().sort((a, b) => b.value[1] - a.value[1])
+          .map((p) => `${p.marker}${escapeHtml(p.seriesName)} <b>${fmtExact.format(p.value[1])}</b>`);
+        return `${bucketLabel(t, report.step)}${report.step < 86400 ? " UTC" : ""}<br>${rows.join("<br>")}`;
+      },
+    },
+    grid: { left: 56, right: 20, top: 36, bottom: 28 },
+    xAxis: { type: "time", axisLine: { lineStyle: { color: grid } },
+             axisLabel: { color: muted } },
+    yAxis: { type: "value", minInterval: 1, axisLabel: { color: muted, formatter: (v) => fmtCount.format(v) },
+             splitLine: { lineStyle: { color: grid } } },
+    series: picked.map((root) => ({
+      name: root.name,
+      type: "line",
+      showSymbol: false,
+      symbolSize: 8,
+      lineStyle: { width: 2 },
+      color: palette[act.picked.indexOf(root.name) % palette.length],
+      data: (metric === "reads" ? root.reads : root.writes).map((v, i) => [times[i], v]),
+    })),
+  }, true);
+  act.chart.resize();
+}
+
+$("nav-activity").onclick = showActivity;
+$("act-window").onchange = () => { act.end = null; loadActivity(); };
+$("act-metric").onchange = drawComparison;
+$("act-refresh").onclick = loadActivity;
+$("act-filter").addEventListener("input", () => { if (act.report) renderActivity(); });
+// Browsing moves by a whole window, so "earlier" never overlaps what was shown.
+const shiftWindow = (direction) => {
+  const { step, start, buckets } = act.report;
+  const last = start + (buckets - 1) * step;
+  const end = last + direction * buckets * step;
+  act.end = end >= act.report.now ? null : end;
+  loadActivity();
+};
+$("act-earlier").onclick = () => shiftWindow(-1);
+$("act-later").onclick = () => shiftWindow(1);
+$("act-now").onclick = () => { act.end = null; loadActivity(); };
+addEventListener("resize", () => { if (act.chart) act.chart.resize(); });
 
 // --- session ---------------------------------------------------------------
 

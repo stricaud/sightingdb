@@ -57,6 +57,9 @@ pub struct Settings {
     /// How many rejected values to keep in memory for `/_management/api/rejections`.
     /// 0 switches the record off.
     pub rejection_log: usize,
+    /// Count reads and writes per top-level namespace for the management
+    /// interface's activity view.
+    pub activity: bool,
     /// This server's name in its own counters. See [`crate::db::LOCAL_NODE`].
     pub node_id: String,
     /// API keys. `None` means no `[acl]` table and no `acl_file`.
@@ -292,6 +295,8 @@ struct RawDaemon {
     shadow_ttl: u64,
     #[serde(default = "default_rejection_log")]
     rejection_log: usize,
+    #[serde(default = "yes")]
+    activity: bool,
     /// This server's name in its own counters. Absent means "local", which is
     /// right until it joins a galaxy — two servers sharing an id would each
     /// take the other's contribution for their own.
@@ -632,6 +637,7 @@ impl RawConfig {
             stats_retention: daemon.stats_retention,
             shadow_ttl: daemon.shadow_ttl,
             rejection_log: daemon.rejection_log,
+            activity: daemon.activity,
             node_id,
             acl,
             acl_file,
@@ -1301,6 +1307,7 @@ daemonize = false
 post_limit = 1234
 sweep_interval = 30
 stats_retention = 720
+activity = false
 "#,
         ))
         .unwrap();
@@ -1310,6 +1317,7 @@ stats_retention = 720
         assert_eq!(settings.post_limit, 1234);
         assert_eq!(settings.sweep_interval, 30);
         assert_eq!(settings.stats_retention, 720);
+        assert!(!settings.activity);
     }
 
     /// A misspelled key used to be silently ignored, which is how a setting

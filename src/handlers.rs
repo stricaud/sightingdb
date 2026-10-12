@@ -4965,6 +4965,7 @@ mod tests {
             "/_management/api/info",
             "/_management/api/namespaces",
             "/_management/api/tree",
+            "/_management/api/activity",
             "/_management/api/galaxy",
             "/_management/api/rejections",
             "/_management/api/values",

@@ -814,6 +814,24 @@ Browses namespaces the way a file manager browses directories. Takes `path`,
 	  "warm_idle":3600,"own_tier":true,"own_warm_idle":false}],
 	 "total":1,"offset":0}
 
+### `GET /_management/api/activity` — reads and writes per top-level namespace
+
+Client reads and accepted writes, counted against the first segment of the
+namespace, in UTC buckets: hourly for 31 days, daily for 400. Takes
+`granularity` (`hour` or `day`, default `day`), `end` (any Unix time in the
+last bucket wanted, default now) and `buckets` (default 48 hours or 90 days).
+Each namespace carries one count per bucket, its totals, and the totals of the
+window of the same length just before, so the interface can say up or down.
+Only namespaces the key can read in full are listed. `activity = false` in
+`[daemon]` stops the counting.
+
+	$ curl -H 'Authorization: changeme' \
+	    'http://127.0.0.1:9999/_management/api/activity?granularity=day&buckets=3'
+	{"enabled":true,"granularity":"day","step":86400,"start":1760054400,
+	 "buckets":3,"oldest":1760054400,"now":1760227200,
+	 "roots":[{"name":"feeds","reads":[12,40,7],"writes":[3,0,1],
+	   "total":{"r":59,"w":4},"previous":{"r":31,"w":9}}]}
+
 `is_namespace` distinguishes a node that holds values from one that is only a
 path to others.
 

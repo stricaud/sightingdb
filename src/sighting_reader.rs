@@ -28,6 +28,8 @@ pub fn read(
     if namespace.starts_with(CONFIG_PREFIX) {
         return Err(ApiError::ConfigNamespace);
     }
+    // A miss is still a read, as it is for the shadow record below.
+    db.activity().record_read(namespace);
 
     let consensus = db.count(ALL_NAMESPACE, value);
     let result = match db.view(namespace, value, consensus, with_stats) {
@@ -57,6 +59,7 @@ pub fn read_namespace(db: &Database, namespace: &str) -> Result<NamespaceView, A
     if namespace.starts_with(CONFIG_PREFIX) {
         return Err(ApiError::ConfigNamespace);
     }
+    db.activity().record_read(namespace);
 
     db.namespace_views(namespace)
         .map(|attributes| NamespaceView { attributes })

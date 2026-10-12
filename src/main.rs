@@ -1,4 +1,5 @@
 mod acl;
+mod activity;
 mod admin;
 mod attribute;
 mod config;
@@ -237,6 +238,7 @@ fn run() -> Result<()> {
     let dbdir = usable_dbdir(&settings);
     let level = settings.compression_level;
     let db = open_database(&settings, dbdir.as_deref())?;
+    db.activity().set_enabled(settings.activity);
 
     if let Some(dir) = dbdir.as_deref() {
         db.attach_store(
@@ -477,6 +479,7 @@ fn server_info(
         sweep_interval: settings.sweep_interval,
         stats_retention: settings.stats_retention,
         shadow_ttl: settings.shadow_ttl,
+        activity: settings.activity,
         dns: settings.dns.as_ref().map(|dns| admin::DnsInfo {
             listen: dns.listen.clone(),
             zone: dns.zone.clone(),
@@ -685,7 +688,7 @@ fn open_database(settings: &Settings, dbdir: Option<&Path>) -> Result<Database> 
         return Ok(Database::with_node(policy, stores, node));
     };
 
-    match persistence::load(path)? {
+    let db = match persistence::load(path)? {
         Some(data) => {
             let db = Database::from_snapshot_as(data, policy, stores, node);
             log::info!(
@@ -693,13 +696,17 @@ fn open_database(settings: &Settings, dbdir: Option<&Path>) -> Result<Database> 
                 db.namespace_count(),
                 path.display()
             );
-            Ok(db)
+            db
         }
         None => {
             log::info!("No shards in {}, starting empty", path.display());
-            Ok(Database::with_node(policy, stores, node))
+            Database::with_node(policy, stores, node)
         }
+    };
+    if let Some(activity) = persistence::load_activity(path) {
+        db.activity().restore(activity);
     }
+    Ok(db)
 }
 
 /// The directory shards are written to, or `None` if persistence is off or the

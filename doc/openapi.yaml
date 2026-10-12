@@ -840,6 +840,85 @@ paths:
                         type: array
                         items: { $ref: "#/components/schemas/TreeEntry" }
 
+  /_management/api/activity:
+    get:
+      tags: [management]
+      summary: Reads and writes per top-level namespace
+      description: |
+        Client reads and accepted writes, counted against the first segment
+        of the namespace (`feeds/misp/ips` counts towards `feeds`), in UTC
+        hourly buckets kept for 31 days and daily buckets kept for 400. Every
+        read path counts, DNS included, and so does every write path, the ZMQ
+        ingest and the management interface included. Internal namespaces are
+        not counted, and neither is a rejected write.
+
+        A namespace is shown only to a key that can read all of it. The counts
+        are saved with snapshots, as `activity.json` in the dbdir. Counting is
+        switched off with `activity = false` in `[daemon]`.
+      parameters:
+        - name: granularity
+          in: query
+          schema: { type: string, enum: [hour, day], default: day }
+        - name: end
+          in: query
+          description: Any Unix time in the last bucket wanted. Absent is now.
+          schema: { type: integer, format: int64 }
+        - name: buckets
+          in: query
+          description: |
+            How many buckets, ending with the one holding `end`. Capped at what
+            is retained: 744 hours or 400 days. Defaults to 48 hours or 90 days.
+          schema: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: One series per namespace, busiest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                    description: |
+                      `activity` in `[daemon]`. When false, earlier counts are
+                      still reported and nothing new is added.
+                  granularity: { type: string, enum: [hour, day] }
+                  step: { type: integer, description: Seconds per bucket. }
+                  start:
+                    type: integer
+                    description: |
+                      Unix time the first bucket starts. Bucket `i` starts at
+                      `start + i * step`.
+                  buckets: { type: integer }
+                  oldest:
+                    type: integer
+                    nullable: true
+                    description: |
+                      The oldest bucket held at this granularity for any
+                      namespace shown, or null when nothing has been counted.
+                  now: { type: integer, description: The bucket holding the present. }
+                  roots:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        reads:
+                          type: array
+                          items: { type: integer }
+                        writes:
+                          type: array
+                          items: { type: integer }
+                        total: { $ref: "#/components/schemas/ActivityCounts" }
+                        previous:
+                          allOf:
+                            - $ref: "#/components/schemas/ActivityCounts"
+                          description: |
+                            The same totals over the equal-length window just
+                            before this one.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
   /_management/api/galaxy:
     get:
       tags: [management]
@@ -1906,6 +1985,12 @@ components:
           type: boolean
           description: The tier is set on the shard rather than the default.
         own_warm_idle: { type: boolean }
+
+    ActivityCounts:
+      type: object
+      properties:
+        r: { type: integer, description: Reads. }
+        w: { type: integer, description: Writes. }
 
     TreeEntry:
       type: object

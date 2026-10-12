@@ -70,6 +70,12 @@ shadow_ttl = 2_592_000
 # 0 switches the record off.
 rejection_log = 1000
 
+# Count reads and writes per top-level namespace, hourly for 31 days and daily
+# for 400, for the management interface's Activity view. Saved beside the
+# shards as activity.json. Every read and write takes a short lock to count;
+# false turns that into a single flag check.
+activity = true
+
 # This server's name in its own counters. Sightings are counted per node, so
 # that merging two copies of a value is a sum of separate contributions rather
 # than a replay of increments — an increment is not idempotent, and a sync that

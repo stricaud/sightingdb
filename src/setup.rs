@@ -377,6 +377,16 @@ impl Plan {
         );
         w(&mut out, "# away and why. 0 switches the record off.");
         w(&mut out, "rejection_log = 1000");
+        w(&mut out, "");
+        w(
+            &mut out,
+            "# Count reads and writes per top-level namespace for the management",
+        );
+        w(
+            &mut out,
+            "# interface's Activity view. Off makes counting a single flag check.",
+        );
+        w(&mut out, "activity = true");
 
         w(&mut out, "");
         if self.mode.in_galaxy() {

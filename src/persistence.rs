@@ -37,6 +37,9 @@ pub const INTERNAL_SHARD: &str = "_internal";
 /// The file that shard is written to. Named for the database rather than the
 /// shard, since it is the one file that is always present.
 const INTERNAL_FILE: &str = "sightingdb.json.zst";
+/// Read and write counts per top-level namespace. Plain JSON, and deliberately
+/// not ending in [`SHARD_SUFFIX`], so it is never mistaken for a shard.
+const ACTIVITY_FILE: &str = "activity.json";
 
 /// The shard a namespace belongs to.
 ///
@@ -125,6 +128,13 @@ pub fn save(db: &Database, dbdir: &Path, level: i32, all: bool) -> Result<SaveRe
         }
     }
 
+    if let Some(activity) = db.activity().take_snapshot(all)
+        && let Err(e) = save_activity(dbdir, &activity)
+    {
+        db.activity().mark_dirty();
+        return Err(e);
+    }
+
     // A shard whose namespaces have all been deleted leaves a stale file.
     for shard in dirty.difference(&present.iter().cloned().collect()) {
         let path = shard_file(dbdir, shard);
@@ -162,6 +172,37 @@ fn write_shard(db: &Database, dbdir: &Path, shard: &str, level: i32) -> Result<u
     fs::rename(&temp, &path)
         .with_context(|| format!("renaming {} to {}", temp.display(), path.display()))?;
     Ok(bytes)
+}
+
+fn save_activity(dbdir: &Path, activity: &crate::activity::ActivityData) -> Result<()> {
+    let path = dbdir.join(ACTIVITY_FILE);
+    let temp = path.with_extension("tmp");
+    {
+        let file = File::create(&temp).with_context(|| format!("creating {}", temp.display()))?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, activity).context("serializing activity")?;
+        writer
+            .flush()
+            .with_context(|| format!("flushing {}", temp.display()))?;
+    }
+    fs::rename(&temp, &path)
+        .with_context(|| format!("renaming {} to {}", temp.display(), path.display()))
+}
+
+/// The activity counts a previous run saved, if any.
+///
+/// Unreadable counts are logged and dropped rather than refusing to start:
+/// they describe how the database was used, not what it holds.
+pub fn load_activity(dbdir: &Path) -> Option<crate::activity::ActivityData> {
+    let path = dbdir.join(ACTIVITY_FILE);
+    let file = File::open(&path).ok()?;
+    match serde_json::from_reader(BufReader::new(file)) {
+        Ok(data) => Some(data),
+        Err(e) => {
+            log::warn!("Ignoring {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Read every shard back, plus a single-file snapshot from an older version.
@@ -569,6 +610,30 @@ mod tests {
 
         let err = load(&dir.0).unwrap_err().to_string();
         assert!(err.contains("broken-"), "{err}");
+    }
+
+    #[test]
+    fn activity_counts_survive_a_restart_and_are_not_read_as_a_shard() {
+        let dir = TempDir::new("activity");
+        let db = Database::default();
+        crate::sighting_writer::write(&db, "feeds/ips", "v", None, None).unwrap();
+        save(&db, &dir.0, default_level(), false).unwrap();
+        assert!(dir.0.join(ACTIVITY_FILE).exists());
+
+        // Still loads: the counts file must not be parsed as a shard.
+        load(&dir.0).unwrap().unwrap();
+        let restored = Database::default();
+        restored
+            .activity()
+            .restore(load_activity(&dir.0).expect("saved"));
+        let report = restored.activity().report(
+            crate::activity::Granularity::Day,
+            Utc::now().timestamp(),
+            1,
+            |_| true,
+        );
+        assert_eq!(report.roots[0].name, "feeds");
+        assert_eq!(report.roots[0].total.writes, 1);
     }
 
     #[test]

@@ -99,6 +99,21 @@ impl ValuesQuery {
     }
 }
 
+/// A window of read and write counts per top-level namespace.
+#[derive(Debug, Deserialize)]
+pub struct ActivityQuery {
+    #[serde(default = "default_granularity")]
+    granularity: crate::activity::Granularity,
+    /// Any instant in the last bucket wanted. Absent is now.
+    end: Option<i64>,
+    /// How many buckets, capped at what is retained.
+    buckets: Option<usize>,
+}
+
+fn default_granularity() -> crate::activity::Granularity {
+    crate::activity::Granularity::Day
+}
+
 /// One level of the namespace tree, as the browser walks it.
 #[derive(Debug, Deserialize)]
 pub struct TreeQuery {
@@ -275,6 +290,8 @@ pub struct ServerInfo {
     pub sweep_interval: u64,
     pub stats_retention: usize,
     pub shadow_ttl: u64,
+    /// Whether reads and writes are being counted for the activity view.
+    pub activity: bool,
     pub dns: Option<DnsInfo>,
     pub zmq: Option<ZmqInfo>,
     pub namespaces: usize,
@@ -1247,6 +1264,37 @@ pub async fn tree(state: State, query: web::Query<TreeQuery>, req: HttpRequest) 
             });
     drop(acl);
     HttpResponse::Ok().json(page)
+}
+
+/// `GET /_management/api/activity` — reads and writes per top-level namespace.
+///
+/// A namespace is shown only to a key that can read all of it: a total for
+/// `feeds` says something about every namespace under it, so a key scoped to
+/// `feeds/misp` does not get it.
+pub async fn activity(
+    state: State,
+    query: web::Query<ActivityQuery>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let key = match require_admin(&state, &req) {
+        Ok(key) => key.to_string(),
+        Err(resp) => return resp,
+    };
+
+    let granularity = query.granularity;
+    let end = query.end.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let buckets = query.buckets.unwrap_or(match granularity {
+        crate::activity::Granularity::Hour => 48,
+        crate::activity::Granularity::Day => 90,
+    });
+
+    let acl = state.acl();
+    let report = state
+        .db
+        .activity()
+        .report(granularity, end, buckets, |root| acl.can_read(&key, root));
+    drop(acl);
+    HttpResponse::Ok().json(report)
 }
 
 /// Create a namespace that holds nothing yet.
@@ -2452,6 +2500,7 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
             web::post().to(create_namespace),
         )
         .route("/_management/api/tree", web::get().to(tree))
+        .route("/_management/api/activity", web::get().to(activity))
         .route("/_management/api/galaxy", web::get().to(galaxy))
         .route("/_management/api/galaxy/peers", web::get().to(list_peers))
         .route("/_management/api/galaxy/peers", web::post().to(add_peer))
@@ -3032,6 +3081,51 @@ mod tests {
         let resp = get!(app, "/_management/api/namespaces?q=nomatch", Some(ADMIN));
         let body: Json = test::read_body_json(resp).await;
         assert_eq!(body["total"], 0);
+    }
+
+    /// Client reads and writes are counted per top-level namespace; the
+    /// shadow sighting a read leaves behind is not counted as a write.
+    #[actix_web::test]
+    async fn activity_counts_client_reads_and_writes_per_top_level_namespace() {
+        let st = state();
+        st.acl
+            .write()
+            .unwrap()
+            .set("scoped", parse_grants("admin, r:feeds").unwrap());
+        let app = app_with_data!(st);
+
+        for uri in [
+            "/w/feeds/ips?val=1.1.1.1",
+            "/w/other/x?val=a",
+            "/r/feeds/ips?val=1.1.1.1",
+            "/r/feeds/ips?val=missing",
+        ] {
+            test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        }
+
+        let resp = get!(
+            app,
+            "/_management/api/activity?granularity=hour&buckets=2",
+            Some(ADMIN)
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Json = test::read_body_json(resp).await;
+        let roots = body["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 2, "{body}");
+        assert_eq!(roots[0]["name"], "feeds", "busiest first: {body}");
+        assert_eq!(roots[0]["total"], json!({"r": 2, "w": 1}), "{body}");
+        assert_eq!(roots[0]["reads"].as_array().unwrap().len(), 2, "{body}");
+
+        // A key that cannot read `other` does not see its totals.
+        let resp = get!(app, "/_management/api/activity", Some("scoped"));
+        let body: Json = test::read_body_json(resp).await;
+        let names: Vec<&str> = body["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["feeds"], "{body}");
     }
 
     #[actix_web::test]

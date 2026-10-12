@@ -54,6 +54,7 @@ pub fn write_tagged_as(
     check(db, namespace, value)?;
 
     let node = origin.unwrap_or_else(|| db.node());
+    db.activity().record_write(namespace);
     Ok(db.write_tagged_as(
         node,
         namespace,
